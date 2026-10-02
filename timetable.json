@@ -1,0 +1,31 @@
+{
+  "semester": "2026-2027 Semester 1",
+  "source": "用户提供的eBridge课表截图 (2026-10-01)",
+  "colors": {
+    "seminar": "浅蓝色 - EAP043 Seminar",
+    "lecture": "浅紫蓝色 - 全学科 Lecture",
+    "tutorial": "淡粉紫色 - 全学科 Tutorial",
+    "sport": "橙色 - 体育类课程"
+  },
+  "courses": [
+    {"code": "EAP043-Seminar-D1/17", "name": "EAP043 Seminar", "day": 1, "day_cn": "周一", "start": "09:00", "end": "10:50", "location": "SIP-FB295", "teacher": "Xinyuan Lyu", "weeks": [1,2,3,4,5,6,7,8,9,10,11,12,13], "type": "seminar"},
+    {"code": "PSP004-Lecture-D1/09", "name": "PSP004 Lecture", "day": 4, "day_cn": "周四", "start": "09:00", "end": "10:50", "location": "SIP-FB251", "teacher": "Marie Beneteau / Thomas Selig", "weeks": [1,2,3,4,5,6,7,8,9,10,11,12,13], "type": "lecture"},
+    {"code": "MTH026-Lecture-D1/17", "name": "MTH026 Lecture", "day": 5, "day_cn": "周五", "start": "09:00", "end": "10:50", "location": "SIP-FBG95", "teacher": "Haixia Liang", "weeks": [1,2,4,5,6,7,8,9,10,11,12,13], "type": "lecture"},
+    {"code": "MTH026-Lecture-D2/17", "name": "MTH026 Lecture (调休补课)", "day": 6, "day_cn": "周六", "start": "09:00", "end": "10:50", "location": "SIP-FBG95", "teacher": "Haixia Liang", "weeks": [2], "type": "lecture"},
+    {"code": "EAP043-Tutorial-D1/1", "name": "EAP043 Tutorial", "day": 7, "day_cn": "周日", "start": "09:00", "end": "10:50", "location": "待定", "teacher": "待定", "weeks": [1,2,3,4,5,6,7,8,9,10,11,12,13], "type": "tutorial"},
+    {"code": "LIF/SCI004-Tutorial-D1/01", "name": "LIF/SCI004 Tutorial", "day": 4, "day_cn": "周四", "start": "11:00", "end": "11:50", "location": "SIP-FB251", "teacher": "Jasen Grant", "weeks": [1,2,3,4,5,6,7,8,9,10,11,12,13], "type": "tutorial"},
+    {"code": "MTH028-Lecture-D1/18", "name": "MTH028 Lecture", "day": 5, "day_cn": "周五", "start": "11:00", "end": "12:50", "location": "SIP-FB396", "teacher": "Linxiao Xu", "weeks": [1,2,4,5,6,7,8,9,10,11,12,13], "type": "lecture"},
+    {"code": "MTH028-Lecture-D2/18", "name": "MTH028 Lecture (调休补课)", "day": 6, "day_cn": "周六", "start": "11:00", "end": "12:50", "location": "SIP-FB396", "teacher": "Linxiao Xu", "weeks": [2], "type": "lecture"},
+    {"code": "Archery", "name": "Archery 射箭 (体育)", "day": 1, "day_cn": "周一", "start": "14:30", "end": "15:50", "location": "GM201 Archery Room 射箭室", "teacher": "张贺", "weeks": [2,3,4,5,6,7,8,9,10,11,12,13], "type": "sport"},
+    {"code": "EAP043-Seminar-D2/17", "name": "EAP043 Seminar", "day": 2, "day_cn": "周二", "start": "14:00", "end": "15:50", "location": "SIP-FB295", "teacher": "Xinyuan Lyu", "weeks": [1,2,3,4,5,6,7,8,9,10,11,12,13], "type": "seminar"},
+    {"code": "CCT011-Lecture-D1/11", "name": "CCT011 Lecture", "day": 3, "day_cn": "周三", "start": "14:00", "end": "15:50", "location": "SIP-SC176", "teacher": "Yi Luo (CCTC)", "weeks": [1,2,3,4,5,6,7,8,9,10,11,12,13], "type": "lecture"},
+    {"code": "CCT012-Lecture1-D1/03", "name": "CCT012 Lecture 1", "day": 4, "day_cn": "周四", "start": "14:00", "end": "15:50", "location": "SIP-FB155", "teacher": "Ting Sun / Wen Huang / Yan Ji", "weeks": [8], "type": "lecture"},
+    {"code": "CCT012-Lecture-D1/04", "name": "CCT012 Lecture", "day": 4, "day_cn": "周四", "start": "14:00", "end": "15:50", "location": "SIP-FB155", "teacher": "Ting Sun / Wen Huang / Yan Ji", "weeks": [2], "type": "lecture"},
+    {"code": "CCT007-Lecture-D1/22", "name": "CCT007 Lecture", "day": 5, "day_cn": "周五", "start": "15:00", "end": "15:50", "location": "SIP-SD102", "teacher": "Gongwei Wang", "weeks": [1,2,3,4,5,6,7,8,9,10,11,12,13], "type": "lecture"},
+    {"code": "EAP043-Tutorial-D2/1", "name": "EAP043 Tutorial", "day": 6, "day_cn": "周六", "start": "14:00", "end": "15:50", "location": "待定", "teacher": "待定", "weeks": [1,2,3,4,5,6,7,8,9,10,11,12,13], "type": "tutorial"},
+    {"code": "CCT001-Lecture-D1/11", "name": "CCT001 Lecture", "day": 3, "day_cn": "周三", "start": "16:00", "end": "17:50", "location": "SIP-SB102", "teacher": "Shannan Hu", "weeks": [1,2,3,4,5,6,7,8,9,10,11,12,13], "type": "lecture"},
+    {"code": "EAP043-Seminar-D3/17", "name": "EAP043 Seminar", "day": 4, "day_cn": "周四", "start": "16:00", "end": "17:50", "location": "SIP-FB295", "teacher": "Xinyuan Lyu", "weeks": [1,2,3,4,5,6,7,8,9,10,11,12,13], "type": "seminar"},
+    {"code": "SCI004-Lecture-D1/02", "name": "SCI004 Lecture", "day": 2, "day_cn": "周二", "start": "18:00", "end": "19:50", "location": "SIP-SD102", "teacher": "JINBO HE 等多名讲师", "weeks": [1,2,3,4,5,6,7,8,9,10,11,12,13], "type": "lecture"},
+    {"code": "LIF/PSP004-Tutorial-D1/08", "name": "LIF/PSP004 Tutorial", "day": 3, "day_cn": "周三", "start": "19:00", "end": "19:50", "location": "SIP-FB251", "teacher": "Wenzhou Li", "weeks": [1,2,3,4,5,6,7,8,9,10,11,12,13], "type": "tutorial"}
+  ]
+}

@@ -1,0 +1,151 @@
+name: Feishu Poller
+
+on:
+  schedule:
+    - cron: '*/5 * * * *'
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  poll:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Poll and forward
+        env:
+          FEISHU_APP_ID: ${{ secrets.FEISHU_APP_ID }}
+          FEISHU_APP_SECRET: ${{ secrets.FEISHU_APP_SECRET }}
+          SCF_URL: ${{ secrets.SCF_URL }}
+          CHAT_ID: ${{ secrets.CHAT_ID }}
+          FEISHU_VERIFY_TOKEN: ${{ secrets.FEISHU_VERIFY_TOKEN }}
+        run: |
+          cat > poll.py << 'PYEOF'
+          import json, urllib.request, time, os, datetime
+
+          APP_ID = os.environ.get("FEISHU_APP_ID", "")
+          APP_SECRET = os.environ.get("FEISHU_APP_SECRET", "")
+          CHAT_ID = os.environ.get("CHAT_ID", "")
+          SCF_URL = os.environ.get("SCF_URL", "")
+          VERIFY_TOKEN = os.environ.get("FEISHU_VERIFY_TOKEN", "")
+          STATE_FILE = "poll-state.json"
+
+          def log(msg):
+              print(msg, flush=True)
+
+          # 1. 读取已处理消息ID（跨运行持久化，杜绝重复转发）
+          processed = set()
+          if os.path.exists(STATE_FILE):
+              try:
+                  with open(STATE_FILE) as f:
+                      processed = set(json.load(f).get("processed", []))
+              except Exception as e:
+                  log("State load failed, starting fresh: " + str(e))
+          log("State: " + str(len(processed)) + " processed ids")
+
+          # 2. 飞书token
+          tok_req = json.dumps({"app_id": APP_ID, "app_secret": APP_SECRET}).encode()
+          tok_resp = urllib.request.urlopen(
+              urllib.request.Request("https://open.feishu.cn/open-apis/auth/v3/tenant_access_token/internal",
+                  data=tok_req, headers={"Content-Type": "application/json"}), timeout=15)
+          token = json.loads(tok_resp.read().decode())["tenant_access_token"]
+          log("token OK")
+
+          # 3. 查询最近2小时消息（覆盖cron延迟窗口，不漏消息）
+          end = int(time.time()) + 60
+          start = end - 7200
+          url = ("https://open.feishu.cn/open-apis/im/v1/messages"
+                 "?container_id_type=chat&container_id=" + CHAT_ID
+                 + "&start_time=" + str(start) + "&end_time=" + str(end) + "&page_size=50")
+          req = urllib.request.Request(url, headers={"Authorization": "Bearer " + token})
+          resp = urllib.request.urlopen(req, timeout=15)
+          items = json.loads(resp.read().decode()).get("data", {}).get("items", [])
+          log("Queried " + str(len(items)) + " messages (2h window)")
+
+          # 回复检测：判断某条用户消息是否已有bot回复
+          # 逻辑：该消息之后、下一条用户消息之前，若存在bot消息则视为已回复
+          timeline = [(int(m.get("create_time", "0")) / 1000,
+                       m.get("sender", {}).get("sender_type", "")) for m in items]
+
+          def is_replied(msg_ts):
+              next_user_ts = None
+              for ts, st in timeline:
+                  if st == "user" and ts > msg_ts:
+                      next_user_ts = ts
+                      break
+              for ts, st in timeline:
+                  if st == "app" and ts > msg_ts and (next_user_ts is None or ts < next_user_ts):
+                      return True
+              return False
+
+          # 4. 转发所有未处理的用户文本消息（按时间正序；已回复的跳过防重复）
+          forwarded = 0
+          skipped = 0
+          for m in items:
+              if m.get("sender", {}).get("sender_type") != "user":
+                  continue
+              if m.get("msg_type") != "text":
+                  continue
+              msg_id = m.get("message_id", "")
+              if not msg_id or msg_id in processed:
+                  continue
+              body = m.get("body", {}).get("content", "{}")
+              try:
+                  text = json.loads(body).get("text", "").strip()
+              except Exception:
+                  continue
+              if not text:
+                  continue
+              processed.add(msg_id)
+              # 回复检测：已被秒回过（或其它通道处理过）的消息不再转发
+              if is_replied(int(m.get("create_time", "0")) / 1000):
+                  skipped += 1
+                  log("Skip (already replied): " + text[:40])
+                  continue
+              payload = json.dumps({
+                  "type": "event_callback",
+                  "token": VERIFY_TOKEN,
+                  "event": {
+                      "type": "im.message.receive_v1",
+                      "message": {
+                          "message_id": msg_id,
+                          "chat_type": "group",
+                          "chat_id": CHAT_ID,
+                          "msg_type": "text",
+                          "content": json.dumps({"text": text})
+                      },
+                      "sender": {"sender_id": {"open_id": "ou_poll"}, "sender_type": "user"}
+                  }
+              }).encode()
+              try:
+                  urllib.request.urlopen(
+                      urllib.request.Request(SCF_URL, data=payload, method="POST",
+                          headers={"Content-Type": "application/json"}), timeout=30)
+                  log("Forwarded: " + text[:40])
+                  forwarded += 1
+              except Exception as e:
+                  log("Forward FAILED: " + str(e))
+
+          log("Done: forwarded=" + str(forwarded) + ", skipped_replied=" + str(skipped) + ", total_processed=" + str(len(processed)))
+
+          # 5. 保存状态（保留最近500条ID）
+          with open(STATE_FILE, "w") as f:
+              json.dump({"processed": sorted(processed)[-500:],
+                         "updated": datetime.datetime.now().isoformat()}, f, indent=2)
+          log("State saved")
+          PYEOF
+
+          python3 poll.py
+
+      - name: Commit state
+        run: |
+          if [ -z "$(git status --porcelain poll-state.json)" ]; then
+            echo "No state change"
+          else
+            git config user.name "github-actions[bot]"
+            git config user.email "github-actions[bot]@users.noreply.github.com"
+            git add poll-state.json
+            git commit -m "chore: poll state [skip ci]"
+            git push || echo "push conflict, next run will sync"
+          fi

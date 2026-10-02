@@ -1,0 +1,51 @@
+name: AI Mail Butler
+
+on:
+  schedule:
+    - cron: '*/5 * * * *'
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  butler:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout 代码仓库
+        uses: actions/checkout@v4
+
+      - name: Clone 私有数据仓库
+        run: git clone https://x-access-token:${{ secrets.GH_PAT }}@github.com/wutian-yu/butler-data.git data
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Run Mail Butler
+        env:
+          OUTLOOK_REFRESH_TOKEN: ${{ secrets.OUTLOOK_REFRESH_TOKEN }}
+          OUTLOOK_CLIENT_ID: ${{ secrets.OUTLOOK_CLIENT_ID }}
+          FEISHU_APP_ID: ${{ secrets.FEISHU_APP_ID }}
+          FEISHU_APP_SECRET: ${{ secrets.FEISHU_APP_SECRET }}
+          BARK_KEY: ${{ secrets.BARK_KEY }}
+          DATA_DIR: ${{ github.workspace }}/data
+          SCF_URL: ${{ secrets.SCF_URL }}
+          ICS_FILENAME: ${{ secrets.ICS_FILENAME }}
+        run: python butler.py
+
+      - name: Push 数据仓库变更
+        run: |
+          cd data
+          git config user.name "mail-butler-bot"
+          git config user.email "butler@users.noreply.github.com"
+          git add .
+          git diff --cached --quiet || (git commit -m "state update" && git push)
+
+      - name: Push 主仓库（仅日历文件）
+        run: |
+          git config user.name "mail-butler-bot"
+          git config user.email "butler@users.noreply.github.com"
+          git add docs/
+          git diff --cached --quiet || (git commit -m "calendar update" && git push)
