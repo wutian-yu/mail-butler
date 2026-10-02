@@ -1353,16 +1353,29 @@ def cmd_homework_to_calendar(chat_id, text):
     if not matched:
         feishu_send(chat_id, "📭 没找到匹配的作业。试试「把10月9号的数学作业加到日历」。")
         return
-    # 创建 Outlook 日历事件
+    # 创建 Outlook 日历事件（防重复：先查是否已有同名事件）
     created = 0
     failed = 0
+    skipped = 0
     fail_reason = ""
+    # 查已有日历事件，按 subject 去重
+    existing_subjects = set()
+    try:
+        upcoming = outlook_events()
+        for e in upcoming:
+            existing_subjects.add((e.get("Subject") or "")[:40])
+    except Exception:
+        pass
     for ev in matched:
         try:
+            title = f"📚 {ev['summary'][:60]}"
+            if title[:40] in existing_subjects:
+                skipped += 1
+                continue
             start = ev["dt"]
             end = start + timedelta(hours=1)
             body = f"LearningMall 作业\n{ev.get('summary','')}\n\n截止时间：{ev['dt'].strftime('%Y年%m月%d日 %H:%M')}\n{ev.get('countdown','')}"
-            eid = outlook_create_event(f"📚 {ev['summary'][:60]}", start, end, body=body)
+            eid = outlook_create_event(title, start, end, body=body)
             if eid:
                 created += 1
             else:
@@ -1372,7 +1385,12 @@ def cmd_homework_to_calendar(chat_id, text):
             log(f"⚠️ 作业写日历失败 {ev['summary'][:30]}: {e}")
             failed += 1
             fail_reason = str(e)[:80]
-    summary_lines = [f"📚 已将 {created} 项作业写入 Outlook 日历" + (f"（{failed} 项失败{': '+fail_reason if fail_reason else ''}）" if failed else "")]
+    parts = [f"📚 已将 {created} 项作业写入 Outlook 日历"]
+    if skipped:
+        parts.append(f"（{skipped} 项已存在跳过）")
+    if failed:
+        parts.append(f"（{failed} 项失败{': '+fail_reason if fail_reason else ''}）")
+    summary_lines = ["".join(parts)]
     for ev in matched[:5]:
         summary_lines.append(f"· {ev['summary'][:50]} — {ev['dt'].strftime('%m月%d日 %H:%M')}")
     summary_lines.append("\n打开 iPhone 日历 app 即可看到（确保 Outlook 日历分组已勾选）。")
