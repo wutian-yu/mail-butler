@@ -686,7 +686,7 @@ def format_new_lm_events(events, known_uids):
         lines.append("")
     # EAP 解锁专属提醒（任何 EAP 新事件 = 新任务解锁）
     if any((ev.get("course") or "").startswith("EAP") for ev in new_events):
-        lines.append("🎯 **EAP 已解锁，尽快完成。**")
+        lines.append("✍️ **EAP 已解锁，尽快完成。**")
         lines.append("")
     lines.append(f"共 {len(new_events)} 项新动态")
     return "\n".join(lines)
