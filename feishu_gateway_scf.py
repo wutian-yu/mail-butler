@@ -845,16 +845,7 @@ def format_homework(events):
         act = ev.get("action", "")
         lines.append(f"　　⏰ {ev['dt'].strftime('%m月%d日 %H:%M')} · {act} · {ev['countdown']}" if act
                      else f"　　⏰ {ev['dt'].strftime('%m月%d日 %H:%M')} · {ev['countdown']}")
-    # EAP 状态说明：日历里没有 EAP 事件 = 当前无解锁中的作业
-    has_eap = any("EAP" in (ev.get("categories", "") + ev.get("summary", "")) for ev in events)
-    if not has_eap:
-        lines.append("")
-        lines.append("📖 学术英语EAP043：日历上当前没有作业事件。")
-        lines.append("　　EAP 是顺序解锁制——完成当前项后，下一项才会出现在日历里。")
-        lines.append("　　如果不确定当前进度，建议直接上 LearningMall 的 EAP043 页面看一眼。")
-    else:
-        lines.append("")
-        lines.append("💡 EAP 作业是顺序解锁的，完成当前项才会开放下一项。")
+    return "\n".join(lines)
     return "\n".join(lines)
 
 
