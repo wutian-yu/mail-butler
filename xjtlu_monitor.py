@@ -730,11 +730,12 @@ def ams_course_label(code):
 
 
 def ams_login_get_token(page):
-    """访问 AMS 走 SSO 自动登录，从 localStorage 抓 x-token"""
+    """访问 AMS 走 SSO 自动登录，从 localStorage 抓 x-token
+    注意：Actions 到西浦网络慢（LM SAML 实测 53 秒），等待上限 3 分钟"""
     log("🏫 登录 AMS 考勤系统...")
     try:
-        page.goto(AMS_CHECKIN_URL, wait_until="domcontentloaded", timeout=60000)
-        for i in range(25):
+        page.goto(AMS_CHECKIN_URL, wait_until="domcontentloaded", timeout=90000)
+        for i in range(90):
             time.sleep(2)
             try:
                 u = page.url
@@ -745,6 +746,8 @@ def ams_login_get_token(page):
                 if token and len(str(token)) >= 16:
                     log(f"✅ AMS 登录成功，x-token 已获取 ({i * 2 + 2}秒)")
                     return token
+                if i % 15 == 14:
+                    log(f"⏳ AMS SSO 链等待中... ({i * 2 + 2}秒) URL: {u[:55]}")
             except Exception:
                 continue
         log("❌ AMS 登录超时，未拿到 x-token")
@@ -1434,7 +1437,18 @@ def run():
                 state["eap_progress"] = eap
 
         # 5. AMS 考勤系统（缺勤检测/出勤率/签到提醒；token 存 state 供云函数远程签到）
-        ams = fetch_ams_data(page) if logged_in else None
+        #    用桌面 UA 独立 context：AMS 是 /studentpc/ 页面，iPhone UA 可能被跳转/渲染异常
+        ams = None
+        if logged_in:
+            try:
+                ams_ctx = browser.new_context(locale="zh-CN")
+                ams_ctx.add_cookies(context.cookies())
+                ams_page = ams_ctx.new_page()
+                ams = fetch_ams_data(ams_page)
+                ams_ctx.close()
+            except Exception as e:
+                log(f"⚠️ AMS 桌面 context 异常: {e}")
+                ams = None
         if ams:
             ams_notes, ams_state = check_ams_changes(ams, state, is_first_run)
             notifications.extend(ams_notes)
