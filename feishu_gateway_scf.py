@@ -754,38 +754,6 @@ def _lm_course_label(categories, summary):
         return m.group(1)
     return ""
 
-def _lm_translate_action(summary):
-    """把作业事件的动作翻译成中文"""
-    s = summary
-    # 作业类型翻译（先长后短，避免误替换）
-    type_map = {
-        "Authorization Letter": "授权信",
-        "Weekly Assignment": "每周作业",
-        "Practice Quiz": "练习测验",
-        "Assignment": "作业",
-        "Quiz": "测验",
-        "Exam": "考试",
-        "Essay": "论文",
-        "Draft": "草稿",
-        "Test": "测试",
-        "Report": "报告",
-        "Project": "项目",
-        "Presentation": "演讲",
-        "Letter": "信函",
-    }
-    for en, cn in type_map.items():
-        if en in s:
-            s = s.replace(en, cn)
-            break
-    # 动作翻译
-    if "opens" in s.lower():
-        s = s.replace("opens", "开放").replace("Opens", "开放")
-    if "is due" in s.lower():
-        s = s.replace("is due", "截止").replace("Is Due", "截止")
-    if "closes" in s.lower():
-        s = s.replace("closes", "截止").replace("Closes", "截止")
-    return s
-
 def fetch_lm_assignments(days_ahead=14):
     """从 LearningMall ICS 日历拉取未来作业/考试截止事件"""
     if not LM_CAL_URL:
@@ -834,10 +802,8 @@ def fetch_lm_assignments(days_ahead=14):
                 continue
             if dt > now + timedelta(days=days_ahead):
                 continue
-            # 课程标签：从CATEGORIES提取课程代码并映射中文
+            # 课程标签：从CATEGORIES提取课程代码并映射中文（作业名保留英文原文）
             course_label = _lm_course_label(categories, summary)
-            # 动作翻译：opens→开放，is due→截止，closes→截止
-            action_cn = _lm_translate_action(summary)
             # 倒计时
             delta = dt - now
             if delta.days == 0:
@@ -846,8 +812,8 @@ def fetch_lm_assignments(days_ahead=14):
                 countdown = f"明天 {dt.strftime('%H:%M')}"
             else:
                 countdown = f"{delta.days}天后"
-            # 拼接完整标题：【课程】作业名·动作
-            full_title = f"【{course_label}】{action_cn}" if course_label else action_cn
+            # 拼接完整标题：【课程名】+ 英文原文
+            full_title = f"【{course_label}】{summary}" if course_label else summary
             events.append({
                 "summary": full_title,
                 "dt": dt,
