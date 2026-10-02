@@ -1307,6 +1307,70 @@ def cmd_leave_revoke(chat_id):
         feishu_send(chat_id, f"❌ 撤回异常：{e}")
 
 
+def cmd_del_calendar(chat_id, text):
+    """删除 Outlook 日历事件：「删日历」列出 →「删日历 N」删第N个 →「删日历全部 📚」清空管家加的"""
+    try:
+        events = outlook_events()
+    except Exception as e:
+        feishu_send(chat_id, f"❌ 读取日历失败：{e}")
+        return
+    if not events:
+        feishu_send(chat_id, "📭 Outlook 日历上没有日程。")
+        return
+    # 按时间排序
+    events.sort(key=lambda e: e.get("Start", {}).get("DateTime", ""))
+    # 删指定编号
+    num = 0
+    m = re.search(r"(\d+)", text)
+    if m:
+        num = int(m.group(1))
+    if num == 0:
+        # 列出
+        lines = [f"📅 Outlook 日历日程（共 {len(events)} 个）："]
+        for i, e in enumerate(events, 1):
+            subj = (e.get("Subject") or "(无标题)")[:45]
+            t = (e.get("Start", {}).get("DateTime", "") or "")
+            t_str = f"{t[5:10]} {t[11:16]}" if len(t) >= 16 else "时间待定"
+            lines.append(f"{i}. {subj} · {t_str}")
+        lines.append("\n🗑️「删日历 N」删第N个　🗑️「删日历全部 📚」删所有📚开头的")
+        feishu_send(chat_id, "\n".join(lines))
+        return
+    if num < 1 or num > len(events):
+        feishu_send(chat_id, f"⚠️ 编号超出范围（1-{len(events)}）")
+        return
+    target = events[num - 1]
+    eid = target.get("Id", "")
+    subj = (target.get("Subject") or "")[:45]
+    try:
+        outlook_delete(eid)
+        feishu_send_action(chat_id, "✅ 已删除", f"已从 Outlook 日历删除：\n{subj}", color="green")
+    except Exception as e:
+        feishu_send(chat_id, f"❌ 删除失败：{e}")
+
+
+def cmd_del_calendar_all_hw(chat_id):
+    """删除所有管家加的作业日历事件（📚 开头）"""
+    try:
+        events = outlook_events()
+    except Exception as e:
+        feishu_send(chat_id, f"❌ 读取日历失败：{e}")
+        return
+    hw_events = [e for e in events if (e.get("Subject") or "").startswith("📚")]
+    if not hw_events:
+        feishu_send(chat_id, "📭 没有找到📚开头的作业日历事件。")
+        return
+    deleted = 0
+    for e in hw_events:
+        try:
+            outlook_delete(e.get("Id", ""))
+            deleted += 1
+        except Exception:
+            pass
+    feishu_send_action(chat_id, "✅ 批量删除完成",
+        f"已删除 {deleted} 个作业日历事件。\n\n现在可以重新发「把XX作业加到日历」，不会再重复了。",
+        color="green")
+
+
 def cmd_homework_to_calendar(chat_id, text):
     """把 LM 作业写进 Outlook 日历（用户说"把XX作业加到日历"时触发）
     支持：课程名/课程码过滤 + 日期过滤"""
@@ -1413,6 +1477,14 @@ def process_command(text, chat_id):
         return
     if t in ("撤回请假", "撤销请假", "撤回申请"):
         cmd_leave_revoke(chat_id)
+        return
+    # 删日历：列出/删第N个/删所有作业
+    if t.startswith("删日历") or t.startswith("删除日历"):
+        rest = text[3:] if text.startswith("删日历") else text[4:]
+        if "全部" in rest and "📚" in rest:
+            cmd_del_calendar_all_hw(chat_id)
+        else:
+            cmd_del_calendar(chat_id, rest)
         return
     if t.startswith("改假条") or t.startswith("改原因"):
         # 重新生成假条原因
