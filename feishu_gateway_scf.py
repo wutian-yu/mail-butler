@@ -700,9 +700,10 @@ def cmd_checkin(chat_id, code):
     ams, _, _ = _ams_state()
     token = ams.get("token", "")
     if not token:
+        triggered = trigger_monitor_refresh()
         feishu_send(chat_id, "❌ 暂无 AMS 签到凭证（x-token）。\n\n"
-                             "监控每 30 分钟自动刷新一次，稍后再试；\n"
-                             "若持续失败，请检查监控 Actions 是否正常运行。")
+                             + ("⏳ 已触发监控立刻刷新（约 2~4 分钟），稍后重试即可。" if triggered
+                                else "监控每 30 分钟自动刷新一次，稍后再试；若持续失败请检查监控 Actions。"))
         return
     try:
         resp = _http(f"{AMS_URL}/xjtlu/sign/qRCodeSign?code={urllib.parse.quote(code)}&type=2",
@@ -721,7 +722,12 @@ def cmd_checkin(chat_id, code):
         feishu_send(chat_id, f"❌ 签到失败：{msg or '签到码无效或已过期'}\n\n"
                              "请确认码是否正确。密码签到 72 小时内有效，可让同学转告后重试。")
     else:
-        hint = "\n\n💡 x-token 可能已过期，等监控下次运行自动刷新后再试。" \
+        hint = ""
+        if _ams_token_dead(resp):
+            hint = ("\n\n⏳ 已触发监控立刻刷新凭证（约 2~4 分钟），稍等后重试即可。"
+                    if trigger_monitor_refresh() else "\n\n💡 x-token 已过期且刷新失败，请检查监控 Actions。")
+        else:
+            hint = "\n\n💡 x-token 可能已过期，等监控下次运行自动刷新后再试。" \
                if (rc in (401, 403) or "token" in str(msg).lower()) else ""
         feishu_send(chat_id, f"❌ 签到失败（code={rc}）：{msg or '未知错误'}{hint}")
 
@@ -1004,6 +1010,33 @@ def _format_leave_reason(user_reason, leave_type):
             f"are not affected. I kindly request an authorised absence for the selected session(s).")
 
 
+def trigger_monitor_refresh():
+    """触发 xjtlu-monitor workflow 立刻运行：刷新 AMS x-token（不等 30 分钟 cron）"""
+    if not GH_TOKEN:
+        return False
+    try:
+        req = urllib.request.Request(
+            f"https://api.github.com/repos/{REPO}/actions/workflows/xjtlu-monitor.yml/dispatches",
+            data=json.dumps({"ref": "main"}).encode(), method="POST",
+            headers={"Authorization": f"Bearer {GH_TOKEN}",
+                     "Accept": "application/vnd.github+json",
+                     "Content-Type": "application/json"})
+        urllib.request.urlopen(req, timeout=10)
+        log("✅ 已触发 monitor 立刻刷新 AMS x-token")
+        return True
+    except Exception as e:
+        log(f"触发 monitor 刷新失败: {e}")
+        return False
+
+
+def _ams_token_dead(resp):
+    """AMS 响应是否为凭证失效（实测 401 响应：The account is invalid. Please log in again.）"""
+    if not isinstance(resp, dict):
+        return False
+    msg = str(resp.get("message", "")).lower()
+    return resp.get("code") == 401 or "invalid" in msg or "log in again" in msg
+
+
 def cmd_leave(chat_id, text):
     """请假第1步：解析日期/课程/原因 → 查课节 → 生成假条 → 预览并等图片证明
     用法：请假 10-05 EAP043 崴脚了去不了 | 请假 明天 全天 病了
@@ -1017,7 +1050,10 @@ def cmd_leave(chat_id, text):
     ams, _, _ = _ams_state()
     token = ams.get("token", "")
     if not token:
-        feishu_send(chat_id, "❌ 暂无 AMS 凭证，监控刷新后再试（约30分钟内）。")
+        triggered = trigger_monitor_refresh()
+        feishu_send(chat_id, "❌ 暂无 AMS 凭证。\n\n"
+                             + ("⏳ 已触发监控立刻刷新（约 2~4 分钟），稍后重说一遍「请假 日期 原因」即可。" if triggered
+                                else "监控每 30 分钟自动刷新一次，稍后再试；若持续失败请检查监控 Actions。"))
         return
     # 1. 解析日期
     date = parse_leave_date(rest)
@@ -1052,6 +1088,13 @@ def cmd_leave(chat_id, text):
                      f"?startDate={date}&endDate={date}", headers={"x-token": token}, timeout=15)
     except Exception as e:
         feishu_send(chat_id, f"❌ 查询课节失败：{e}")
+        return
+    if _ams_token_dead(resp):
+        if trigger_monitor_refresh():
+            feishu_send(chat_id, "⏳ AMS 凭证刚好过期，我已触发监控立刻刷新（约 2~4 分钟）\n\n"
+                                 "稍等几分钟后重说一遍「请假 日期 原因」即可，假条不会丢。")
+        else:
+            feishu_send(chat_id, "❌ AMS 凭证过期且自动刷新失败，请检查监控 Actions 是否正常。")
         return
     if not isinstance(resp, dict) or resp.get("code") != 0 or not resp.get("data"):
         feishu_send(chat_id, "📭 该日期没有可请假的课节（可能没课或超出范围）。")
@@ -1104,6 +1147,11 @@ def cmd_leave_confirm_attachment(chat_id, image_bytes, filename):
         return True
     try:
         up = _http_upload_ams(f"{AMS_URL}/xjtlu/file/uploadToObject", token, filename, image_bytes)
+        if _ams_token_dead(up):
+            trigger_monitor_refresh()
+            feishu_send(chat_id, "⏳ AMS 凭证刚好过期，已触发监控刷新（约 2~4 分钟）。\n\n"
+                                 "申请还暂存着，几分钟后重发这张图片即可提交。")
+            return True
         if up.get("code") != 0 or not (up.get("data") or {}).get("fileUrl"):
             feishu_send(chat_id, f"❌ 证明上传失败：{up.get('message', '未知错误')}")
             return True
@@ -1117,6 +1165,11 @@ def cmd_leave_confirm_attachment(chat_id, image_bytes, filename):
         resp = _http(f"{AMS_URL}/xjtlu/stuapi/xjtlu-leave/addLeave", method="POST",
                      headers={"x-token": token, "Content-Type": "application/json"},
                      data=body, timeout=20)
+        if _ams_token_dead(resp):
+            trigger_monitor_refresh()
+            feishu_send(chat_id, "⏳ AMS 凭证刚好过期，已触发监控刷新（约 2~4 分钟）。\n\n"
+                                 "申请还暂存着，几分钟后重发这张图片即可提交。")
+            return True
     except Exception as e:
         feishu_send(chat_id, f"❌ 提交申请失败：{e}\n\n申请已暂存，可重发图片再试，或发「取消请假」放弃。")
         return True
