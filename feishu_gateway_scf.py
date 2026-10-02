@@ -1308,7 +1308,12 @@ def cmd_leave_revoke(chat_id):
 
 
 def cmd_del_calendar(chat_id, text):
-    """删除 Outlook 日历事件：「删日历」列出 →「删日历 N」删第N个 →「删日历全部 📚」清空管家加的"""
+    """删除 Outlook 日历事件
+    「删日历」→ 列出
+    「删日历 N」→ 删第N个
+    「删日历全部 📚」→ 删所有📚开头的
+    「删日历 10月9号的数学」→ 按日期+关键词过滤，匹配的列出供选择或全删
+    「删日历 10月9号的数学 全部」→ 匹配的全删"""
     try:
         events = outlook_events()
     except Exception as e:
@@ -1317,15 +1322,81 @@ def cmd_del_calendar(chat_id, text):
     if not events:
         feishu_send(chat_id, "📭 Outlook 日历上没有日程。")
         return
-    # 按时间排序
     events.sort(key=lambda e: e.get("Start", {}).get("DateTime", ""))
-    # 删指定编号
+
+    # 解析日期过滤
+    date_filter = None
+    dm = re.search(r"(\d{1,2})[月./\-](\d{1,2})", text)
+    if dm:
+        try:
+            date_filter = datetime(datetime.now().year, int(dm.group(1)), int(dm.group(2))).strftime("%m-%d")
+        except ValueError:
+            pass
+
+    # 解析课程/关键词过滤
+    kw_filter = None
+    for cn, kws in [("数学", ["MTH026", "MTH028", "微积分", "线代", "线性代数", "数学"]),
+                    ("微积分", ["MTH026", "微积分"]),
+                    ("线代", ["MTH028", "线代", "线性代数"]),
+                    ("英语", ["EAP043", "英语"]),
+                    ("体育", ["PHE001", "体育"]),
+                    ("科学", ["SCI004", "科学"]),
+                    ("心理", ["CCT007", "心理"]),
+                    ("毛概", ["CCT011", "毛概"]),
+                    ("马原", ["CCT001", "马原"])]:
+        if cn in text:
+            kw_filter = kws
+            break
+    # 也支持直接写课程码
+    cm = re.search(r"\b([A-Z]{3}\d{3})\b", text.upper())
+    if cm:
+        kw_filter = [cm.group(1)]
+
+    # 有日期或关键词过滤时：先筛选再决定列出还是删除
+    if date_filter or kw_filter:
+        matched = []
+        for e in events:
+            subj = (e.get("Subject") or "")
+            dt = (e.get("Start", {}).get("DateTime", "") or "")
+            dt_short = dt[5:10] if len(dt) >= 10 else ""  # MM-DD
+            if date_filter and dt_short != date_filter:
+                continue
+            if kw_filter and not any(k.lower() in subj.lower() for k in kw_filter):
+                continue
+            matched.append(e)
+        if not matched:
+            feishu_send(chat_id, "📭 没找到匹配的日历事件。")
+            return
+        # 「全部」→ 全删
+        if "全部" in text or "所有" in text or len(matched) == 1:
+            deleted = 0
+            for e in matched:
+                try:
+                    outlook_delete(e.get("Id", ""))
+                    deleted += 1
+                except Exception:
+                    pass
+            names = "、".join((e.get("Subject") or "")[:30] for e in matched[:3])
+            feishu_send_action(chat_id, "✅ 已删除",
+                f"删除了 {deleted} 个日历事件：\n{names}", color="green")
+            return
+        # 否则列出匹配的供选择
+        lines = [f"找到 {len(matched)} 个匹配的日历事件："]
+        for i, e in enumerate(matched, 1):
+            subj = (e.get("Subject") or "(无标题)")[:45]
+            t = (e.get("Start", {}).get("DateTime", "") or "")
+            t_str = f"{t[5:10]} {t[11:16]}" if len(t) >= 16 else "时间待定"
+            lines.append(f"{i}. {subj} · {t_str}")
+        lines.append(f"\n🗑️「删日历 N」删第N个　🗑️「删日历 {text.strip()} 全部」全删")
+        feishu_send(chat_id, "\n".join(lines))
+        return
+
+    # 无过滤：按编号删或列出
     num = 0
     m = re.search(r"(\d+)", text)
     if m:
         num = int(m.group(1))
     if num == 0:
-        # 列出
         lines = [f"📅 Outlook 日历日程（共 {len(events)} 个）："]
         for i, e in enumerate(events, 1):
             subj = (e.get("Subject") or "(无标题)")[:45]
@@ -1333,6 +1404,7 @@ def cmd_del_calendar(chat_id, text):
             t_str = f"{t[5:10]} {t[11:16]}" if len(t) >= 16 else "时间待定"
             lines.append(f"{i}. {subj} · {t_str}")
         lines.append("\n🗑️「删日历 N」删第N个　🗑️「删日历全部 📚」删所有📚开头的")
+        lines.append("💡 也可「删日历 10月9号的数学」按条件筛")
         feishu_send(chat_id, "\n".join(lines))
         return
     if num < 1 or num > len(events):
