@@ -1119,6 +1119,7 @@ def cmd_leave(chat_id, text):
         "leaveModuleList": all_sessions,
         "course_filter": course_filter,
         "created": datetime.now().strftime("%Y-%m-%d %H:%M"),
+        "created_ts": time.time(),
     }
     _save_leave_pending(pending)
     # 6. 预览
@@ -1140,6 +1141,12 @@ def cmd_leave_confirm_attachment(chat_id, image_bytes, filename):
     pending, _ = _load_leave_pending()
     if not pending or pending.get("status") != "awaiting_attachment":
         return False
+    # 防误触：预览超 30 分钟后发图不再自动提交，需重新发起
+    if pending.get("created_ts") and time.time() - pending["created_ts"] > 1800:
+        _save_leave_pending({})
+        feishu_send(chat_id, "⌛ 上一次的请假预览已超时（30 分钟保护已清空）。\n\n"
+                             "如仍需请假，请重新发「请假 日期 原因」，我再写一份假条。")
+        return True
     ams, _, _ = _ams_state()
     token = ams.get("token", "")
     if not token:
@@ -1197,6 +1204,36 @@ def cmd_leave_cancel(chat_id):
         feishu_send(chat_id, "📭 当前没有进行中的请假申请。")
 
 
+def cmd_leave_revoke(chat_id):
+    """撤回最近一次请假申请（DA 审批前可自助撤回，误触/改主意的救命勢）"""
+    ams, _, _ = _ams_state()
+    token = ams.get("token", "")
+    if not token:
+        feishu_send(chat_id, "❌ 暂无 AMS 凭证，无法撤回。")
+        return
+    try:
+        resp = _http(f"{AMS_URL}/xjtlu/stuapi/xjtlu-leave/getLeaveList?pageNum=1&pageSize=5",
+                     headers={"x-token": token}, timeout=15)
+        rows = (resp.get("data") or {}).get("list") or [] if isinstance(resp, dict) else []
+        if not rows:
+            feishu_send(chat_id, "📭 没有找到任何请假申请。")
+            return
+        latest = rows[0]
+        leave_odd = latest.get("leaveOdd") or latest.get("id")
+        status = latest.get("status", "")
+        # 撤回最新一条（用 leaveOdd 或 id）
+        cancel = _http(f"{AMS_URL}/xjtlu/stuapi/xjtlu-leave/cancelLeave/{leave_odd}",
+                       headers={"x-token": token}, timeout=15)
+        if isinstance(cancel, dict) and cancel.get("code") == 0:
+            feishu_send_action(chat_id, "✅ 请假申请已撤回",
+                f"{latest.get('startTime', '')} 的申请已从 AMS 撤回（原状态：{status}）。", color="green")
+        else:
+            msg = (cancel or {}).get("message", "未知错误") if isinstance(cancel, dict) else str(cancel)
+            feishu_send(chat_id, f"❌ 撤回失败：{msg}\n\n如果申请已在审批中，可能需在 AMS 网页或联系 DA 处理。")
+    except Exception as e:
+        feishu_send(chat_id, f"❌ 撤回异常：{e}")
+
+
 def process_command(text, chat_id):
     t = text.lower().strip()
     # 请假流程（优先级高，避免「请假」被其他规则吞掉）
@@ -1205,6 +1242,9 @@ def process_command(text, chat_id):
         return
     if t in ("取消请假", "取消申请", "放弃请假"):
         cmd_leave_cancel(chat_id)
+        return
+    if t in ("撤回请假", "撤销请假", "撤回申请"):
+        cmd_leave_revoke(chat_id)
         return
     if t.startswith("改假条") or t.startswith("改原因"):
         # 重新生成假条原因
