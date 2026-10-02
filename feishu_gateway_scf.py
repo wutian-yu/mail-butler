@@ -233,6 +233,29 @@ def outlook_delete(event_id):
     urllib.request.urlopen(req, timeout=30)
 
 
+def outlook_create_event(subject, start_dt, end_dt, body=""):
+    """在 Outlook 日历创建事件 → 同步到 iPhone 自带日历（前提：iPhone 已加 Outlook 账户）"""
+    token = get_outlook_token()
+    def fmt(dt):
+        return dt.strftime("%Y-%m-%dT%H:%M:%S")
+    ev = {
+        "Subject": subject[:120],
+        "Start": {"DateTime": fmt(start_dt), "TimeZone": "China Standard Time"},
+        "End": {"DateTime": fmt(end_dt), "TimeZone": "China Standard Time"},
+        "Body": {"ContentType": "Text", "Content": body or ""},
+        "ShowAs": "Free",
+        "IsReminderOn": True,
+        "Reminder": 30,
+    }
+    resp = _http("https://outlook.office.com/api/v2.0/me/events",
+                 method="POST",
+                 headers={"Authorization": f"Bearer {token}",
+                          "Content-Type": "application/json",
+                          "Accept": "application/json"},
+                 data=ev, timeout=30)
+    return resp.get("Id") if resp else None
+
+
 # ============ 日期工具 ============
 def fmt_date(s):
     if not s:
@@ -405,6 +428,38 @@ def cmd_calendar(chat_id):
     feishu_send(chat_id, "\n".join(lines))
 
 
+def _create_outlook_event_from_item(item):
+    """从 pending item 创建 Outlook 日历事件，返回 event_id 或 None"""
+    try:
+        subject = (item.get("subject") or "(活动)")[:100]
+        prefix = "📮"
+        title = f"{prefix} {subject}"
+        body = (item.get("summary") or item.get("preview") or "")[:500]
+        dates = item.get("dates") or []
+        time_range = item.get("time_range")  # [h0, m0, h1, m1] or None
+        now = datetime.now()
+        if dates:
+            d = dates[0]
+            if time_range and len(time_range) == 4:
+                start = d.replace(hour=time_range[0], minute=time_range[1])
+                end = d.replace(hour=time_range[2], minute=time_range[3])
+            else:
+                start = d.replace(hour=9)
+                end = d.replace(hour=10)
+        else:
+            # 时间待定：占位明天 9-10 点
+            start = now + timedelta(days=1)
+            start = start.replace(hour=9, minute=0, second=0, microsecond=0)
+            end = start.replace(hour=10)
+            title += "（时间待定）"
+        eid = outlook_create_event(title, start, end, body=body)
+        log(f"📅 Outlook 日历事件已创建: {title[:40]} → {eid}")
+        return eid
+    except Exception as e:
+        log(f"⚠️ 创建 Outlook 日历事件失败: {e}")
+        return None
+
+
 def cmd_approve(chat_id, text):
     try:
         pending, p_sha = gh_read_json("pending.json")
@@ -420,10 +475,16 @@ def cmd_approve(chat_id, text):
     # 批量：批准全部
     if "全部" in text or "all" in text:
         count = len(active)
+        created = 0
         for item in active:
             item["status"] = "confirmed"
+            # 真实写入 Outlook 日历
+            eid = _create_outlook_event_from_item(item)
+            if eid:
+                item["outlook_event_id"] = eid
+                created += 1
             confirmed.setdefault("items", []).append(item)
-        pending["items"] = [i for i in pending["items"] if i.get("status") != "pending"]
+        pending["items"] = [i for i in pending.get("items", []) if i.get("status") != "pending"]
         gh_write_json("pending.json", pending, p_sha, "approve all")
         try:
             confirmed2, c_sha2 = gh_read_json("confirmed.json")
@@ -431,7 +492,8 @@ def cmd_approve(chat_id, text):
             gh_write_json("confirmed.json", confirmed2, c_sha2, "approve all")
         except Exception:
             gh_write_json("confirmed.json", confirmed, c_sha, "approve all")
-        feishu_send_action(chat_id, "✅ 批量批准完成", f"已批准 **{count}** 个活动\n\n将自动同步到你的 iPhone 日历。", color="green")
+        sync_note = f"已批准 **{count}** 个活动，{created} 个已写入 Outlook 日历。\n\n打开 iPhone 日历 app 即可看到（如果看不到，在日历 app 里点底部「日历」勾选 Outlook 分组）。" if created else f"已批准 **{count}** 个活动，但写入日历失败，稍后 Actions 会补写。"
+        feishu_send_action(chat_id, "✅ 批量批准完成", sync_note, color="green")
         trigger_github()
         return
 
@@ -451,6 +513,10 @@ def cmd_approve(chat_id, text):
     conflict_msg = _check_conflict(item)
 
     item["status"] = "confirmed"
+    # 真实写入 Outlook 日历
+    eid = _create_outlook_event_from_item(item)
+    if eid:
+        item["outlook_event_id"] = eid
     confirmed.setdefault("items", []).append(item)
     pending["items"].remove(item)
     gh_write_json("pending.json", pending, p_sha, "approve")
@@ -461,11 +527,15 @@ def cmd_approve(chat_id, text):
     except Exception:
         gh_write_json("confirmed.json", confirmed, c_sha, "approve")
     result_msg = f"📌 {item['subject'][:50]}\n📅 {item.get('date_txt', '时间待定')}\n👤 {item.get('sender', '')}"
+    if eid:
+        result_msg += "\n\n✅ 已写入 Outlook 日历，iPhone 日历会自动同步显示。"
+    else:
+        result_msg += "\n\n⚠️ 写入日历失败，稍后 Actions 会补写。"
     if conflict_msg:
         result_msg += f"\n\n⚠️ **冲突提醒**\n{conflict_msg}"
         feishu_send_action(chat_id, "✅ 已加入日历（有冲突）", result_msg, color="orange")
     else:
-        feishu_send_action(chat_id, "✅ 已加入日历", result_msg + "\n\n将自动同步到你的 iPhone 日历。", color="green")
+        feishu_send_action(chat_id, "✅ 已加入日历", result_msg, color="green")
     trigger_github()
 
 
