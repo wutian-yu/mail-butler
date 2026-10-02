@@ -45,4 +45,4 @@ jobs:
           git config user.name "XJTLU Monitor Bot"
           git config user.email "bot@xjtlu.edu.cn"
           git add .
-          git diff --cached --quiet || (git pull --rebase origin main 2>/dev/null; git commit -m "xjtlu state update" && git push)
+          git diff --cached --quiet || (git commit -m "xjtlu state update" && git push -f)
