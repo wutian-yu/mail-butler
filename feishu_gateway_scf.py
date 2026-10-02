@@ -277,7 +277,9 @@ HELP_TEXT = (
     "📅「日程」Outlook全部日程\n"
     "🗑️「删除」查看可删除清单\n"
     "🗑️「删除 N / 日期 / 名称」删除指定日程\n"
-    "🗑️「删除全部」一键清空\n\n"
+    "🗑️「删除全部」一键清空\n"
+    "🏫「签到 码」远程签到 AMS（72小时内可补）\n"
+    "📊「出勤」AMS 出勤率统计\n\n"
     "💡 删除=自动判断从哪移除，不用操心\n"
     "💡 也可以直接跟我聊天～"
 )
@@ -678,8 +680,82 @@ def cmd_homework(chat_id):
     send_homework_card(chat_id, events)
 
 
+# ============ AMS 远程签到 ============
+AMS_URL = "https://ams.xjtlu.edu.cn"
+
+
+def _ams_state():
+    """读 butler-data 的 xjtlu_state.json，返回 (ams 快照, 完整 state, sha)"""
+    try:
+        data, sha = gh_read_json("xjtlu_state.json")
+        return data.get("ams") or {}, data, sha
+    except Exception as e:
+        log(f"AMS state 读取失败: {e}")
+        return {}, None, ""
+
+
+def cmd_checkin(chat_id, code):
+    """远程签到：AMS 密码签到码（72小时内可补签，无需在教室）"""
+    ams, _, _ = _ams_state()
+    token = ams.get("token", "")
+    if not token:
+        feishu_send(chat_id, "❌ 暂无 AMS 签到凭证（x-token）。\n\n"
+                             "监控每 30 分钟自动刷新一次，稍后再试；\n"
+                             "若持续失败，请检查监控 Actions 是否正常运行。")
+        return
+    try:
+        resp = _http(f"{AMS_URL}/xjtlu/sign/qRCodeSign?code={urllib.parse.quote(code)}&type=2",
+                     headers={"x-token": token}, timeout=15)
+    except Exception as e:
+        feishu_send(chat_id, f"❌ 签到请求失败（AMS 或网络异常）: {e}")
+        return
+    rc = (resp or {}).get("code")
+    msg = (resp or {}).get("message", "")
+    if rc == 0:
+        feishu_send_action(chat_id, "✅ 签到成功！",
+                           f"签到码 {code} 已提交到 AMS。\n"
+                           "出勤率将在 24 小时后更新。\n"
+                           "若码不对应当前课节，AMS 会拒绝并提示。", color="green")
+    elif rc == 1001:
+        feishu_send(chat_id, f"❌ 签到失败：{msg or '签到码无效或已过期'}\n\n"
+                             "请确认码是否正确。密码签到 72 小时内有效，可让同学转告后重试。")
+    else:
+        hint = "\n\n💡 x-token 可能已过期，等监控下次运行自动刷新后再试。" \
+               if (rc in (401, 403) or "token" in str(msg).lower()) else ""
+        feishu_send(chat_id, f"❌ 签到失败（code={rc}）：{msg or '未知错误'}{hint}")
+
+
+def cmd_attendance(chat_id):
+    """查询 AMS 出勤率统计（数据来自监控最近一次同步）"""
+    ams, _, _ = _ams_state()
+    att = ams.get("attendance") or {}
+    if not att:
+        feishu_send(chat_id, "📭 出勤数据尚未同步。\n\n监控每 30 分钟拉取一次 AMS，稍后再试。")
+        return
+    overall = att.get("overall", "?")
+    warn = "\n🚨 已触发学校出勤率阈值警告，请尽快联系 DA！" if att.get("threshold") else ""
+    lines = [f"📊 AMS 考勤统计 · 总出勤率 {overall}%{warn}"]
+    modules = att.get("modules") or {}
+    for code, m in sorted(modules.items()):
+        flag = " ⚠️阈值" if m.get("threshold") else ""
+        lines.append(f"· {code} {m.get('att', '?')}%"
+                     f"（已签 {m.get('sign_hours', 0)}/{m.get('total_hours', 0)} 课时，缺勤 {m.get('absences', 0)} 次）{flag}")
+    last = ams.get("last_check", "")
+    if last:
+        lines.append(f"\n⏱️ 数据同步于 {last}")
+    feishu_send(chat_id, "\n".join(lines))
+
+
 def process_command(text, chat_id):
     t = text.lower().strip()
+    # 签到：精确匹配「签到 <数字码>」，避免误触聊天
+    m = re.match(r"^(?:签到|checkin|check in)[\s:：]*(\d{3,8})\s*$", t)
+    if m:
+        cmd_checkin(chat_id, m.group(1))
+        return
+    if t in ("出勤", "出勤率", "考勤", "attendance"):
+        cmd_attendance(chat_id)
+        return
     # 批量操作优先匹配
     if "全部" in t or "all" in t:
         if "批准" in t or "approve" in t or "加入" in t or "确认" in t:
