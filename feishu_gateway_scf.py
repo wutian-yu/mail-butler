@@ -254,7 +254,8 @@ def outlook_create_event(subject, start_dt, end_dt, body=""):
                  "Origin": "https://outlook.office.com",
                  "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36"})
     with urllib.request.urlopen(req, timeout=30) as r:
-        resp = json.loads(r.read().decode()) if r.read() else None
+        raw = r.read()
+    resp = json.loads(raw.decode()) if raw else None
     return resp.get("Id") if resp else None
 
 
