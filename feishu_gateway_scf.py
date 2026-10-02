@@ -673,9 +673,9 @@ def _do_smart_delete_one(chat_id, item, confirmed, c_sha):
 
 
 def cmd_homework(chat_id):
-    """查看 LearningMall 作业截止时间"""
+    """查看 LearningMall 作业截止时间（卡片格式）"""
     events = fetch_lm_assignments()
-    feishu_send(chat_id, format_homework(events))
+    send_homework_card(chat_id, events)
 
 
 def process_command(text, chat_id):
@@ -836,7 +836,7 @@ def fetch_lm_assignments(days_ahead=14):
 
 
 def format_homework(events):
-    """格式化作业列表供飞书消息展示"""
+    """格式化作业列表供飞书消息展示（纯文本版，卡片失败时备用）"""
     if not events:
         return "📚 当前没有即将到期的作业，可以轻松一下～"
     lines = [f"📚 近期作业/测验（共{len(events)}项）："]
@@ -846,7 +846,95 @@ def format_homework(events):
         lines.append(f"　　⏰ {ev['dt'].strftime('%m月%d日 %H:%M')} · {act} · {ev['countdown']}" if act
                      else f"　　⏰ {ev['dt'].strftime('%m月%d日 %H:%M')} · {ev['countdown']}")
     return "\n".join(lines)
-    return "\n".join(lines)
+
+
+def format_homework_card(events):
+    """生成飞书卡片：按课程分组的作业列表（彩色标题+表格布局）"""
+    if not events:
+        return None
+    # 按课程分组（保持时间序）
+    courses = {}
+    order = []
+    for ev in events:
+        m = re.match(r'【(.+?)】(.+)', ev["summary"])
+        if m:
+            course, name = m.group(1), m.group(2)
+        else:
+            course, name = "其他", ev["summary"]
+        if course not in courses:
+            courses[course] = []
+            order.append(course)
+        courses[course].append({
+            "name": name,
+            "time": ev["dt"].strftime('%m月%d日 %H:%M'),
+            "action": ev.get("action", ""),
+            "countdown": ev["countdown"],
+        })
+    elements = []
+    for idx, course in enumerate(order):
+        items = courses[course]
+        if idx > 0:
+            elements.append({"tag": "hr"})
+        elements.append({
+            "tag": "div",
+            "text": {"tag": "lark_md",
+                     "content": f"**📘 {course}**（{len(items)}项）"}
+        })
+        for it in items:
+            # 状态图标：截止🔴 开放🟢
+            if it["action"] == "截止":
+                status = f"🔴 截止 · {it['countdown']}"
+            elif it["action"] == "开放":
+                status = f"🟢 开放 · {it['countdown']}"
+            else:
+                status = it["countdown"]
+            elements.append({
+                "tag": "column_set",
+                "flex_mode": "bisect",
+                "background_style": "grey",
+                "columns": [
+                    {"tag": "column", "width": "weighted", "weight": 1,
+                     "elements": [{"tag": "div",
+                                   "text": {"tag": "lark_md", "content": it["name"][:40]}}]},
+                    {"tag": "column", "width": "weighted", "weight": 1,
+                     "elements": [{"tag": "div",
+                                   "text": {"tag": "lark_md",
+                                            "content": f"{it['time']}\n{status}"}}]}
+                ]
+            })
+    elements.append({"tag": "hr"})
+    elements.append({"tag": "note", "elements": [
+        {"tag": "plain_text", "content": "📅 数据来自 LearningMall 日历订阅"}
+    ]})
+    return {
+        "config": {"wide_screen_mode": True},
+        "header": {
+            "template": "blue",
+            "title": {"tag": "plain_text", "content": f"📚 近期作业/测验（共{len(events)}项）"}
+        },
+        "elements": elements
+    }
+
+
+def send_homework_card(chat_id, events):
+    """发送作业列表卡片消息，失败时回退纯文本"""
+    if not FEISHU_APP_ID or not FEISHU_APP_SECRET:
+        return
+    card = format_homework_card(events)
+    if not card:
+        feishu_send(chat_id, "📚 当前没有即将到期的作业，可以轻松一下～")
+        return
+    try:
+        token = get_feishu_token()
+        _http(f"{FEISHU_BASE}/open-apis/im/v1/messages?receive_id_type=chat_id",
+              method="POST",
+              headers={"Authorization": f"Bearer {token}"},
+              data={"receive_id": chat_id, "msg_type": "interactive",
+                    "content": json.dumps(card)})
+        log(f"✅ 作业卡片已发送（{len(events)}项）")
+    except Exception as e:
+        log(f"❌ 作业卡片发送失败: {e}，回退纯文本")
+        feishu_send(chat_id, format_homework(events))
 
 
 # ============ 大模型对话 ============
