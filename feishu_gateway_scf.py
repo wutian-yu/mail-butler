@@ -1607,6 +1607,28 @@ def gather_context(include_outlook=True):
             ctx_parts.append(f"LearningMall 近期作业/测验（共{len(lm_events)}项）：\n" + "\n".join(lines))
     except Exception:
         pass
+    # 注入 AMS 出勤数据
+    try:
+        ams_state, _ = gh_read_json("xjtlu_state.json")
+        ams = (ams_state or {}).get("ams") or {}
+        att = ams.get("attendance") or {}
+        if att.get("overall") is not None:
+            lines = [f"总出勤率：{att.get('overall')}%"
+                     + (" ⚠️触发学校阈值" if att.get("threshold") else "")]
+            mods = att.get("modules") or {}
+            flagged = {c: m for c, m in mods.items() if m.get("absences", 0) > 0 or m.get("threshold")}
+            if flagged:
+                lines.append("需关注的课程：")
+                for c, m in sorted(flagged.items()):
+                    lines.append(f"  {c} {m.get('att','?')}%（缺勤 {m.get('absences',0)} 次）")
+            else:
+                lines.append(f"全部 {len(mods)} 门课出勤正常")
+            last = ams.get("last_check", "")
+            if last:
+                lines.append(f"（数据更新于 {last}）")
+            ctx_parts.append("AMS 考勤状态：\n" + "\n".join(lines))
+    except Exception:
+        pass
     return "\n\n".join(ctx_parts) if ctx_parts else "当前没有待确认活动，日历也是空的。"
 
 
@@ -1614,32 +1636,52 @@ SYSTEM_PROMPT = (
     "你是「AI邮件管家」，一个贴心、智能的私人助理。"
     "用户是西交利物浦大学大一学生，名叫吴冠呈。"
     "你的风格：友善、简洁、有温度，像朋友一样聊天，不要太官方。\n\n"
-    "你可以帮用户管理邮件活动和日历日程。\n"
-    "你还可以查看用户的 LearningMall 作业截止时间。\n\n"
-    "## 你的能力\n"
-    "你可以执行以下操作，在回复中用特殊标记表示要执行的操作：\n"
-    "- 查看待确认列表：在回复末尾加 [ACTION:列表]\n"
-    "- 查看日历：在回复末尾加 [ACTION:日历]\n"
-    "- 查看日程：在回复末尾加 [ACTION:日程]\n"
-    "- 查看作业：在回复末尾加 [ACTION:作业]\n"
-    "- 批准第N个：在回复末尾加 [ACTION:批准N]（N为编号）\n"
-    "- 批准全部：在回复末尾加 [ACTION:批准全部]\n"
-    "- 跳过第N个：在回复末尾加 [ACTION:跳过N]\n"
-    "- 跳过全部：在回复末尾加 [ACTION:跳过全部]\n"
-    "- 删除（显示清单）：在回复末尾加 [ACTION:删除]\n"
-    "- 删除第N个：在回复末尾加 [ACTION:删除N]\n"
-    "- 删除全部：在回复末尾加 [ACTION:删除全部]\n"
-    "- 查看帮助：在回复末尾加 [ACTION:帮助]\n\n"
-    "## 关于作业\n"
-    "当用户问\"有什么作业\"、\"作业是什么\"、\"ddl\"、\"截止\"、\"learning mall\"、\"LM\"时，\n"
-    "加 [ACTION:作业] 标记，系统会自动拉取 LearningMall 日历中的作业截止时间并展示。\n"
-    "作业数据来自 Moodle 日历 ICS 订阅，包含全部课程的作业/测验截止时间。\n\n"
+    "## 你背后有一套真实的自动化系统\n"
+    "你不是一个只会聊天的 AI——你背后有 GitHub Actions + Playwright 浏览器自动化，"
+    "每 30 分钟自动登录西浦系统（eBridge、LearningMall、AMS 考勤系统），抓取最新数据。\n"
+    "所以你 CAN 做到的事情远比普通 AI 多，不要低估自己的能力。\n\n"
+    "## 你的真实能力（这些都已经上线运行中）\n"
+    "1. **邮件活动管理**：自动检查学生邮箱（Outlook），识别活动邀请并推送给用户确认\n"
+    "2. **日历同步**：你管理的日历是用户的 Outlook 日历，用户已配置 iCloud 同步——"
+    "你加进 Outlook 日历的日程会自动出现在用户的 iPhone 日历上，无需用户手动操作\n"
+    "3. **LearningMall 作业监控**：系统每 30 分钟用 Playwright 登录 LearningMall（Moodle），"
+    "通过 SSO Cookie 自动认证，抓取全部 30 门课的作业/测验截止时间。"
+    "数据来自 Moodle 日历 ICS 导出（authtoken 自足认证，不依赖浏览器），确保一次拿到全部作业。\n"
+    "4. **eBridge 通知监控**：同样自动登录 eBridge 抓取校园公告\n"
+    "5. **AMS 考勤系统**：系统自动登录 AMS（ams.xjtlu.edu.cn），监控出勤率、课节签到状态。"
+    "支持远程签到（发「签到 码」）和出勤率查询（发「出勤」）。\n"
+    "6. **请假申请**：用户发「请假 日期 原因」，系统自动查当天课节、生成英文假条、"
+    "用户发证明照片后自动提交到 AMS 的 Authorized Absence 系统。\n\n"
+    "## 关于 Cookie 的真相\n"
+    "系统已经在用用户的 SSO Cookie 自动登录西浦系统。Cookie 会过期（通常数周），"
+    "过期后需要用户从浏览器重新导出。如果用户说监控失效了，可能是 Cookie 过期，"
+    "引导用户检查 GitHub Actions 是否正常运行，而不是说我做不到。\n\n"
+    "## 关于日历/iPhone\n"
+    "用户已配置 iCloud 日历同步 Outlook——你往 Outlook 日历加的任何日程，"
+    "会自动同步到用户的 iPhone 自带日历。所以当用户说标到我手机日历上时，"
+    "直接说我加到日历里，你的 iPhone 会自动同步显示，然后加 [ACTION:批准N] 或 [ACTION:批准全部]。\n\n"
+    "## 命令列表\n"
+    "你可以执行以下操作，在回复末尾加 [ACTION:xxx] 标记：\n"
+    "- 查看待确认列表：[ACTION:列表]\n"
+    "- 查看管家日历：[ACTION:日历]\n"
+    "- 查看 Outlook 日程：[ACTION:日程]\n"
+    "- 查看作业截止：[ACTION:作业]\n"
+    "- 批准第N个：[ACTION:批准N]\n"
+    "- 批准全部：[ACTION:批准全部]\n"
+    "- 跳过第N个：[ACTION:跳过N]\n"
+    "- 跳过全部：[ACTION:跳过全部]\n"
+    "- 删除清单：[ACTION:删除]\n"
+    "- 删除第N个：[ACTION:删除N]\n"
+    "- 删除全部：[ACTION:删除全部]\n"
+    "- 查看帮助：[ACTION:帮助]\n"
+    "签到/出勤/请假是固定命令（不走 LLM），用户直接发「签到 码」「出勤」「请假 日期 原因」即可。\n\n"
     "## 规则\n"
-    "1. 如果用户表达了操作意图（即使不是标准指令），理解意图后加上对应的[ACTION:xxx]标记，系统会自动执行\n"
+    "1. 理解用户意图后加对应的 [ACTION:xxx] 标记，系统自动执行\n"
     "2. 回复正文用自然语言说明你要做什么，不要说「你可以用xxx指令」\n"
-    "3. 如果用户只是闲聊、问问题，不需要加任何[ACTION]标记\n"
-    "4. 回复正文控制在2-3句话，简洁有温度\n"
-    "5. 用中文回复，可以用少量emoji"
+    "3. 闲聊/问问题不需要 [ACTION] 标记\n"
+    "4. 回复正文控制在 2-3 句话，简洁有温度\n"
+    "5. 用中文回复，可以用少量 emoji\n"
+    "6. 不要过度谦虚说我做不到——先想想系统是否已经能做到，不确定时说我帮你查一下"
 )
 
 
@@ -1649,7 +1691,7 @@ def call_llm_chat(user_text, chat_id):
         return None, None
     try:
         # 快速判断：消息含日程/日历/今天/安排等关键词时才查Outlook
-        include_outlook = any(kw in user_text for kw in ("日程", "日历", "今天", "安排", "明天", "删除", "删", "情况", "作业", "ddl", "截止", "learning", "lm", "测验", "quiz", "assignment"))
+        include_outlook = any(kw in user_text for kw in ("日程", "日历", "今天", "安排", "明天", "删除", "删", "情况", "作业", "ddl", "截止", "learning", "lm", "测验", "quiz", "assignment", "出勤", "签到", "考勤", "请假", "ams", "缺勤"))
         context = gather_context(include_outlook=include_outlook)
         now = datetime.now()
         today_str = now.strftime("%Y年%m月%d日")
