@@ -234,27 +234,27 @@ def outlook_delete(event_id):
 
 
 def outlook_create_event(subject, start_dt, end_dt, body=""):
-    """在 Outlook 日历创建事件 → 同步到 iPhone 自带日历（前提：iPhone 已加 Outlook 账户）"""
+    """在 Outlook 日历创建事件 → 同步到 iPhone 自带日历
+    完全对齐 butler.py 的 _call 实现，避免 _http 的 header 冲突"""
     token = get_outlook_token()
-    def fmt(dt):
-        return dt.strftime("%Y-%m-%dT%H:%M:%S")
     ev = {
         "Subject": subject[:120],
-        "Start": {"DateTime": fmt(start_dt), "TimeZone": "China Standard Time"},
-        "End": {"DateTime": fmt(end_dt), "TimeZone": "China Standard Time"},
+        "Start": {"DateTime": start_dt.strftime("%Y-%m-%dT%H:%M:%S"), "TimeZone": "China Standard Time"},
+        "End": {"DateTime": end_dt.strftime("%Y-%m-%dT%H:%M:%S"), "TimeZone": "China Standard Time"},
         "Body": {"ContentType": "Text", "Content": body or ""},
         "ShowAs": "Free",
-        "IsReminderOn": True,
-        "Reminder": 30,
     }
-    resp = _http("https://outlook.office.com/api/v2.0/me/events",
-                 method="POST",
-                 headers={"Authorization": f"Bearer {token}",
-                          "Content-Type": "application/json",
-                          "Accept": "application/json",
-                          "Origin": "https://outlook.office.com",
-                          "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36"},
-                 data=ev, timeout=30)
+    # 不用 _http（它会重复设 Content-Type），直接手写，完全对齐 butler.py 的 _call
+    data = json.dumps(ev).encode()
+    req = urllib.request.Request("https://outlook.office.com/api/v2.0/me/events",
+        data=data, method="POST",
+        headers={"Authorization": f"Bearer {token}",
+                 "Accept": "application/json",
+                 "Content-Type": "application/json",
+                 "Origin": "https://outlook.office.com",
+                 "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36"})
+    with urllib.request.urlopen(req, timeout=30) as r:
+        resp = json.loads(r.read().decode()) if r.read() else None
     return resp.get("Id") if resp else None
 
 
