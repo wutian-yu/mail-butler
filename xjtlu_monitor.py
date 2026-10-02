@@ -593,17 +593,20 @@ def fetch_ics_url(url):
 
 
 def saml_login_core(page):
-    """SAML 登录 LM Core（成功返回 True）"""
+    """SAML 登录 LM Core（完全复用 regenerate_lm_calendar_url 的等待逻辑）"""
     try:
         page.goto(LM_SAML_LOGIN_URL, wait_until="domcontentloaded", timeout=60000)
         for i in range(20):
             time.sleep(2)
             u = page.url
-            if u.startswith("https://core.xjtlu.edu.cn") and "/auth/saml2" not in u and "login" not in u:
+            if u.startswith("https://core.xjtlu.edu.cn") and "/auth/saml2" not in u:
                 return True
-        return False
+        # 备用：直接访问 /my/ 看是否登录
+        page.goto(LM_CORE_URL + "/my/", wait_until="domcontentloaded", timeout=45000)
+        time.sleep(5)
+        return "/auth" not in page.url and "login" not in page.url.lower()
     except Exception as e:
-        log(f"❌ core 登录异常: {e}")
+        log(f"❌ core SAML 登录异常: {e}")
         return False
 
 
@@ -611,17 +614,15 @@ def fetch_eap_progress(context, page):
     """抓取 EAP043 课程页面的作业活动列表（含未解锁），返回进度数据"""
     log("📖 抓取 EAP043 作业进度...")
     try:
-        # 1. 确保登录 LM Core
-        page.goto(LM_CORE_URL + "/my/", wait_until="domcontentloaded", timeout=45000)
-        time.sleep(4)
-        if "login" in page.url or "auth" in page.url:
-            if not saml_login_core(page):
-                log("❌ 无法登录 LM Core，跳过 EAP 进度抓取")
-                return None
-            page.goto(LM_CORE_URL + "/my/", wait_until="domcontentloaded", timeout=45000)
-            time.sleep(5)
+        # 1. SAML 登录 LM Core（不依赖 URL 判断，直接走 SAML 链）
+        if not saml_login_core(page):
+            log("❌ 无法登录 LM Core，跳过 EAP 进度抓取")
+            return None
+        log("✅ LM Core 登录成功")
 
         # 2. 从 My Courses 页面找 EAP043 课程链接
+        page.goto(LM_CORE_URL + "/my/", wait_until="domcontentloaded", timeout=45000)
+        time.sleep(5)
         course_link = page.evaluate("""() => {
             const links = document.querySelectorAll('a[href*="course/view.php"]');
             for (const a of links) {
