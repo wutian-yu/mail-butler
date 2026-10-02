@@ -848,6 +848,18 @@ def format_homework(events):
     return "\n".join(lines)
 
 
+def _get_eap_progress():
+    """读取 xjtlu_monitor 存的 EAP043 作业进度"""
+    try:
+        state, _ = gh_read_json("xjtlu_state.json")
+        eap = state.get("eap_progress") or {}
+        if not eap.get("total"):
+            return None
+        return eap
+    except Exception:
+        return None
+
+
 def format_homework_card(events):
     """生成飞书卡片：按课程分组的作业列表（彩色标题+表格布局）"""
     if not events:
@@ -902,6 +914,28 @@ def format_homework_card(events):
                                             "content": f"{it['time']}\n{status}"}}]}
                 ]
             })
+    # EAP 进度区块（有数据才显示）
+    eap = _get_eap_progress()
+    if eap and eap.get("total"):
+        total = eap.get("total", 0)
+        done = eap.get("completed", 0)
+        locked = eap.get("locked", 0)
+        # 进度条：▓▓▓░░░░░ X/N
+        filled = round(done / total * 8) if total else 0
+        bar = "▓" * filled + "░" * (8 - filled)
+        eap_line = f"**✍️ 学术英语EAP043 作业进度**\n{bar}  {done}/{total}\n已完成 {done} 项"
+        if locked:
+            eap_line += f" · 未解锁 {locked} 项"
+        # 当前进行中的作业（未锁定的第一个）
+        current = next((it["name"] for it in eap.get("items", [])
+                        if not it.get("locked") and not it.get("completed")), "")
+        if current:
+            eap_line += f"\n当前任务：{current}"
+        elements.append({"tag": "hr"})
+        elements.append({
+            "tag": "div",
+            "text": {"tag": "lark_md", "content": eap_line}
+        })
     elements.append({"tag": "hr"})
     elements.append({"tag": "note", "elements": [
         {"tag": "plain_text", "content": "📅 数据来自 LearningMall 日历订阅"}
