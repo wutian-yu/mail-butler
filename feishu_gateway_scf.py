@@ -804,6 +804,13 @@ def fetch_lm_assignments(days_ahead=14):
                 continue
             # 课程标签：从CATEGORIES提取课程代码并映射中文（作业名保留英文原文）
             course_label = _lm_course_label(categories, summary)
+            # 提取动作词（opens/closes/is due）从标题中移除，放到时间行
+            action = ""
+            title = summary
+            m_act = re.search(r'\s+(opens|closes|is due)\s*$', title, re.IGNORECASE)
+            if m_act:
+                action = {"opens": "开放", "closes": "截止", "is due": "截止"}[m_act.group(1).lower()]
+                title = title[:m_act.start()].strip()
             # 倒计时
             delta = dt - now
             if delta.days == 0:
@@ -812,10 +819,11 @@ def fetch_lm_assignments(days_ahead=14):
                 countdown = f"明天 {dt.strftime('%H:%M')}"
             else:
                 countdown = f"{delta.days}天后"
-            # 拼接完整标题：【课程名】+ 英文原文
-            full_title = f"【{course_label}】{summary}" if course_label else summary
+            # 拼接标题：【课程名】+ 英文作业名（不含动作词）
+            full_title = f"【{course_label}】{title}" if course_label else title
             events.append({
                 "summary": full_title,
+                "action": action,
                 "dt": dt,
                 "countdown": countdown,
                 "categories": categories,
@@ -834,7 +842,9 @@ def format_homework(events):
     lines = [f"📚 近期作业/测验（共{len(events)}项）："]
     for i, ev in enumerate(events, 1):
         lines.append(f"{i}. {ev['summary'][:50]}")
-        lines.append(f"　　⏰ {ev['dt'].strftime('%m月%d日 %H:%M')} · {ev['countdown']}")
+        act = ev.get("action", "")
+        lines.append(f"　　⏰ {ev['dt'].strftime('%m月%d日 %H:%M')} · {act} · {ev['countdown']}" if act
+                     else f"　　⏰ {ev['dt'].strftime('%m月%d日 %H:%M')} · {ev['countdown']}")
     lines.append("\n💡 注意：EAP 作业是顺序解锁的，完成当前项才会开放下一项。")
     return "\n".join(lines)
 
