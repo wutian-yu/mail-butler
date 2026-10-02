@@ -669,13 +669,11 @@ def fetch_eap_progress(context, page):
         }""")
         items = json.loads(activities) if activities else []
 
-        # 4. 备用：如果标准解析拿不到，抓整页文本存档（下次完善解析用）
-        page_text = ""
-        if not items:
-            try:
-                page_text = page.evaluate("() => document.body.innerText.slice(0, 3000)")
-            except Exception:
-                pass
+        # 4. 备用：不管 items 多少，都抓 page_text 存档（下次完善解析用）
+        try:
+            page_text = page.evaluate("() => document.body.innerText.slice(0, 5000)")
+        except Exception:
+            page_text = ""
 
         # 5. 构建进度数据
         hw_items = [it for it in items if it.get("is_hw")] or items  # 优先作业类，否则全部
