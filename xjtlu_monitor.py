@@ -592,6 +592,112 @@ def fetch_ics_url(url):
     return None
 
 
+def saml_login_core(page):
+    """SAML 登录 LM Core（成功返回 True）"""
+    try:
+        page.goto(LM_SAML_LOGIN_URL, wait_until="domcontentloaded", timeout=60000)
+        for i in range(20):
+            time.sleep(2)
+            u = page.url
+            if u.startswith("https://core.xjtlu.edu.cn") and "/auth/saml2" not in u and "login" not in u:
+                return True
+        return False
+    except Exception as e:
+        log(f"❌ core 登录异常: {e}")
+        return False
+
+
+def fetch_eap_progress(context, page):
+    """抓取 EAP043 课程页面的作业活动列表（含未解锁），返回进度数据"""
+    log("📖 抓取 EAP043 作业进度...")
+    try:
+        # 1. 确保登录 LM Core
+        page.goto(LM_CORE_URL + "/my/", wait_until="domcontentloaded", timeout=45000)
+        time.sleep(4)
+        if "login" in page.url or "auth" in page.url:
+            if not saml_login_core(page):
+                log("❌ 无法登录 LM Core，跳过 EAP 进度抓取")
+                return None
+            page.goto(LM_CORE_URL + "/my/", wait_until="domcontentloaded", timeout=45000)
+            time.sleep(5)
+
+        # 2. 从 My Courses 页面找 EAP043 课程链接
+        course_link = page.evaluate("""() => {
+            const links = document.querySelectorAll('a[href*="course/view.php"]');
+            for (const a of links) {
+                const t = (a.innerText || '').trim();
+                if (t.toUpperCase().includes('EAP043') || t.toUpperCase().includes('EAP 043')) {
+                    return a.href;
+                }
+            }
+            return '';
+        }""")
+        if not course_link:
+            log("❌ My Courses 页面未找到 EAP043 课程链接")
+            return None
+        log(f"✅ 找到 EAP043 课程: {course_link[:70]}")
+
+        # 3. 进课程页面解析作业活动
+        page.goto(course_link, wait_until="domcontentloaded", timeout=45000)
+        time.sleep(5)
+        # 展开所有 section（Moodle 课程可能分节折叠）
+        try:
+            for btn in page.query_selector_all(".course-section-header, [data-toggle*='collapse']"):
+                btn.click()
+                time.sleep(0.3)
+        except Exception:
+            pass
+        time.sleep(2)
+
+        # Moodle 4.x 活动列表解析
+        activities = page.evaluate("""() => {
+            const acts = document.querySelectorAll('li.activity, .activity-item, [class*="activity-wrapper"]');
+            const results = [];
+            for (const a of acts) {
+                const nameEl = a.querySelector('.instancename, .activity-name, .aalink .instancename, [class*="instancename"]');
+                const name = nameEl ? nameEl.innerText.trim() : '';
+                if (!name) continue;
+                const isLocked = !!(a.querySelector('.availabilityinfo, [class*="restricted"], [class*="locked"]') ||
+                                    a.className.includes('restricted'));
+                const isCompleted = !!(a.querySelector('.completion_done, [class*="completion-passed"], [data-completionstate="1"]'));
+                const isAssign = !!(a.querySelector('a[href*="mod/assign"], a[href*="mod/quiz"], a[href*="mod/forum"]') ||
+                                    a.className.includes('assign') || a.className.includes('quiz'));
+                results.push({name: name.slice(0, 60), locked: isLocked, completed: isCompleted, is_hw: isAssign});
+            }
+            return JSON.stringify(results);
+        }""")
+        items = json.loads(activities) if activities else []
+
+        # 4. 备用：如果标准解析拿不到，抓整页文本存档（下次完善解析用）
+        page_text = ""
+        if not items:
+            try:
+                page_text = page.evaluate("() => document.body.innerText.slice(0, 3000)")
+            except Exception:
+                pass
+
+        # 5. 构建进度数据
+        hw_items = [it for it in items if it.get("is_hw")] or items  # 优先作业类，否则全部
+        total = len(hw_items)
+        completed = len([it for it in hw_items if it.get("completed")])
+        locked = len([it for it in hw_items if it.get("locked")])
+        progress = {
+            "course_url": course_link,
+            "total": total,
+            "completed": completed,
+            "locked": locked,
+            "items": [{"name": it["name"], "locked": it.get("locked", False),
+                       "completed": it.get("completed", False)} for it in hw_items[:20]],
+            "page_text": page_text,
+            "last_check": datetime.now().strftime("%Y-%m-%d %H:%M"),
+        }
+        log(f"✅ EAP进度: 共{total}项作业，已完成{completed}，未解锁{locked}")
+        return progress
+    except Exception as e:
+        log(f"❌ EAP 进度抓取失败: {e}")
+        return None
+
+
 def regenerate_lm_calendar_url(context, page):
     """日历 authtoken 失效时：SAML 登录 core → 填导出表单 → 返回新 URL"""
     try:
@@ -1120,6 +1226,17 @@ def run():
             log(f"📚 事件总数 {len(lm_events)}，已知 {len(known_uids)}，新增 {len(lm_events) - len([u for u in known_uids if u in state['lm_events']])}")
         else:
             log("📭 无法获取日历事件")
+
+        # 4. EAP043 作业进度（浏览器在，顺手抓课程页面）
+        if logged_in:
+            eap = fetch_eap_progress(context, page)
+            if eap:
+                # EAP 新作业解锁检测（对比上次）
+                old_eap = state.get("eap_progress") or {}
+                if old_eap and old_eap.get("total") and eap.get("total") and \
+                   eap.get("locked", 0) < old_eap.get("locked", 0):
+                    notifications.append("✍️ **EAP 新作业已解锁！** 请查看 EAP043 课程页面尽快完成。")
+                state["eap_progress"] = eap
 
         browser.close()
 
