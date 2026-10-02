@@ -251,7 +251,9 @@ def outlook_create_event(subject, start_dt, end_dt, body=""):
                  method="POST",
                  headers={"Authorization": f"Bearer {token}",
                           "Content-Type": "application/json",
-                          "Accept": "application/json"},
+                          "Accept": "application/json",
+                          "Origin": "https://outlook.office.com",
+                          "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36"},
                  data=ev, timeout=30)
     return resp.get("Id") if resp else None
 
@@ -1353,6 +1355,7 @@ def cmd_homework_to_calendar(chat_id, text):
     # 创建 Outlook 日历事件
     created = 0
     failed = 0
+    fail_reason = ""
     for ev in matched:
         try:
             start = ev["dt"]
@@ -1363,10 +1366,12 @@ def cmd_homework_to_calendar(chat_id, text):
                 created += 1
             else:
                 failed += 1
+                fail_reason = "API 返回空"
         except Exception as e:
             log(f"⚠️ 作业写日历失败 {ev['summary'][:30]}: {e}")
             failed += 1
-    summary_lines = [f"📚 已将 {created} 项作业写入 Outlook 日历" + (f"（{failed} 项失败）" if failed else "")]
+            fail_reason = str(e)[:80]
+    summary_lines = [f"📚 已将 {created} 项作业写入 Outlook 日历" + (f"（{failed} 项失败{': '+fail_reason if fail_reason else ''}）" if failed else "")]
     for ev in matched[:5]:
         summary_lines.append(f"· {ev['summary'][:50]} — {ev['dt'].strftime('%m月%d日 %H:%M')}")
     summary_lines.append("\n打开 iPhone 日历 app 即可看到（确保 Outlook 日历分组已勾选）。")
