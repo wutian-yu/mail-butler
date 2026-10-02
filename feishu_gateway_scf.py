@@ -746,8 +746,135 @@ def cmd_attendance(chat_id):
     feishu_send(chat_id, "\n".join(lines))
 
 
+# ============ AMS 实时轮询（1分钟 Timer 触发） ============
+# 实测 AMS status 语义：0=未签 1=Present已签到 2=Authorized Absence已准假 3=缺勤 4=Excluded免签
+AMS_STATUS_NAME = {1: "已签到", 2: "已准假", 3: "缺勤", 4: "免签不计入"}
+
+
+def ams_timer_poll():
+    """1分钟 Timer：课节状态实时监控（纯 API，x-token 自足，无需浏览器）
+    信号1: status 0→1 签到成功自动确认
+    信号2: status 0→2/3 缺勤/准假标记 → 即时告警（72小时补签窗口内快速反应）
+    信号3: 上课/将上课且未签 → 签到提醒（每课节最多1次）
+    """
+    try:
+        ams, state_data, sha = _ams_state()
+        token = ams.get("token", "")
+        if not token or not state_data or not sha:
+            log("AMS 轮询跳过：无凭证或 state 不可读")
+            return
+        resp = _http(f"{AMS_URL}/xjtlu/xjtlu-base-student-timetables/getStudentTimetable",
+                     headers={"x-token": token}, timeout=12)
+        if not isinstance(resp, dict) or resp.get("code") != 0 or not resp.get("data"):
+            log(f"AMS 轮询跳过：API code={resp and resp.get('code')}")
+            return
+        now_sessions = {}
+        for day in resp["data"]:
+            for s in day.get("timetableVoList", []):
+                rid = str(s.get("signInRecordId") or "")
+                if rid:
+                    now_sessions[rid] = {
+                        "code": s.get("moduleCode", ""),
+                        "time_text": s.get("moduleTime", ""),
+                        "start": s.get("startTime", ""),
+                        "status": s.get("status"),
+                        "signTime": s.get("signTime"),
+                    }
+        if not now_sessions:
+            return
+        old_sessions = ams.get("sessions") or {}
+        reminded = set(ams.get("reminded", []))
+        now = datetime.now()
+        notes = []
+        changed = False
+
+        # 1. status 变化检测（只在 monitor 已建基线的课节上，避免新课节误报）
+        for rid, s in now_sessions.items():
+            old = old_sessions.get(rid)
+            if not old or s["status"] is None or s["status"] == old.get("status"):
+                continue
+            name = AMS_STATUS_NAME.get(s["status"], f"状态{s['status']}")
+            if s["status"] == 1:
+                stime = f"（{s['signTime']}）" if s.get("signTime") else ""
+                notes.append(f"✅ AMS：{s['code']} {s['time_text']} 签到成功已记录{stime}")
+            elif s["status"] in (2, 3):
+                notes.append(f"❗ AMS：{s['code']} {s['time_text']} 被标记为「{name}」\n\n"
+                             "若与实际不符：缺勤可让同学转告签到码，回复「签到 码」72小时内补签；"
+                             "或课后联系老师在 AMS 直接修正。")
+            elif s["status"] == 0:
+                notes.append(f"↩️ AMS：{s['code']} {s['time_text']} 状态被重置为「未签到」，请留意老师是否开启了签到")
+            else:
+                notes.append(f"AMS：{s['code']} {s['time_text']} 状态变化 → {name}")
+            changed = True
+
+        # 2. 上课签到提醒（开课前10分钟~上课中，status=0，每课节只提醒一次）
+        for rid, s in now_sessions.items():
+            if s["status"] != 0 or rid in reminded:
+                continue
+            try:
+                st = datetime.strptime(s["start"], "%Y-%m-%d %H:%M:%S")
+            except Exception:
+                continue
+            if st - timedelta(minutes=10) <= now <= st + timedelta(hours=2):
+                notes.append(f"⏰ {s['code']} {s['time_text']} 即将开始/正在上课\n\n"
+                             "老师开始签到后：回复「签到 码」或直接发纯数字码，我帮你签（密码72小时有效）。")
+                reminded.add(rid)
+                changed = True
+
+        if notes:
+            feishu_send(CHAT_ID_FALLBACK, "\n\n".join(notes))
+            log(f"AMS 轮询发现 {len(notes)} 条信号，已推送")
+
+        # 3. 变化写回（只合并 status/signTime，完整快照结构由 monitor 维护；sha 冲突自动重试）
+        if changed:
+            merged = dict(old_sessions)
+            for rid, s in now_sessions.items():
+                if rid in merged:
+                    merged[rid]["status"] = s["status"]
+                    merged[rid]["signTime"] = s.get("signTime")
+            ams["sessions"] = merged
+            ams["reminded"] = [rid for rid in reminded if rid in merged]
+            try:
+                state_data["ams"] = ams
+                gh_write_json("xjtlu_state.json", state_data, sha, "ams timer update")
+                log("AMS 轮询状态已写回 butler-data")
+            except Exception as e:
+                log(f"AMS 状态写回失败（下轮重试）: {e}")
+    except Exception as e:
+        log(f"AMS 轮询异常: {e}")
+
+
+def ams_try_auto_sign(t, chat_id):
+    """智能签到入口：上课时间发纯数字码或扫码URL → 自动签到。返回 True 已处理"""
+    # 二维码扫码结果 / 含 code 参数的 URL（同学转发或相册识别复制）
+    if "ams.xjtlu.edu.cn" in t or "code=" in t:
+        m = re.search(r"code[=:/]\s*([A-Za-z0-9\-]{3,24})", t)
+        if m:
+            cmd_checkin(chat_id, m.group(1))
+            return True
+    # 纯数字 3-8 位：仅当前有课（开课前10分钟~下课）时视为签到码，其余情况当聊天不处理
+    if re.fullmatch(r"\d{3,8}", t):
+        ams, _, _ = _ams_state()
+        sessions = ams.get("sessions") or {}
+        now = datetime.now()
+        for s in sessions.values():
+            if s.get("status") != 0:
+                continue
+            try:
+                st = datetime.strptime(s.get("start", ""), "%Y-%m-%d %H:%M:%S")
+            except Exception:
+                continue
+            if st - timedelta(minutes=10) <= now <= st + timedelta(hours=3):
+                cmd_checkin(chat_id, t)
+                return True
+    return False
+
+
 def process_command(text, chat_id):
     t = text.lower().strip()
+    # 智能签到：纯数字码 / 扫码URL（上课时间自动识别，误触保护：无课时纯数字走聊天）
+    if ams_try_auto_sign(t, chat_id):
+        return
     # 签到：精确匹配「签到 <数字码>」，避免误触聊天
     m = re.match(r"^(?:签到|checkin|check in)[\s:：]*(\d{3,8})\s*$", t)
     if m:
@@ -1345,8 +1472,14 @@ def poll_group_messages():
 
 # ============ 主入口 ============
 def main_handler(event, context):
-    # 定时触发器：主动轮询群消息
-    if event.get("Type") == "Timer" or "Message" in str(event.get("Message", "")):
+    # 定时触发器：按 TriggerName 分流
+    if event.get("Type") == "Timer":
+        trigger = str(event.get("TriggerName", ""))
+        if "ams" in trigger.lower() or "sign" in trigger.lower():
+            # AMS 实时轮询器（1分钟）：课节状态秒级感知
+            ams_timer_poll()
+            return {"statusCode": 200, "body": "ams polled"}
+        # 默认 Timer：主动轮询群消息（防事件推送遗漏）
         log("🔄 定时轮询开始（6轮×10秒）")
         for i in range(6):
             poll_group_messages()
