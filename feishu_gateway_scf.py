@@ -1304,12 +1304,86 @@ def cmd_leave_revoke(chat_id):
         feishu_send(chat_id, f"❌ 撤回异常：{e}")
 
 
+def cmd_homework_to_calendar(chat_id, text):
+    """把 LM 作业写进 Outlook 日历（用户说"把XX作业加到日历"时触发）
+    支持：课程名/课程码过滤 + 日期过滤"""
+    events = fetch_lm_assignments()
+    if not events:
+        feishu_send(chat_id, "📭 暂无 LearningMall 作业数据。")
+        return
+    # 解析过滤条件
+    t = text.upper()
+    # 课程码
+    course_filter = None
+    m = re.search(r"\b([A-Z]{3}\d{3})\b", t)
+    if m:
+        course_filter = m.group(1)
+    else:
+        for cn, code in [("微积分", "MTH026"), ("线代", "MTH028"), ("线性代数", "MTH028"),
+                         ("学术英语", "EAP043"), ("英语", "EAP043"), ("体育", "PHE001"),
+                         ("科学", "SCI004"), ("新兴技术", "PSP004"), ("马原", "CCT001"),
+                         ("毛概", "CCT011"), ("形势", "CCT012"), ("心理", "CCT007"),
+                         ("数学", None)]:
+            if cn in text:
+                course_filter = code if code else "MATH"
+                break
+    # 日期过滤：10月9号 / 10-09 / 10.9
+    date_filter = None
+    dm = re.search(r"(\d{1,2})[月./\-](\d{1,2})", text)
+    if dm:
+        try:
+            date_filter = datetime(datetime.now().year, int(dm.group(1)), int(dm.group(2))).strftime("%Y-%m-%d")
+        except ValueError:
+            pass
+    # 筛选
+    matched = []
+    for ev in events:
+        if date_filter and ev["dt"].strftime("%Y-%m-%d") != date_filter:
+            continue
+        if course_filter == "MATH":
+            if not any(c in ev["summary"] for c in ["MTH026", "MTH028", "微积分", "线代", "线性代数"]):
+                continue
+        elif course_filter:
+            if course_filter not in ev["summary"]:
+                continue
+        matched.append(ev)
+    if not matched:
+        feishu_send(chat_id, "📭 没找到匹配的作业。试试「把10月9号的数学作业加到日历」。")
+        return
+    # 创建 Outlook 日历事件
+    created = 0
+    failed = 0
+    for ev in matched:
+        try:
+            start = ev["dt"]
+            end = start + timedelta(hours=1)
+            body = f"LearningMall 作业\n{ev.get('summary','')}\n\n截止时间：{ev['dt'].strftime('%Y年%m月%d日 %H:%M')}\n{ev.get('countdown','')}"
+            eid = outlook_create_event(f"📚 {ev['summary'][:60]}", start, end, body=body)
+            if eid:
+                created += 1
+            else:
+                failed += 1
+        except Exception as e:
+            log(f"⚠️ 作业写日历失败 {ev['summary'][:30]}: {e}")
+            failed += 1
+    summary_lines = [f"📚 已将 {created} 项作业写入 Outlook 日历" + (f"（{failed} 项失败）" if failed else "")]
+    for ev in matched[:5]:
+        summary_lines.append(f"· {ev['summary'][:50]} — {ev['dt'].strftime('%m月%d日 %H:%M')}")
+    summary_lines.append("\n打开 iPhone 日历 app 即可看到（确保 Outlook 日历分组已勾选）。")
+    feishu_send(chat_id, "\n".join(summary_lines))
+
+
 def process_command(text, chat_id):
     t = text.lower().strip()
     # 请假流程（优先级高，避免「请假」被其他规则吞掉）
     if text.strip().startswith("请假") or t.startswith("请个假") or t.startswith("申请请假"):
         cmd_leave(chat_id, text)
         return
+    # 作业写日历：用户说"把XX作业加到日历"/"添加到日历"+作业/课程关键词
+    if ("日历" in text or "日历" in t) and any(kw in text for kw in ["作业", "assignment", "截止", "ddl", "MTH", "EAP", "SCI", "CCT", "PHE", "PSP", "微积分", "线代", "英语", "数学", "科学", "体育"]):
+        if any(kw in text for kw in ["加", "添加", "写", "标", "放", "同步", "导入"]) or "日历" in text:
+            cmd_homework_to_calendar(chat_id, text)
+            return
     if t in ("取消请假", "取消申请", "放弃请假"):
         cmd_leave_cancel(chat_id)
         return
