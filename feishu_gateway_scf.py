@@ -34,6 +34,7 @@ DEEPSEEK_API_KEY = os.environ.get("DEEPSEEK_API_KEY", "")
 REPO = "wutian-yu/mail-butler"              # 公开仓库：代码+workflow（仅用于触发Actions）
 DATA_REPO = "wutian-yu/butler-data"          # 私有仓库：所有状态数据（邮件/聊天/活动）
 FEISHU_VERIFY_TOKEN = os.environ.get("FEISHU_VERIFY_TOKEN", "")
+LM_CAL_URL = os.environ.get("LM_CAL_URL", "https://core.xjtlu.edu.cn/calendar/export_execute.php?userid=7860&authtoken=e0f4ad6318700f9841cb02a96315cb30d6451624&preset_what=all&preset_time=recentupcoming")
 FEISHU_BASE = "https://open.feishu.cn"
 CHAT_ID_FALLBACK = "oc_0f1f851c3fce82feff595f7a44bcc88a"
 WEEKDAYS = ["周一", "周二", "周三", "周四", "周五", "周六", "周日"]
@@ -671,6 +672,12 @@ def _do_smart_delete_one(chat_id, item, confirmed, c_sha):
             feishu_send(chat_id, f"⚠️ 删除失败: {e}")
 
 
+def cmd_homework(chat_id):
+    """查看 LearningMall 作业截止时间"""
+    events = fetch_lm_assignments()
+    feishu_send(chat_id, format_homework(events))
+
+
 def process_command(text, chat_id):
     t = text.lower().strip()
     # 批量操作优先匹配
@@ -697,6 +704,8 @@ def process_command(text, chat_id):
         cmd_skip(chat_id, t)
     elif t in ("日程", "全部日程", "outlook", "events"):
         cmd_schedule(chat_id)
+    elif t in ("作业", "homework", "hw", "ddl", "deadline", "learningmall", "lm", "学习"):
+        cmd_homework(chat_id)
     elif t.startswith("删除") or t.startswith("delete") or t.startswith("取消") or t.startswith("revoke") or t.startswith("去掉") or t.startswith("移除"):
         rest = t
         for prefix in ("删除", "delete", "取消", "revoke", "去掉", "移除"):
@@ -719,9 +728,105 @@ def process_command(text, chat_id):
             feishu_send(chat_id,
                         f"收到消息：「{text[:20]}」\n\n"
                         f"我可以帮你：\n"
-                        f"• 回复「列表」查看待确认活动\n"
-                        f"• 回复「日历」管理日程\n"
-                        f"• 回复「帮助」查看完整指令")
+            f"• 回复「列表」查看待确认活动\n"
+            f"• 回复「作业」查看近期作业截止时间\n"
+            f"• 回复「日历」管理日程\n"
+            f"• 回复「帮助」查看完整指令")
+
+
+# ============ LearningMall 作业 ============
+LM_COURSE_MAP = {
+    "MTH026": "数学026", "MTH028": "数学028", "SCI004": "科学004",
+    "EAP043": "学术英语043", "EAP029": "学术英语029",
+    "CSE105": "计算机105", "CSE106": "计算机106",
+    "PHY001": "物理001", "CHE001": "化学001",
+}
+
+def fetch_lm_assignments(days_ahead=14):
+    """从 LearningMall ICS 日历拉取未来作业/考试截止事件"""
+    if not LM_CAL_URL:
+        return []
+    try:
+        req = urllib.request.Request(LM_CAL_URL, headers={"User-Agent": "Mozilla/5.0"})
+        raw = urllib.request.urlopen(req, timeout=15).read().decode("utf-8", errors="ignore")
+        # 解析 ICS
+        events = []
+        for block in raw.split("BEGIN:VEVENT"):
+            if "END:VEVENT" not in block:
+                continue
+            block = block.split("END:VEVENT")[0]
+            summary = ""
+            dtstart = ""
+            categories = ""
+            desc = ""
+            for line in block.splitlines():
+                line = line.strip()
+                if line.startswith("SUMMARY:"):
+                    summary = line[8:].strip()
+                elif line.startswith("DTSTART"):
+                    dtstart = line.split(":", 1)[-1].strip() if ":" in line else ""
+                elif line.startswith("CATEGORIES:"):
+                    categories = line[11:].strip()
+                elif line.startswith("DESCRIPTION:"):
+                    desc = line[12:].strip()
+            if not summary or not dtstart:
+                continue
+            # 解析时间（ICS 时间是 UTC，需转换为北京时间 UTC+8）
+            is_utc = dtstart.endswith("Z")
+            dt = None
+            for fmt in ("%Y%m%dT%H%M%S", "%Y%m%dT%H%M%SZ", "%Y%m%d"):
+                try:
+                    dt = datetime.strptime(dtstart[:15], fmt)
+                    break
+                except ValueError:
+                    continue
+            if not dt:
+                continue
+            if is_utc:
+                dt = dt + timedelta(hours=8)  # UTC → 北京时间
+            # 只保留未来 days_ahead 天内的事件
+            now = datetime.now()
+            if dt < now - timedelta(hours=1):
+                continue
+            if dt > now + timedelta(days=days_ahead):
+                continue
+            # 课程名映射
+            course_cn = summary
+            for code, cn in LM_COURSE_MAP.items():
+                if code in summary:
+                    course_cn = summary.replace(code, cn)
+                    break
+            # 倒计时
+            delta = dt - now
+            if delta.days == 0:
+                countdown = f"今天 {dt.strftime('%H:%M')}"
+            elif delta.days == 1:
+                countdown = f"明天 {dt.strftime('%H:%M')}"
+            else:
+                countdown = f"{delta.days}天后"
+            events.append({
+                "summary": course_cn,
+                "dt": dt,
+                "countdown": countdown,
+                "categories": categories,
+            })
+        events.sort(key=lambda e: e["dt"])
+        return events
+    except Exception as e:
+        log(f"❌ LM作业拉取失败: {e}")
+        return []
+
+
+def format_homework(events):
+    """格式化作业列表供飞书消息展示"""
+    if not events:
+        return "📚 当前没有即将到期的作业，可以轻松一下～"
+    lines = [f"📚 近期作业/测验（共{len(events)}项）："]
+    for i, ev in enumerate(events, 1):
+        lines.append(f"{i}. {ev['summary'][:45]}")
+        lines.append(f"　　⏰ {ev['dt'].strftime('%m月%d日 %H:%M')} · {ev['countdown']}")
+    lines.append("\n💡 注意：EAP 作业是顺序解锁的，完成当前项才会开放下一项。")
+    return "\n".join(lines)
 
 
 # ============ 大模型对话 ============
@@ -758,6 +863,14 @@ def gather_context(include_outlook=True):
                 ctx_parts.append(f"今天的Outlook日程（共{len(today_events)}个）：\n" + "\n".join(lines))
         except Exception:
             pass
+    # 注入 LM 作业上下文（关键词触发或 include_outlook 时）
+    try:
+        lm_events = fetch_lm_assignments()
+        if lm_events:
+            lines = [f"- {ev['summary'][:45]} ({ev['dt'].strftime('%m月%d日 %H:%M')}, {ev['countdown']})" for ev in lm_events[:10]]
+            ctx_parts.append(f"LearningMall 近期作业/测验（共{len(lm_events)}项）：\n" + "\n".join(lines))
+    except Exception:
+        pass
     return "\n\n".join(ctx_parts) if ctx_parts else "当前没有待确认活动，日历也是空的。"
 
 
@@ -765,12 +878,14 @@ SYSTEM_PROMPT = (
     "你是「AI邮件管家」，一个贴心、智能的私人助理。"
     "用户是西交利物浦大学大一学生，名叫吴冠呈。"
     "你的风格：友善、简洁、有温度，像朋友一样聊天，不要太官方。\n\n"
-    "你可以帮用户管理邮件活动和日历日程。\n\n"
+    "你可以帮用户管理邮件活动和日历日程。\n"
+    "你还可以查看用户的 LearningMall 作业截止时间。\n\n"
     "## 你的能力\n"
     "你可以执行以下操作，在回复中用特殊标记表示要执行的操作：\n"
     "- 查看待确认列表：在回复末尾加 [ACTION:列表]\n"
     "- 查看日历：在回复末尾加 [ACTION:日历]\n"
     "- 查看日程：在回复末尾加 [ACTION:日程]\n"
+    "- 查看作业：在回复末尾加 [ACTION:作业]\n"
     "- 批准第N个：在回复末尾加 [ACTION:批准N]（N为编号）\n"
     "- 批准全部：在回复末尾加 [ACTION:批准全部]\n"
     "- 跳过第N个：在回复末尾加 [ACTION:跳过N]\n"
@@ -779,6 +894,10 @@ SYSTEM_PROMPT = (
     "- 删除第N个：在回复末尾加 [ACTION:删除N]\n"
     "- 删除全部：在回复末尾加 [ACTION:删除全部]\n"
     "- 查看帮助：在回复末尾加 [ACTION:帮助]\n\n"
+    "## 关于作业\n"
+    "当用户问\"有什么作业\"、\"作业是什么\"、\"ddl\"、\"截止\"、\"learning mall\"、\"LM\"时，\n"
+    "加 [ACTION:作业] 标记，系统会自动拉取 LearningMall 日历中的作业截止时间并展示。\n"
+    "作业数据来自 Moodle 日历 ICS 订阅，包含全部课程的作业/测验截止时间。\n\n"
     "## 规则\n"
     "1. 如果用户表达了操作意图（即使不是标准指令），理解意图后加上对应的[ACTION:xxx]标记，系统会自动执行\n"
     "2. 回复正文用自然语言说明你要做什么，不要说「你可以用xxx指令」\n"
@@ -794,7 +913,7 @@ def call_llm_chat(user_text, chat_id):
         return None, None
     try:
         # 快速判断：消息含日程/日历/今天/安排等关键词时才查Outlook
-        include_outlook = any(kw in user_text for kw in ("日程", "日历", "今天", "安排", "明天", "删除", "删", "情况"))
+        include_outlook = any(kw in user_text for kw in ("日程", "日历", "今天", "安排", "明天", "删除", "删", "情况", "作业", "ddl", "截止", "learning", "lm", "测验", "quiz", "assignment"))
         context = gather_context(include_outlook=include_outlook)
         now = datetime.now()
         today_str = now.strftime("%Y年%m月%d日")
@@ -817,7 +936,7 @@ def call_llm_chat(user_text, chat_id):
                      data={
                          "model": "deepseek-chat",
                          "messages": messages,
-                         "max_tokens": 300,
+                         "max_tokens": 600,
                          "temperature": 0.7
                      },
                      timeout=15)
@@ -852,6 +971,8 @@ def execute_llm_action(action, chat_id):
         cmd_calendar(chat_id)
     elif a == "日程" or a == "schedule":
         cmd_schedule(chat_id)
+    elif a == "作业" or a == "homework" or a == "hw":
+        cmd_homework(chat_id)
     elif a == "帮助" or a == "help":
         cmd_help(chat_id)
     elif a.startswith("批准") or a.startswith("approve"):
