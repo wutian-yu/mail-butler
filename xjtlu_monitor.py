@@ -697,6 +697,202 @@ def fetch_eap_progress(context, page):
         return None
 
 
+# ============ AMS 考勤系统 ============
+# 机制（2026-10-02 实测）：
+#   1. 带 uim SSO Cookie 访问 /studentpc/checkIn → 自动 SSO → localStorage 存 x-token
+#   2. x-token 自足认证（header），纯 curl 可用 → 云函数可远程签到
+#   3. 签到: GET /xjtlu/sign/qRCodeSign?code={签到码}&type=2 （老师公布的密码码，72小时内可补签）
+#   4. 课表: GET /xjtlu/xjtlu-base-student-timetables/getStudentTimetable（未来3天+签到状态）
+#   5. 出勤: GET /xjtlu/stuapi/my-module/list?type=1&academicYear=...&semester=...
+AMS_URL = "https://ams.xjtlu.edu.cn"
+AMS_CHECKIN_URL = AMS_URL + "/studentpc/checkIn"
+
+
+def ams_semester_params():
+    """按当前日期算学年学期参数（AMS 用短学年格式：2026/27；西浦：8月起 SEM1）"""
+    now = datetime.now()
+    if now.month >= 8:
+        ay = f"{now.year}/{(now.year + 1) % 100:02d}"
+        sem = "SEM1"
+    elif now.month <= 1:
+        ay = f"{now.year - 1}/{now.year % 100:02d}"
+        sem = "SEM1"
+    else:
+        ay = f"{now.year - 1}/{now.year % 100:02d}"
+        sem = "SEM2"
+    # 注意 safe=""：必须把 / 转义成 %2F，否则 academicYear 参数会被路径截断
+    return urllib.parse.quote(ay, safe=""), sem
+
+
+def ams_course_label(code):
+    """EAP043 → 'EAP043 学术英语'"""
+    return short_course(code) if code in COURSE_NAME_MAP else (code or "未知课程")
+
+
+def ams_login_get_token(page):
+    """访问 AMS 走 SSO 自动登录，从 localStorage 抓 x-token"""
+    log("🏫 登录 AMS 考勤系统...")
+    try:
+        page.goto(AMS_CHECKIN_URL, wait_until="domcontentloaded", timeout=60000)
+        for i in range(25):
+            time.sleep(2)
+            try:
+                u = page.url
+                if "uim.xjtlu" in u and "login" in u.lower():
+                    log("❌ AMS 登录被弹回 uim 登录页（SSO Cookie 可能过期）")
+                    return None
+                token = page.evaluate("() => localStorage.getItem('Token')")
+                if token and len(str(token)) >= 16:
+                    log(f"✅ AMS 登录成功，x-token 已获取 ({i * 2 + 2}秒)")
+                    return token
+            except Exception:
+                continue
+        log("❌ AMS 登录超时，未拿到 x-token")
+        return None
+    except Exception as e:
+        log(f"❌ AMS 登录异常: {e}")
+        return None
+
+
+def ams_api_get(path, token):
+    """AMS API GET（x-token 自足认证），成功返回 data"""
+    try:
+        req = urllib.request.Request(AMS_URL + path, headers={"x-token": token})
+        with urllib.request.urlopen(req, timeout=30) as r:
+            data = json.loads(r.read().decode("utf-8", errors="replace"))
+        if data.get("code") == 0:
+            return data.get("data")
+        log(f"⚠️ AMS API 非0返回: {str(data.get('message', ''))[:60]}")
+    except Exception as e:
+        log(f"⚠️ AMS API 请求失败: {e}")
+    return None
+
+
+def fetch_ams_data(page):
+    """登录 AMS，返回 {'token', 'sessions', 'attendance'} 或 None"""
+    token = ams_login_get_token(page)
+    if not token:
+        return None
+    tt = ams_api_get("/xjtlu/xjtlu-base-student-timetables/getStudentTimetable", token)
+    ay, sem = ams_semester_params()
+    att = ams_api_get(
+        f"/xjtlu/stuapi/my-module/list?type=1&academicYear={ay}&semester={sem}", token)
+    if tt is None and att is None:
+        return None
+    # 课表 → {signInRecordId: session dict}
+    sessions = {}
+    for day in (tt or []):
+        for s in day.get("timetableVoList", []):
+            rid = s.get("signInRecordId")
+            if rid:
+                sessions[str(rid)] = {
+                    "code": s.get("moduleCode", ""),
+                    "title": s.get("moduleTitle", ""),
+                    "group": s.get("moduleTypeGroup", ""),
+                    "start": s.get("startTime", ""),
+                    "time_text": s.get("moduleTime", ""),
+                    "date": day.get("date", ""),
+                    "room": s.get("room") or "",
+                    "status": s.get("status"),
+                }
+    # 出勤统计（学年参数错误时后端会返回空 vos + 0.0%，做防护）
+    attendance = None
+    if att and att.get("vos"):
+        modules = {}
+        for m in att.get("vos", []):
+            modules[m.get("moduleCode", "?")] = {
+                "absences": m.get("absences", 0),
+                "sign_hours": m.get("signClassHour", 0),
+                "total_hours": m.get("classHour", 0),
+                "att": m.get("courseAttendance", 100.0),
+                "threshold": m.get("courseThresholdFlag", False),
+            }
+        attendance = {
+            "overall": att.get("comprehensiveAttendance", ""),
+            "threshold": att.get("thresholdFlag", False),
+            "modules": modules,
+        }
+    log(f"✅ AMS 数据: {len(sessions)} 个课节，总出勤率 {attendance['overall'] if attendance else '?'}%")
+    return {"token": token, "sessions": sessions, "attendance": attendance}
+
+
+def ams_parse_start(start_str):
+    """"2026-10-05 09:00:00" → datetime 或 None"""
+    try:
+        return datetime.strptime(start_str, "%Y-%m-%d %H:%M:%S")
+    except Exception:
+        return None
+
+
+def check_ams_changes(ams_new, state, is_first_run):
+    """对比上次快照产生提醒。返回 (notifications 列表, updated_state_ams)"""
+    notes = []
+    old = state.get("ams") or {}
+    reminded = set(old.get("reminded", []))
+    new_sessions = ams_new.get("sessions", {})
+    new_att = ams_new.get("attendance") or {}
+    old_att = old.get("attendance") or {}
+    old_modules = old_att.get("modules", {}) if old_att else {}
+    old_overall = old_att.get("overall") if old_att else None
+
+    if not is_first_run:
+        # 1. 缺勤增长（高置信信号：absences 是老师课后确认的数字）
+        for code, m in (new_att.get("modules") or {}).items():
+            old_abs = old_modules.get(code, {}).get("absences", 0)
+            if m["absences"] > old_abs:
+                delta = m["absences"] - old_abs
+                lines = [f"❗ AMS 新增缺勤记录\n\n"
+                         f"{ams_course_label(code)}缺勤 +{delta}"
+                         f"（累计 {m['absences']} 次，已签 {m['sign_hours']}/{m['total_hours']} 课时）"]
+                old_pct = old_modules.get(code, {}).get("att")
+                if old_pct is not None and old_pct != m["att"]:
+                    lines.append(f"模块出勤率：{old_pct}% → {m['att']}%")
+                lines.append("\n若实际有出勤，请课后尽快联系老师修改记录（老师可在 AMS 直接修正）。")
+                notes.append("\n".join(lines))
+        # 2. 总出勤率下降
+        new_overall = new_att.get("overall")
+        if (old_overall and new_overall
+                and isinstance(new_overall, (int, float))
+                and float(new_overall) < float(old_overall)):
+            has_absence_note = any("缺勤" in n for n in notes)
+            if not has_absence_note:
+                notes.append(f"📉 总出勤率变化：{old_overall}% → {new_overall}%")
+        # 3. thresholdFlag 触发（低于学校阈值，升学籍警告级）
+        if new_att.get("threshold") and not old_att.get("threshold"):
+            bad = [f"{ams_course_label(c)}（{m['att']}%）"
+                   for c, m in (new_att.get("modules") or {}).items() if m.get("threshold")]
+            notes.append("🚨 出勤率触发学校阈值警告！\n\n"
+                         + ("；".join(bad) if bad else "总出勤率已低于阈值")
+                         + "\n\n请尽快联系 DA（Development Advisor）说明情况，必要时申请 Authorized Absence。")
+        # 4. 签到提醒：今天将开课/正在上课的未签课节（每课节只提醒一次）
+        now = datetime.now()
+        for rid, s in new_sessions.items():
+            if s.get("status") != 0 or rid in reminded:
+                continue
+            st = ams_parse_start(s.get("start", ""))
+            if not st:
+                continue
+            # 开课前30分钟 ~ 开课后2小时内提醒一次
+            if st - timedelta(minutes=30) <= now <= st + timedelta(hours=2):
+                lines = [f"⏰ 别忘了签到\n\n{ams_course_label(s['code'])} · {s['time_text']}"
+                         + (f" · {s['room']}" if s.get("room") else "")]
+                lines.append("\n老师公布签到码后，直接回复「签到 码」即可远程签到（3秒完成）。\n"
+                             "密码签到 72 小时内可补签，二维码则需现场扫。")
+                notes.append("\n".join(lines))
+                reminded.add(rid)
+
+    # 更新 state 快照（token 供云函数远程签到使用）
+    # reminded 只保留当前课表内已提醒过的课节，出窗口自动清理
+    updated = {
+        "token": ams_new.get("token", ""),
+        "attendance": new_att,
+        "sessions": new_sessions,
+        "reminded": [rid for rid in reminded if rid in new_sessions],
+        "last_check": datetime.now().isoformat(timespec="minutes"),
+    }
+    return notes, updated
+
+
 def regenerate_lm_calendar_url(context, page):
     """日历 authtoken 失效时：SAML 登录 core → 填导出表单 → 返回新 URL"""
     try:
@@ -1236,6 +1432,17 @@ def run():
                    eap.get("locked", 0) < old_eap.get("locked", 0):
                     notifications.append("✍️ **EAP 新作业已解锁！** 请查看 EAP043 课程页面尽快完成。")
                 state["eap_progress"] = eap
+
+        # 5. AMS 考勤系统（缺勤检测/出勤率/签到提醒；token 存 state 供云函数远程签到）
+        ams = fetch_ams_data(page) if logged_in else None
+        if ams:
+            ams_notes, ams_state = check_ams_changes(ams, state, is_first_run)
+            notifications.extend(ams_notes)
+            state["ams"] = ams_state
+            log(f"🏫 AMS: 出勤率 {ams_state['attendance']['overall'] if ams_state['attendance'] else '?'}%"
+                f"，课节 {len(ams_state['sessions'])} 个，提醒 {len(ams_notes)} 条")
+        else:
+            log("📭 AMS 数据未获取（登录或接口异常），跳过")
 
         browser.close()
 
