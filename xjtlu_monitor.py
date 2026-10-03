@@ -1821,88 +1821,94 @@ def _room_op_query(page, captured, op):
 
 
 def _room_op_probe(page, captured, op):
-    """安全探测 v26（成员搜索接口传输方式补测）：
-    v25 教训：POST /login/user + URL查询串 key= 仍报参数错误。
-    新假设：chunk-common 的 API 定义可能用 data:n（JSON body）而非 params:n。
-    变体：A JSON body {key,page,pageNum} / B URL串+sf_request_type=ajax / C A+ajax
-    另 dump /login/user 完整函数定义（找 method/data/params 真相）。纯只读。"""
+    """安全探测 v27（实调 remoteMethod + 网络拦截，定位成员搜索真身）：
+    v26 教训：猜 /login/user 传输方式全错。本轮不再猜——
+    1. 遍历 Vue 组件树找有 remoteMethod 的组件（订房弹窗）
+    2. 找不到就点一个房间卡片让它挂载
+    3. 直接调用 comp.remoteMethod('GUANCHENG')（真实搜索）
+    4. 拦截发出的网络请求 → 拿到确切 URL/参数/请求头
+    5. 读回 comp.options（搜索结果）
+    remoteMethod 是纯搜索（GET 语义），零副作用。"""
     findings = []
     acc_id, pid = _room_get_accid_from_storage(page)
     log(f"🆔 accId={acc_id!r} pid={pid!r}")
     findings.append(f"accId={acc_id}")
 
-    # 0) /login/user 完整定义（两种引号风格都找，前后 700 字符）
-    js_urls = page.evaluate(
-        "() => performance.getEntriesByType('resource').map(r => r.name)"
-        ".filter(u => u.endsWith('.js'))")
-    for u in js_urls:
+    # 网络拦截器
+    net_log = []
+    def _net(resp):
         try:
-            body = page.request.get(u, timeout=25000).text()
+            u = resp.url
+            if "/ic-web/" in u or "user" in u.lower():
+                net_log.append((resp.request.method, u))
         except Exception:
-            continue
-        for pat_ in ('"/login/user"', "'/login/user'"):
-            j = body.find(pat_)
-            if j >= 0:
-                s = max(0, j - 550)
-                log(f"📜 /login/user定义@{u.split('/')[-1][:24]}: {body[s:j + 200][:750]}")
-                findings.append("定义✓")
-                break
-        else:
-            continue
-        break
+            pass
+    page.on("response", _net)
 
-    def spa_req(url, json_body=None):
-        """SPA axios 请求：url 可含查询串；json_body 为 dict 时发 JSON body"""
-        if json_body is not None:
-            mid = "const p = " + json.dumps(json_body, ensure_ascii=False) + "; axios.post(url, p)"
-        else:
-            mid = "axios.post(url, null)"
+    def find_and_call():
+        """找 remoteMethod 组件并调用，返回结果"""
         js = (
-            "() => Promise.race(["
-            "new Promise((resolve) => {"
-            "try {"
-            "const el = document.querySelector('#app') || document.body.firstElementChild;"
-            "const vm = el && el.__vue__;"
-            "const axios = vm && vm.$axios;"
-            "if (!axios) { resolve({stage: 'noaxios'}); return; }"
-            "const url = " + json.dumps(url) + ";"
-            + mid +
-            ".then(r => resolve({ok: 1, code: r.data && r.data.code, message: r.data && r.data.message,"
-            " count: r.data && r.data.count, data: r.data && r.data.data}))"
-            ".catch(e => resolve({ok: 0, error: String(e).slice(0, 100)}));"
-            "} catch(e) { resolve({ok: -1, error: String(e).slice(0, 100)}); }"
-            "}),"
-            "new Promise((resolve) => setTimeout(() => resolve({stage: 'timeout'}), 15000))"
-            "])"
+            "() => new Promise((resolve) => {"
+            "const root = (document.querySelector('#app') || document.body.firstElementChild).__vue__;"
+            "if (!root) { resolve({stage: 'noroot'}); return; }"
+            "let comp = null;"
+            "(function walk(vm) {"
+            "  if (!vm || comp) return;"
+            "  if (typeof vm.remoteMethod === 'function') { comp = vm; return; }"
+            "  (vm.$children || []).forEach(walk);"
+            "})(root);"
+            "if (!comp) { resolve({stage: 'nocomp'}); return; }"
+            "try { comp.remoteMethod(" + json.dumps(str(pid).split(".")[0]) + "); } catch(e) {"
+            "  resolve({stage: 'callerr', error: String(e).slice(0, 80)}); return; }"
+            "setTimeout(() => resolve({"
+            "  stage: 'ok', tag: comp.$options.name || '?',"
+            "  accLoading: comp.accLoading,"
+            "  options: (comp.options || []).slice(0, 5)"
+            "}), 4000);"
+            "})"
         )
         try:
             return page.evaluate(js)
         except Exception as e:
-            return {"ok": -2, "error": str(e)[:100]}
+            return {"stage": "evalerr", "error": str(e)[:100]}
 
-    import time as _t
-    import urllib.parse as up
-    k = up.quote(str(pid), safe="")
-    variants = [
-        ("A jsonbody", f"/login/user", {"key": pid, "page": 1, "pageNum": 10}),
-        ("B url+ajax", f"/login/user?key={k}&page=1&pageNum=10&sf_request_type=ajax", None),
-        ("C json+ajax", f"/login/user?sf_request_type=ajax", {"key": pid, "page": 1, "pageNum": 10}),
-        ("D json简", f"/login/user", {"key": pid}),
-    ]
-    for label, url, body in variants:
-        _t.sleep(3)
-        r = spa_req(url, body)
-        rows = r.get("data") or []
-        log(f"📥 [{label}]: code={r.get('code')} count={r.get('count')} "
-            f"msg={str(r.get('message', r.get('error', '')))[:40]} rows={json.dumps(rows, ensure_ascii=False, default=str)[:350]}")
-        if r.get("code") == 0:
-            hit = [x for x in rows if isinstance(x, dict) and str(x.get("accNo")) == str(acc_id)]
-            findings.append(f"{label}:OK{'命中✓' if hit else ''}")
-            if hit:
-                log(f"🎯 命中: {json.dumps(hit[0], ensure_ascii=False, default=str)[:250]}")
-                break
-        else:
-            findings.append(f"{label}:{str(r.get('message', ''))[:18]}")
+    r = find_and_call()
+    log(f"📥 直接找组件: {json.dumps(r, ensure_ascii=False, default=str)[:400]}")
+    if r.get("stage") != "ok":
+        # 点房间卡片让订房弹窗挂载
+        findings.append("首页无组件,点房间")
+        try:
+            clicked = False
+            for sel in ("text=Room ", "text=房间"):
+                loc = page.locator(f"div:has-text('Room 5')").first
+                try:
+                    loc.click(timeout=3000)
+                    clicked = True
+                    log(f"🖱️ 已点击房间卡片 ({sel})")
+                    break
+                except Exception:
+                    continue
+            page.wait_for_timeout(2500)
+            log(f"📍 当前URL: {page.url}")
+            r = find_and_call()
+            log(f"📥 点击后再找: {json.dumps(r, ensure_ascii=False, default=str)[:400]}")
+        except Exception as e:
+            log(f"⚠️ 点击失败: {str(e)[:100]}")
+
+    if r.get("stage") == "ok":
+        opts = r.get("options") or []
+        hit = [o for o in opts if str(o.get("value")) == str(acc_id)]
+        findings.append(f"remoteMethod✓ opts={len(opts)}{'命中✓' if hit else ''}")
+        log(f"🎯 options: {json.dumps(opts, ensure_ascii=False, default=str)[:400]}")
+    else:
+        findings.append(f"stage={r.get('stage')}")
+
+    # 拦截到的请求（搜索真身）
+    log(f"📡 网络拦截({len(net_log)}条):")
+    for m, u in net_log[-12:]:
+        log(f"   {m} {u[:150]}")
+    if net_log:
+        findings.append(f"net={len(net_log)}")
 
     # 零残留
     begin = (_bjnow() - timedelta(days=1)).strftime("%Y-%m-%d")
@@ -1922,7 +1928,7 @@ def _room_op_probe(page, captured, op):
     else:
         log("✅ 零残留")
         findings.append("零残留✅")
-    return "🔬 probe v26 完成: " + "；".join(findings)
+    return "🔬 probe v27 完成: " + "；".join(findings)
 
 
 def run_room_op(op_json):
