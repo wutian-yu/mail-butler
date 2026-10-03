@@ -7,6 +7,7 @@ Handbook/Regulation），结果存 butler-data/lm_pages.json 供管家知识库�
 import json
 import os
 import re
+import sys
 import time
 from playwright.sync_api import sync_playwright
 
@@ -22,7 +23,7 @@ def main():
     cookie_str = os.environ.get("EBRIDGE_COOKIES", "")
     if not cookie_str:
         log("无 EBRIDGE_COOKIES，退出")
-        return
+        sys.exit(1)
     results = {}
 
     with sync_playwright() as p:
@@ -40,15 +41,38 @@ def main():
         time.sleep(3)
         if "login" in page.url.lower():
             log("SSO cookie 已过期，退出（monitor secrets 需刷新）")
-            return
+            sys.exit(1)
         log("✅ SSO 会话有效")
 
-        # 登录 LM（SAML 跳转链自动完成）
+        # 登录 LM：必须先走 SAML SSO 入口（直接访问 /my/ 只会到本地登录页）
+        sso_entry = ("https://core.xjtlu.edu.cn/auth/saml2/login.php"
+                     "?wants=&idp=59e86c8687092bdfa106649b2d5519e5&passive=off")
+        page.goto(sso_entry, wait_until="networkidle", timeout=60000)
+        # SAML 链：Moodle→IdP→(自动提交表单)→ACS→session 建立，轮询等待
+        logged = False
+        for i in range(12):
+            time.sleep(5)
+            url = page.url
+            log(f"  跳转中[{i+1}]: {url[:70]}")
+            if "core.xjtlu.edu.cn" in url and "login" not in url.lower():
+                logged = True
+                break
+            # 停在 IdP 自动提交页时，JS 会自动执行；若停留过久，尝试找 Continue 按钮点一下
+            try:
+                btn = page.query_selector("button[type=submit], input[type=submit]")
+                if btn and "uim" in url:
+                    btn.click()
+            except Exception:
+                pass
+        if not logged:
+            log("LM 登录失败（SAML 链未完成）")
+            sys.exit(1)
+        # 最终确认 dashboard 可达
         page.goto("https://core.xjtlu.edu.cn/my/", wait_until="networkidle", timeout=60000)
-        time.sleep(5)
+        time.sleep(3)
         if "login" in page.url.lower():
             log("LM 登录失败")
-            return
+            sys.exit(1)
         log("✅ LM 登录成功: " + page.url[:60])
 
         def grab(url, depth=0):
