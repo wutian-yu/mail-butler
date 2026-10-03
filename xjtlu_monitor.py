@@ -1821,105 +1821,81 @@ def _room_op_query(page, captured, op):
 
 
 def _room_op_probe(page, captured, op):
-    """安全探测订房 API v19（强制冷载 + 捕获全部请求）：
-    1. page.goto about:blank → page.goto ROOM_URL/#/ic/researchSpace/2/5/5（强制 SPA 冷启动）
-    2. 捕获全部请求 URL（不限 /ic-web/）+ 周视图响应
-    3. 打印页面最终 URL/标题 + 房间结构
+    """安全探测订房 API v20（验证 minUser 假设）：
+    1. dump roomDevice/roomInfos 房间完整字段（不截断，找 minUser/resvRule/devProp）
+    2. GET /borrow/device/resvDevInfo（设备详情）
+    3. dump getReserve 完整函数（周视图全部参数）
+    4. 用 GZHU 式 memberKind=2 测订（零副作用）
     """
     today = _bjnow().strftime("%Y-%m-%d")
+    ds = today.replace("-", "")
     findings = []
 
     acc_id, pid = _room_get_accid_from_storage(page)
     log(f"🆔 accId={acc_id!r}")
     findings.append(f"accId={acc_id}")
 
-    all_reqs = []
-    week_resp = {}
-
-    def _on_req(req):
-        try:
-            all_reqs.append(req.url[:200])
-        except Exception:
-            pass
-
-    def _on_resp(resp):
-        try:
-            u = resp.url
-            if "/ic-web/" in u and ("reserve" in u or "roomDevice" in u or "space" in u.lower()):
-                week_resp[u.split("/ic-web/", 1)[1][:150]] = resp.json()
-        except Exception:
-            pass
-
-    page.on("request", _on_req)
-    page.on("response", _on_resp)
-
-    log("🔀 先到 about:blank 强制冷载...")
-    try:
-        page.goto("about:blank", wait_until="domcontentloaded", timeout=10000)
-    except Exception:
-        pass
-    time.sleep(1)
-    log("🔀 导航到 5F 周视图完整 URL...")
-    try:
-        page.goto(ROOM_URL + "/#/ic/researchSpace/2/5/5",
-                 wait_until="domcontentloaded", timeout=45000)
-    except Exception as e:
-        log(f"⚠️ goto: {e}")
-    time.sleep(15)
-
-    try:
-        page.remove_listener("request", _on_req)
-        page.remove_listener("response", _on_resp)
-    except Exception:
-        pass
-
-    log(f"📍 页面 URL: {page.url[:120]}")
-    try:
-        log(f"📍 页面标题: {page.title()[:60]}")
-    except Exception:
-        pass
-
-    # 打印捕获的请求（全部）
-    xjtlu_reqs = [u for u in all_reqs if "xjtlu" in u and ".js" not in u and ".css" not in u and ".png" not in u and ".woff" not in u]
-    log(f"🔍 捕获 {len(all_reqs)} 个请求（xjtlu API {len(xjtlu_reqs)}）:")
-    for u in list(dict.fromkeys(xjtlu_reqs))[:25]:
-        log(f"🔍   {u}")
-    findings.append(f"reqs:{len(xjtlu_reqs)}")
-
-    for path, body in list(week_resp.items())[:6]:
-        log(f"📜 响应 {path[:80]}: {str(body)[:500]}")
-
-    # 房间结构
-    week_room = None
-    occupied = None
-    for path, body in week_resp.items():
-        if not isinstance(body, dict) or not body.get("data"):
-            continue
-        data = body["data"]
-        lists = data if isinstance(data, list) else [data]
-        for campus in lists:
-            if not isinstance(campus, dict):
-                continue
+    # 1. 房间完整字段（不截断）
+    r1 = _room_api_on_page(page, f"/roomDevice/roomInfos?resvDate={ds}")
+    if r1.get("code") == 0 and r1.get("data"):
+        for campus in r1["data"]:
             for lab in campus.get("labInfos") or []:
-                for rm in lab.get("roomInfos") or []:
-                    log(f"📜 房间: {json.dumps(rm, ensure_ascii=False)[:500]}")
-                    ris = rm.get("resvInfos") or []
-                    if ris and not week_room:
-                        week_room, occupied = rm, ris[0]
-                break
-            if week_room:
-                break
-        if week_room:
+                if lab.get("labName") == "5F":
+                    for rm in lab.get("roomInfos") or []:
+                        log(f"📜 房间完整字段: {json.dumps(rm, ensure_ascii=False)}")
+                    break
             break
 
-    # 试订
-    if week_room and occupied:
-        s = occupied.get("resvBeginTime", "")
-        e = occupied.get("resvEndTime", "")
-        dev_id = week_room.get("devId")
-        log(f"📍 冲突房间: {week_room.get('devName')} devId={dev_id} {s}-{e}")
+    # 2. 设备详情端点
+    for q in ("devId=7", "devId=7&sysKind=2", "id=7"):
+        r2 = _room_api_on_page(page, f"/borrow/device/resvDevInfo?{q}")
+        log(f"📥 resvDevInfo?{q}: code={r2.get('code')} data={str(r2.get('data'))[:250]}")
+        if r2.get("code") == 0:
+            break
 
-        def spa_post(payload):
+    # 3. dump getReserve 完整函数
+    try:
+        js_urls = page.evaluate(
+            "() => performance.getEntriesByType('resource')"
+            ".map(r => r.name).filter(u => u.endsWith('.js') && u.includes('chunk-52d28091'))")
+        if js_urls:
+            body = page.request.get(js_urls[0], timeout=20000).text()
+            idx = body.find("getReserve:function")
+            if idx >= 0:
+                log(f"📜 getReserve 完整: {body[idx:idx+1200][:1200]}")
+            # judgLimit / orderpeople / minUser 相关
+            for kw in ("minUser", "orderpeople"):
+                j = body.find(kw)
+                if j >= 0:
+                    log(f"📜「{kw}」: {body[max(0, j-200):j+400][:600]}")
+                    break
+    except Exception as e:
+        log(f"⚠️ JS 扫描失败: {e}")
+
+    # 4. GZHU 式 payload 测试（memberKind=2，研讨室全套字段；冲突时段零副作用）
+    raw = _room_query_avail_raw(page, today, captured)
+    conflict_room = occupied_slot = None
+    if raw:
+        for campus in raw:
+            for lab in campus.get("labInfos") or []:
+                for rm in lab.get("roomInfos") or []:
+                    occ = [rv for rv in (rm.get("resvInfos") or [])
+                           if _room_slot_occupied(rv.get("resvStatus", 0))]
+                    if occ:
+                        conflict_room, occupied_slot = rm, occ[0]
+                        break
+                if conflict_room:
+                    break
+            if conflict_room:
+                break
+
+    if conflict_room:
+        s = occupied_slot["resvBeginTime"]
+        e_t = occupied_slot["resvEndTime"]
+        dev = conflict_room["devId"]
+        acc = int(acc_id) if str(acc_id).isdigit() else acc_id
+
+        def spa_post(payload, url="/reserve/update"):
             js = (
                 "() => Promise.race(["
                 "new Promise((resolve) => {"
@@ -1929,7 +1905,7 @@ def _room_op_probe(page, captured, op):
                 "const axios = vm && vm.$axios;"
                 "if (!axios) { resolve({stage: 'noaxios'}); return; }"
                 "const p = " + json.dumps(payload, ensure_ascii=False) + ";"
-                "axios.post('/reserve/update', p)"
+                "axios.post(" + json.dumps(url) + ", p)"
                 ".then(r => resolve({ok: 1, code: r.data && r.data.code, message: r.data && r.data.message}))"
                 ".catch(e => resolve({ok: 0, error: String(e).slice(0, 100)}));"
                 "} catch(e) { resolve({ok: -1, error: String(e).slice(0, 100)}); }"
@@ -1942,19 +1918,31 @@ def _room_op_probe(page, captured, op):
             except Exception as e:
                 return {"ok": -2, "error": str(e)[:100]}
 
-        acc = int(acc_id) if str(acc_id).isdigit() else acc_id
-        payload = {
-            "sysKind": 2, "appAccNo": acc, "memberKind": 1,
-            "resvBeginTime": s, "resvEndTime": e,
-            "testName": "研讨", "resvKind": 2, "resvProperty": 0,
-            "appUrl": "", "resvMember": [acc], "resvDev": [dev_id],
-            "memo": "小组研讨", "captcha": "", "addServices": [],
+        # GZHU 式：memberKind=2 + resvKind=2 + sysKind=1 + rp=0 + 无秒时间
+        gzhu_payload = {
+            "appAccNo": acc,
+            "captcha": "",
+            "memberKind": 2,
+            "memo": "小组研讨",
+            "resvBeginTime": s,
+            "resvDev": [dev],
+            "resvEndTime": e_t,
+            "resvMember": [acc],
+            "resvProperty": 0,
+            "sysKind": 1,
+            "testName": "小组研讨",
+            "addServices": [],
+            "appUrl": "",
+            "resvKind": 2,
         }
-        rb = spa_post(payload)
-        log(f"📥 周视图冲突订房: code={rb.get('code')} msg={str(rb.get('message', rb.get('error', '')))[:70]}")
-        findings.append(f"订:{str(rb.get('message', ''))[:30]}")
-    else:
-        log("📭 无冲突房间或数据未捕获")
+        r3 = spa_post(gzhu_payload)
+        log(f"📥 GZHU式(update): code={r3.get('code')} msg={str(r3.get('message', r3.get('error', '')))[:70]}")
+        findings.append(f"GZHU式:{str(r3.get('message', ''))[:30]}")
+
+        # GZHU 还用 /reserve 端点——试一下（XJTLU 可能兼容旧端点）
+        r4 = spa_post(gzhu_payload, "/reserve")
+        log(f"📥 GZHU式(/reserve): code={r4.get('code')} msg={str(r4.get('message', r4.get('error', '')))[:70]}")
+        findings.append(f"/reserve:{str(r4.get('message', ''))[:30]}")
 
     # 零残留
     begin = (_bjnow() - timedelta(days=1)).strftime("%Y-%m-%d")
@@ -1973,7 +1961,7 @@ def _room_op_probe(page, captured, op):
     else:
         log("✅ 零残留")
         findings.append("零残留✅")
-    return "🔬 probe v19 完成: " + "；".join(findings)
+    return "🔬 probe v20 完成: " + "；".join(findings)
 
 
 def run_room_op(op_json):
