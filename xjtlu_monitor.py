@@ -1821,10 +1821,10 @@ def _room_op_query(page, captured, op):
 
 
 def _room_op_probe(page, captured, op):
-    """安全探测订房 API v12（纯情报：dump 完整 submit 方法代码）：
-    1. 找 chunk-52d28091 里的 handleSubmit:function / resvBeginTime:i / resvBeginTime:r
-    2. dump 完整方法体（含时间计算 + API 调用）
-    3. 分段打日志（避免截断）
+    """安全探测订房 API v13（找研讨室真实 sysKind）：
+    1. 读 Vuex 的 navSpaceMenu / navSeatMenu（kindId 就是订房的 sysKind）
+    2. dump sysKind 赋值来源
+    3. 用真实 sysKind 测冲突时段（零副作用）
     """
     today = _bjnow().strftime("%Y-%m-%d")
     findings = []
@@ -1833,6 +1833,28 @@ def _room_op_probe(page, captured, op):
     log(f"🆔 accId={acc_id!r}")
     findings.append(f"accId={acc_id}")
 
+    # 1. 读 Vuex 的导航菜单（含 kindId）
+    try:
+        menus = page.evaluate(
+            "() => {"
+            "const el = document.querySelector('#app') || document.body.firstElementChild;"
+            "const vm = el && el.__vue__;"
+            "if (!vm || !vm.$store) return {error: 'no store'};"
+            "const s = vm.$store.state;"
+            "return {"
+            "navSpaceMenu: s.navSpaceMenu,"
+            "navSeatMenu: s.navSeatMenu,"
+            "navreadroomMenu: s.navreadroomMenu,"
+            "};"
+            "}")
+        log(f"🔍 navSpaceMenu: {json.dumps(menus.get('navSpaceMenu'), ensure_ascii=False)[:800]}")
+        log(f"🔍 navSeatMenu: {json.dumps(menus.get('navSeatMenu'), ensure_ascii=False)[:300]}")
+        log(f"🔍 navreadroomMenu: {json.dumps(menus.get('navreadroomMenu'), ensure_ascii=False)[:300]}")
+        findings.append(f"space菜单:{json.dumps(menus.get('navSpaceMenu'), ensure_ascii=False)[:100]}")
+    except Exception as e:
+        log(f"⚠️ 菜单读取失败: {e}")
+
+    # 2. dump chunk-52d28091 的 sysKind 赋值来源
     body = None
     try:
         js_urls = page.evaluate(
@@ -1840,53 +1862,93 @@ def _room_op_probe(page, captured, op):
             ".map(r => r.name).filter(u => u.endsWith('.js') && u.includes('chunk-52d28091'))")
         if js_urls:
             body = page.request.get(js_urls[0], timeout=20000).text()
-            log(f"📜 chunk-52d28091.js {len(body)} 字节")
     except Exception as e:
         log(f"⚠️ chunk 下载失败: {e}")
-        return "❌ probe v12: chunk 下载失败"
 
-    if not body:
-        return "❌ probe v12: chunk 为空"
+    if body:
+        # sysKind 的来源（props/computed/route）
+        for kw in ("sysKind:", "sysKind=", "kindId"):
+            idx = 0
+            count = 0
+            while count < 4:
+                idx = body.find(kw, idx)
+                if idx < 0:
+                    break
+                # 只打带上下文的
+                ctx = body[max(0, idx - 100):idx + 200]
+                if "props" in ctx or "route" in ctx or "data" in ctx or "=" in ctx[:110]:
+                    log(f"📜「{kw}」@{idx}: ...{ctx[:300]}...")
+                    count += 1
+                idx += len(kw)
 
-    # 1. 找 handleSubmit:function（完整方法体，分段 dump）
-    idx = body.find("handleSubmit:function")
-    if idx >= 0:
-        seg = body[idx:idx + 9000]
-        for i in range(0, min(len(seg), 9000), 900):
-            log(f"📜 submit[{i//900}] {seg[i:i+900]}")
-        findings.append("handleSubmit已dump")
-    else:
-        log("📜 handleSubmit:function 未找到，试别的关键词")
-        for kw in ("resvBeginTime:i", "resvBeginTime:r", "selectAccNoList.length",
-                   "changeBeginTime:function", "laterTimeChange:function"):
-            j = body.find(kw)
-            if j >= 0:
-                log(f"📜「{kw}」@{j}: {body[max(0, j - 500):j + 3000][:3500]}")
-                findings.append(f"{kw[:15]}已dump")
+    # 3. 用候选 sysKind 测冲突时段（零副作用）
+    raw = _room_query_avail_raw(page, today, captured)
+    conflict_room = occupied_slot = None
+    if raw:
+        for campus in raw:
+            for lab in campus.get("labInfos") or []:
+                for rm in lab.get("roomInfos") or []:
+                    occ = [rv for rv in (rm.get("resvInfos") or [])
+                           if _room_slot_occupied(rv.get("resvStatus", 0))]
+                    if occ:
+                        conflict_room, occupied_slot = rm, occ[0]
+                        break
+                if conflict_room:
+                    break
+            if conflict_room:
                 break
 
-    # 2. resvBeginTime:i 的上下文（i/s 时间计算）
-    j = body.find("resvBeginTime:i")
-    if j >= 0:
-        log(f"📜「resvBeginTime:i」前文: {body[max(0, j - 2500):j][:2500]}")
-        log(f"📜「resvBeginTime:i」后文: {body[j:j + 2500][:2500]}")
-        findings.append("时间构造已dump")
+    if conflict_room:
+        s_slot = occupied_slot["resvBeginTime"]
+        e_slot = occupied_slot["resvEndTime"]
+        dev = conflict_room["devId"]
+        acc = int(acc_id) if str(acc_id).isdigit() else acc_id
 
-    # 3. API 调用模式（Object(l["q"]) / Object(x["x"]) 等）
-    for kw in ('Object(l["q"])', 'Object(l["r"])', 'Object(l["p"])',
-               'Object(l["s"])', 'Object(l["t"])', 'Object(l["u"])',
-               'Object(l["v"])', 'Object(l["w"])', 'Object(l["x"])'):
-        j = body.find(kw)
-        if j >= 0:
-            log(f"📜 API调用「{kw}」: {body[max(0, j - 300):j + 500][:800]}")
-            findings.append(f"API调用{kw[9:12]}已dump")
+        def spa_post(payload):
+            js = (
+                "() => Promise.race(["
+                "new Promise((resolve) => {"
+                "try {"
+                "const el = document.querySelector('#app') || document.body.firstElementChild;"
+                "const vm = el && el.__vue__;"
+                "const axios = vm && vm.$axios;"
+                "if (!axios) { resolve({stage: 'noaxios'}); return; }"
+                "const p = " + json.dumps(payload, ensure_ascii=False) + ";"
+                "axios.post('/reserve/update', p)"
+                ".then(r => resolve({ok: 1, code: r.data && r.data.code, message: r.data && r.data.message}))"
+                ".catch(e => resolve({ok: 0, error: String(e).slice(0, 100)}));"
+                "} catch(e) { resolve({ok: -1, error: String(e).slice(0, 100)}); }"
+                "}),"
+                "new Promise((resolve) => setTimeout(() => resolve({stage: 'timeout'}), 15000))"
+                "])"
+            )
+            try:
+                return page.evaluate(js)
+            except Exception as e:
+                return {"ok": -2, "error": str(e)[:100]}
 
-    # 4. Vue 组件里的 methods 列表（找 submit 相关方法名）
-    for kw in ("methods:{", "handleSubmit", "submitResv", "doResv", "handleResv",
-               "saveResv", "confirmResv", "onSubmit", "submitForm"):
-        j = body.find(kw)
-        if j >= 0:
-            log(f"📜「{kw}」@{j}: {body[j:j + 400][:400]}")
+        def mk(sk):
+            return {
+                "sysKind": sk, "appAccNo": acc, "memberKind": 1,
+                "resvBeginTime": s_slot, "resvEndTime": e_slot,
+                "testName": "研讨", "resvKind": 2, "resvProperty": 32,
+                "appUrl": "", "resvMember": [acc], "resvDev": [dev],
+                "memo": "小组研讨", "captcha": "", "addServices": [],
+            }
+
+        def is_param_err(msg):
+            m = str(msg).lower()
+            return "参数" in m or "parameter" in m
+
+        # sysKind 候选：1（旧值）、2（座位用）、3、4、8（sysInfo 里见过）、16（活动）
+        for sk in (1, 2, 3, 4, 8, 16):
+            r = spa_post(mk(sk))
+            msg = str(r.get("message", r.get("error", "")))
+            log(f"📥 sysKind={sk}: code={r.get('code')} msg={msg[:60]}")
+            findings.append(f"sk{sk}:{msg[:20]}")
+            if not is_param_err(msg):
+                log(f"🎯 sysKind={sk} 通过参数校验！")
+                break
 
     # 零残留
     begin = (_bjnow() - timedelta(days=1)).strftime("%Y-%m-%d")
@@ -1905,7 +1967,7 @@ def _room_op_probe(page, captured, op):
     else:
         log("✅ 零残留")
         findings.append("零残留✅")
-    return "🔬 probe v12 完成: " + "；".join(findings)
+    return "🔬 probe v13 完成: " + "；".join(findings)
 
 
 def run_room_op(op_json):
