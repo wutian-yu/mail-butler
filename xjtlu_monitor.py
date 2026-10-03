@@ -49,6 +49,10 @@ LM_CAL_DEFAULT_URL = (LM_CORE_URL + "/calendar/export_execute.php"
                       "?userid=7860&authtoken=e0f4ad6318700f9841cb02a96315cb30d6451624"
                       "&preset_what=all&preset_time=recentupcoming")
 
+# 图书馆房间预定系统（Information Commons，走 trust → sso → uim esc-sso OAuth 链）
+ROOM_URL = "https://roombookings.xjtlu.edu.cn"
+IC_API = ROOM_URL + "/ic-web"
+
 IMPORTANT_KEYWORDS = [
     "考试", "exam", "deadline", "截止", "ddl", "作业", "assignment",
     "成绩", "grade", "通知", "announcement", "重要", "important",
@@ -1313,6 +1317,194 @@ def cookie_login(context, page):
         return False
 
 
+# ============ 图书馆房间预定系统（Information Commons） ============
+
+def _room_uim_fill_login(page):
+    """roombookings 跳到 uim esc-sso 登录页时，填账密登录（选择器与 sso_login 同源）"""
+    selectors = [
+        ("input[name='username']", "input[name='password']"),
+        ("input#username", "input#password"),
+        ("input[type='text']", "input[type='password']"),
+        ("input[placeholder*='帐号']", "input[placeholder*='密码']"),
+        ("input[placeholder*='账号']", "input[placeholder*='密码']"),
+    ]
+    u = p = None
+    for u_sel, p_sel in selectors:
+        try:
+            u = page.query_selector(u_sel)
+            p = page.query_selector(p_sel)
+        except Exception:
+            continue
+        if u and p:
+            break
+        u = p = None
+    if not u or not p:
+        return False
+    try:
+        u.fill(XJTLU_USERNAME)
+        time.sleep(0.4)
+        p.fill(XJTLU_PASSWORD)
+        time.sleep(0.4)
+        btn = (page.query_selector("button:has-text('登录')")
+               or page.query_selector("button:has-text('Login')")
+               or page.query_selector("button[type='submit']")
+               or page.query_selector("input[type='submit']"))
+        if btn:
+            try:
+                box = btn.bounding_box()
+                if box:
+                    page.mouse.move(box["x"] + box["width"] / 2, box["y"] + box["height"] / 2)
+                    time.sleep(0.2)
+                    page.mouse.down()
+                    time.sleep(0.1)
+                    page.mouse.up()
+                else:
+                    btn.click(force=True)
+            except Exception:
+                p.press("Enter")
+        else:
+            p.press("Enter")
+        log("🔑 房间系统 uim 登录表单已提交")
+        return True
+    except Exception as e:
+        log(f"⚠️ uim 表单填写失败: {e}")
+        return False
+
+
+def _find_accid(obj):
+    """在任意 JSON 结构里递归找 accId 字段"""
+    if isinstance(obj, dict):
+        for k, v in obj.items():
+            if k.lower() in ("accid", "accno", "useraccid") and v:
+                return str(v)
+            r = _find_accid(v)
+            if r:
+                return r
+    elif isinstance(obj, list):
+        for it in obj:
+            r = _find_accid(it)
+            if r:
+                return r
+    return None
+
+
+def fetch_roombookings_session(browser, main_context):
+    """登录房间预定系统，抓 API session cookies + accId，存入 state['room']
+
+    跳转链：roombookings → trust → sso.xjtlu → uim esc-sso（OAuth2）
+    复用主 context 的 uim TGC，通常自动跳回；停在登录页则填账密。
+    """
+    captured = {}
+
+    def _capture(resp):
+        try:
+            if "/ic-web/" in resp.url:
+                path = resp.url.split("/ic-web/", 1)[1].split("?")[0]
+                captured[path] = resp.json()
+        except Exception:
+            pass
+
+    ctx = None
+    try:
+        ctx = browser.new_context(locale="zh-CN")  # 桌面 UA：IC 是 PC 系统
+        ctx.add_cookies(main_context.cookies())
+        page = ctx.new_page()
+        page.on("response", _capture)
+        log("🏛️ 登录图书馆房间预定系统...")
+        page.goto(ROOM_URL, wait_until="domcontentloaded", timeout=45000)
+
+        stable = 0
+        filled_once = False
+        for i in range(40):
+            time.sleep(3)
+            try:
+                u = page.url
+            except Exception:
+                continue
+            if "uim.xjtlu.edu.cn" in u and "login" in u.lower():
+                if not filled_once and XJTLU_USERNAME and XJTLU_PASSWORD:
+                    log(f"🔑 停在 uim 登录页，自动填入账密...")
+                    filled_once = _room_uim_fill_login(page)
+                continue
+            if "roombookings" in u:
+                stable += 1
+                if stable >= 2:
+                    log(f"✅ 房间系统就绪: {u[:60]}")
+                    break
+            else:
+                stable = 0
+                if i % 4 == 0:
+                    log(f"⏳ 跳转链中... URL: {u[:70]}")
+                # 卡在 trust/sso 超过 45 秒 → 重新触发一次跳转链
+                if i in (15, 30):
+                    log(f"🔄 跳转链卡住，重新访问 {ROOM_URL}")
+                    try:
+                        page.goto(ROOM_URL, wait_until="domcontentloaded", timeout=30000)
+                    except Exception:
+                        pass
+
+        # 验证 API 登录态（roomMenu 无需登录也可能返回？以 reserve/count 为准）
+        try:
+            resp = page.request.get(f"{IC_API}/roomMenu", timeout=20000)
+            data = resp.json()
+        except Exception as e:
+            log(f"⚠️ roomMenu 请求失败: {e}")
+            data = {}
+        if data.get("code") != 0:
+            log(f"❌ 房间系统 API 未登录: {str(data.get('message'))[:60]}")
+            return None
+
+        # 抓 roombookings/trust/sso 三个域的 session cookies
+        all_cookies = ctx.cookies()
+        keep_domains = ("roombookings", "trust.xjtlu", "sso.xjtlu")
+        room_cookies = [c for c in all_cookies
+                        if any(d in (c.get("domain") or "") for d in keep_domains)
+                        and c.get("name") not in ("lang", "language")]  # 语言 cookie 无用，省体积
+        # accId：先翻捕获的响应，再主动调 getOwerUser
+        acc_id = None
+        for body in captured.values():
+            acc_id = _find_accid(body)
+            if acc_id:
+                break
+        user_name = None
+        for path, body in captured.items():
+            if isinstance(body, dict):
+                d = body.get("data")
+                if isinstance(d, dict) and d.get("name"):
+                    user_name = str(d["name"])
+                    break
+        if not acc_id:
+            for ep in ("/authUser/getOwerUser", "/user/getUserInfo", "/authUser/getUser"):
+                try:
+                    r2 = page.request.get(IC_API + ep, timeout=15000)
+                    j2 = r2.json()
+                    acc_id = _find_accid(j2)
+                    if acc_id:
+                        log(f"🆔 accId 来自 {ep}")
+                        if not user_name and isinstance(j2.get("data"), dict):
+                            user_name = j2["data"].get("name")
+                        break
+                except Exception:
+                    continue
+
+        log(f"✅ 房间系统登录成功：{len(room_cookies)} 个 cookie，accId={'有' if acc_id else '未获取'}")
+        return {
+            "cookies": room_cookies,
+            "accId": acc_id or "",
+            "name": user_name or "",
+            "updated": datetime.now().isoformat(timespec="seconds"),
+        }
+    except Exception as e:
+        log(f"⚠️ 房间系统登录异常: {e}")
+        return None
+    finally:
+        if ctx:
+            try:
+                ctx.close()
+            except Exception:
+                pass
+
+
 def run():
     log("🚀 西浦网站监控启动")
 
@@ -1461,6 +1653,18 @@ def run():
                 f"，课节 {len(ams_state['sessions'])} 个，提醒 {len(ams_notes)} 条")
         else:
             log("📭 AMS 数据未获取（登录或接口异常），跳过")
+
+        # 6. 图书馆房间预定系统（抓 session cookie 存 state，供云函数查房/订房）
+        if logged_in:
+            room = fetch_roombookings_session(browser, context)
+            if room:
+                state["room"] = room
+                log(f"🏛️ 房间 session 已更新（cookie {len(room['cookies'])} 个）")
+            else:
+                # 登录失败保留旧 session（cookie 可能仍有效）
+                old = state.get("room") or {}
+                state["room"] = old
+                log(f"📭 房间系统本次未登录成功，保留旧 session（{len(old.get('cookies') or [])} cookie）")
 
         browser.close()
 
