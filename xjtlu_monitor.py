@@ -1467,30 +1467,38 @@ def _room_api_on_page(page, path, method="GET", data=None, timeout=20000):
         return {"code": -1, "message": f"请求异常: {e}"}
 
 
-def _room_query_avail_raw(page, date_str):
+def _room_query_avail_raw(page, date_str, captured=None):
     """查 SIP 当天可用性，返回原始 data 数组（可能为 None）
-    方案A: 全楼层逗号分隔 → 方案B: 逐楼层调用合并 → 方案C: roomDevice/roomInfos（仅今天）
+    方案A: 全楼层逗号分隔 → 方案B: 逐楼层 → 方案C: roomDevice/roomInfos 带日期参数变体 → 方案D: roomDevice/roomInfos（仅今天）
+    captured: SPA 已调过的接口（含完整 URL），用来借鉴参数格式
     """
     ds = date_str.replace("-", "")
+    is_today = (ds == _bjnow().strftime("%Y%m%d"))
     # 方案A: 合并 labIds
     resp = _room_api_on_page(
         page, f"/reserve?sysKind=1&resvDates={ds}&labIds={ROOM_SIP_LABS}")
     if resp.get("code") == 0 and resp.get("data"):
         return resp["data"]
-    log(f"⚠️ /reserve 合并labIds失败 {date_str}: {str(resp.get('message'))[:50]} → 试逐楼层")
-    # 方案B: 逐楼层调用合并
+    # 方案B: 逐楼层
     labs_data = []
     for lid in (3, 4, 5, 1, 7, 9):
-        r = _room_api_on_page(
-            page, f"/reserve?sysKind=1&resvDates={ds}&labIds={lid}")
+        r = _room_api_on_page(page, f"/reserve?sysKind=1&resvDates={ds}&labIds={lid}")
         if r.get("code") == 0 and r.get("data"):
             for campus in r["data"]:
                 if "SIP" in (campus.get("campusName") or ""):
                     labs_data.extend(campus.get("labInfos") or [])
     if labs_data:
         return [{"campusName": "SIP Campus", "labInfos": labs_data}]
-    # 方案C: roomDevice/roomInfos（SPA 自调的接口，仅今天）
-    if ds == _bjnow().strftime("%Y%m%d"):
+    # 方案C: roomDevice/roomInfos 带日期参数（试常见变体）
+    if not is_today:
+        for q in (f"resvDate={ds}", f"resvDates={ds}",
+                  f"beginDate={ds}&endDate={ds}", f"date={ds}"):
+            r = _room_api_on_page(page, f"/roomDevice/roomInfos?{q}")
+            if r.get("code") == 0 and r.get("data"):
+                log(f"✅ roomDevice/roomInfos?{q[:30]} 成功")
+                return r["data"]
+    # 方案D: roomDevice/roomInfos 无参数（仅今天有效）
+    if is_today:
         r = _room_api_on_page(page, "/roomDevice/roomInfos")
         if r.get("code") == 0 and r.get("data"):
             return r["data"]
@@ -1613,8 +1621,13 @@ def fetch_roombookings_session(browser, main_context, with_cache=True):
     def _capture(resp):
         try:
             if "/ic-web/" in resp.url:
-                path = resp.url.split("/ic-web/", 1)[1].split("?")[0]
-                captured[path] = resp.json()
+                full = resp.url.split("/ic-web/", 1)[1]  # path?query
+                path = full.split("?", 1)[0]
+                body = resp.json()
+                captured[path] = body
+                # 记录带查询参数的完整路径（discover 日期参数格式用）
+                if "?" in full:
+                    captured.setdefault("_urls", []).append(full)
         except Exception:
             pass
 
@@ -1622,9 +1635,13 @@ def fetch_roombookings_session(browser, main_context, with_cache=True):
     if not page:
         return None
     try:
-        # 把 SPA 调过的接口打出来（一次性排查 accId 端点用）
+        # 把 SPA 调过的接口打出来（含完整 URL，排查 accId 端点 + 日期参数格式）
+        for full in captured.get("_urls", [])[:15]:
+            log(f"📸 SPA 调用 {full[:130]}")
         for path, body in list(captured.items())[:15]:
-            log(f"📸 SPA 调用 {path}: {str(body)[:90]}")
+            if path == "_urls":
+                continue
+            log(f"📸 SPA 响应 {path}: {str(body)[:80]}")
 
         all_cookies = ctx.cookies()
         keep_domains = ("roombookings", "trust.xjtlu", "sso.xjtlu")
@@ -1644,7 +1661,7 @@ def fetch_roombookings_session(browser, main_context, with_cache=True):
             avail = {}
             for d in range(ROOM_MAX_AHEAD_DAYS + 1):
                 ds = (_bjnow() + timedelta(days=d)).strftime("%Y-%m-%d")
-                raw = _room_query_avail_raw(page, ds)
+                raw = _room_query_avail_raw(page, ds, captured)
                 if raw:
                     avail[ds] = _room_compact_avail(raw)
             session["avail"] = avail
@@ -1718,7 +1735,7 @@ def _room_op_book(page, captured, op):
     err = _room_validate_booking(date, start, end)
     if err:
         return err
-    raw = _room_query_avail_raw(page, date)
+    raw = _room_query_avail_raw(page, date, captured)
     if raw is None:
         return "❌ 查询房间状态失败，稍后重试。"
     dev = _room_find_dev_compact(raw, room_key)
@@ -1776,7 +1793,7 @@ def _room_op_cancel(page, captured, op):
 
 def _room_op_query(page, captured, op):
     date = op.get("date") or _bjnow().strftime("%Y-%m-%d")
-    raw = _room_query_avail_raw(page, date)
+    raw = _room_query_avail_raw(page, date, captured)
     if raw is None:
         return "❌ 查询失败，稍后重试。"
     # 用与云函数一致的 compact+展示逻辑
@@ -1810,8 +1827,11 @@ def run_room_op(op_json):
     def _capture(resp):
         try:
             if "/ic-web/" in resp.url:
-                path = resp.url.split("/ic-web/", 1)[1].split("?")[0]
+                full = resp.url.split("/ic-web/", 1)[1]
+                path = full.split("?", 1)[0]
                 captured[path] = resp.json()
+                if "?" in full:
+                    captured.setdefault("_urls", []).append(full)
         except Exception:
             pass
 
