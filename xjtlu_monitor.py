@@ -1821,12 +1821,14 @@ def _room_op_query(page, captured, op):
 
 
 def _room_op_probe(page, captured, op):
-    """安全探测订房 API v20（验证 minUser 假设）：
-    1. dump roomDevice/roomInfos 房间完整字段（不截断，找 minUser/resvRule/devProp）
-    2. GET /borrow/device/resvDevInfo（设备详情）
-    3. dump getReserve 完整函数（周视图全部参数）
-    4. 用 GZHU 式 memberKind=2 测订（零副作用）
-    """
+    """安全探测订房 API v21（memberKind=1 单人流验证）：
+    依据：SPA handleSubmit 源码 memberKind = selectAccNoList.length>1 ? 2 : 1，
+    即单人提交 = memberKind:1 + resvMember:[自己]——"人数2-10"报错可能只针对 memberKind=2。
+    所有订房测试打在已占用时段 → 必被拒绝 → 零副作用。
+    T1 mk1+sk2+rp32（handleSubmit 原样）/ T2 mk1+sk2+rp0 / T3 mk1+sk1+rp0（GZHU 座位式）
+    T4 mk2+自己×2（测重复 accNo 能否过人数关）
+    T5 /reserve/update + URL参数串（SPA 原生传输：API 模块里是 method:post, params:n）
+    另：dump sysConfig（验证码开关等）+ 楼层 labId 映射 + 零残留验证"""
     today = _bjnow().strftime("%Y-%m-%d")
     ds = today.replace("-", "")
     findings = []
@@ -1834,45 +1836,34 @@ def _room_op_probe(page, captured, op):
     acc_id, pid = _room_get_accid_from_storage(page)
     log(f"🆔 accId={acc_id!r}")
     findings.append(f"accId={acc_id}")
+    acc = int(acc_id) if str(acc_id).isdigit() else acc_id
 
-    # 1. 房间完整字段（不截断）
-    r1 = _room_api_on_page(page, f"/roomDevice/roomInfos?resvDate={ds}")
-    if r1.get("code") == 0 and r1.get("data"):
-        for campus in r1["data"]:
-            for lab in campus.get("labInfos") or []:
-                if lab.get("labName") == "5F":
-                    for rm in lab.get("roomInfos") or []:
-                        log(f"📜 房间完整字段: {json.dumps(rm, ensure_ascii=False)}")
-                    break
-            break
-
-    # 2. 设备详情端点
-    for q in ("devId=7", "devId=7&sysKind=2", "id=7"):
-        r2 = _room_api_on_page(page, f"/borrow/device/resvDevInfo?{q}")
-        log(f"📥 resvDevInfo?{q}: code={r2.get('code')} data={str(r2.get('data'))[:250]}")
-        if r2.get("code") == 0:
-            break
-
-    # 3. dump getReserve 完整函数
+    # 0) sysConfig / 路由（resvCode 验证码开关、resvthemefix、spaceListType）
     try:
-        js_urls = page.evaluate(
-            "() => performance.getEntriesByType('resource')"
-            ".map(r => r.name).filter(u => u.endsWith('.js') && u.includes('chunk-52d28091'))")
-        if js_urls:
-            body = page.request.get(js_urls[0], timeout=20000).text()
-            idx = body.find("getReserve:function")
-            if idx >= 0:
-                log(f"📜 getReserve 完整: {body[idx:idx+1200][:1200]}")
-            # judgLimit / orderpeople / minUser 相关
-            for kw in ("minUser", "orderpeople"):
-                j = body.find(kw)
-                if j >= 0:
-                    log(f"📜「{kw}」: {body[max(0, j-200):j+400][:600]}")
-                    break
+        cfg = page.evaluate(
+            "() => { try { const el = document.querySelector('#app') || document.body.firstElementChild;"
+            "const vm = el && el.__vue__; if (!vm) return null;"
+            "const s = (vm.$store && vm.$store.state) || {};"
+            "return { sysConfig: s.sysConfig || null, route: vm.$route ? {path: vm.$route.path, params: vm.$route.params} : null };"
+            "} catch(e) { return 'ERR ' + String(e).slice(0, 60); } }")
+        log(f"📜 sysConfig/route: {json.dumps(cfg, ensure_ascii=False, default=str)[:700]}")
+        if isinstance(cfg, dict) and isinstance(cfg.get("sysConfig"), dict):
+            sc = cfg["sysConfig"]
+            findings.append(f"resvCode={sc.get('resvCode')},themefix={sc.get('resvthemefix')}")
     except Exception as e:
-        log(f"⚠️ JS 扫描失败: {e}")
+        log(f"⚠️ sysConfig dump 失败: {e}")
 
-    # 4. GZHU 式 payload 测试（memberKind=2，研讨室全套字段；冲突时段零副作用）
+    # 1) 楼层 labId 映射（周视图 getReserve 需要）
+    r0 = _room_api_on_page(page, f"/roomDevice/roomInfos?resvDate={ds}")
+    labs = 0
+    if r0.get("code") == 0 and r0.get("data"):
+        for campus in r0["data"]:
+            for lab in campus.get("labInfos") or []:
+                labs += 1
+                log(f"🏛️ labId={lab.get('labId')} labName={lab.get('labName')}")
+    findings.append(f"labIds={labs}")
+
+    # 2) 找一个已占用时段（冲突 → 必被拒 → 零副作用）
     raw = _room_query_avail_raw(page, today, captured)
     conflict_room = occupied_slot = None
     if raw:
@@ -1889,62 +1880,86 @@ def _room_op_probe(page, captured, op):
             if conflict_room:
                 break
 
+    def spa_post(payload, url="/reserve", as_params=False):
+        """SPA axios 提交。as_params=False: JSON body（v20 实证 /reserve 接受）；
+        True: 参数全部拼进 URL 查询串（SPA 原生 params:n 传输，数组重复键）"""
+        head = (
+            "() => Promise.race(["
+            "new Promise((resolve) => {"
+            "try {"
+            "const el = document.querySelector('#app') || document.body.firstElementChild;"
+            "const vm = el && el.__vue__;"
+            "const axios = vm && vm.$axios;"
+            "if (!axios) { resolve({stage: 'noaxios'}); return; }"
+        )
+        tail = (
+            ".then(r => resolve({ok: 1, code: r.data && r.data.code, message: r.data && r.data.message}))"
+            ".catch(e => resolve({ok: 0, error: String(e).slice(0, 100)}));"
+            "} catch(e) { resolve({ok: -1, error: String(e).slice(0, 100)}); }"
+            "}),"
+            "new Promise((resolve) => setTimeout(() => resolve({stage: 'timeout'}), 15000))"
+            "])"
+        )
+        if as_params:
+            parts = []
+            for k, v in payload.items():
+                if isinstance(v, (list, tuple)):
+                    if not v:
+                        continue
+                    for x in v:
+                        parts.append(k + "=" + urllib.parse.quote(str(x), safe=""))
+                elif v is None:
+                    continue
+                else:
+                    parts.append(k + "=" + urllib.parse.quote(str(v), safe=""))
+            full = url + ("&" if "?" in url else "?") + "&".join(parts)
+            js = head + "axios.post(" + json.dumps(full) + ", null)" + tail
+        else:
+            js = (head + "const p = " + json.dumps(payload, ensure_ascii=False) + ";"
+                  + "axios.post(" + json.dumps(url) + ", p)" + tail)
+        try:
+            return page.evaluate(js)
+        except Exception as e:
+            return {"ok": -2, "error": str(e)[:100]}
+
     if conflict_room:
         s = occupied_slot["resvBeginTime"]
         e_t = occupied_slot["resvEndTime"]
         dev = conflict_room["devId"]
-        acc = int(acc_id) if str(acc_id).isdigit() else acc_id
-
-        def spa_post(payload, url="/reserve/update"):
-            js = (
-                "() => Promise.race(["
-                "new Promise((resolve) => {"
-                "try {"
-                "const el = document.querySelector('#app') || document.body.firstElementChild;"
-                "const vm = el && el.__vue__;"
-                "const axios = vm && vm.$axios;"
-                "if (!axios) { resolve({stage: 'noaxios'}); return; }"
-                "const p = " + json.dumps(payload, ensure_ascii=False) + ";"
-                "axios.post(" + json.dumps(url) + ", p)"
-                ".then(r => resolve({ok: 1, code: r.data && r.data.code, message: r.data && r.data.message}))"
-                ".catch(e => resolve({ok: 0, error: String(e).slice(0, 100)}));"
-                "} catch(e) { resolve({ok: -1, error: String(e).slice(0, 100)}); }"
-                "}),"
-                "new Promise((resolve) => setTimeout(() => resolve({stage: 'timeout'}), 15000))"
-                "])"
-            )
-            try:
-                return page.evaluate(js)
-            except Exception as e:
-                return {"ok": -2, "error": str(e)[:100]}
-
-        # GZHU 式：memberKind=2 + resvKind=2 + sysKind=1 + rp=0 + 无秒时间
-        gzhu_payload = {
+        log(f"🎯 冲突房: devId={dev} {conflict_room.get('devName')} {s}~{e_t}")
+        base = {
             "appAccNo": acc,
             "captcha": "",
-            "memberKind": 2,
             "memo": "小组研讨",
             "resvBeginTime": s,
             "resvDev": [dev],
             "resvEndTime": e_t,
-            "resvMember": [acc],
-            "resvProperty": 0,
-            "sysKind": 1,
             "testName": "小组研讨",
             "addServices": [],
             "appUrl": "",
             "resvKind": 2,
         }
-        r3 = spa_post(gzhu_payload)
-        log(f"📥 GZHU式(update): code={r3.get('code')} msg={str(r3.get('message', r3.get('error', '')))[:70]}")
-        findings.append(f"GZHU式:{str(r3.get('message', ''))[:30]}")
+        tests = [
+            ("T1", "mk1,sk2,rp32", dict(base, memberKind=1, sysKind=2, resvProperty=32, resvMember=[acc]),
+             "/reserve", False),
+            ("T2", "mk1,sk2,rp0", dict(base, memberKind=1, sysKind=2, resvProperty=0, resvMember=[acc]),
+             "/reserve", False),
+            ("T3", "mk1,sk1,rp0", dict(base, memberKind=1, sysKind=1, resvProperty=0, resvMember=[acc]),
+             "/reserve", False),
+            ("T4", "mk2,accx2", dict(base, memberKind=2, sysKind=1, resvProperty=0, resvMember=[acc, acc]),
+             "/reserve", False),
+            ("T5", "update+串", dict(base, memberKind=1, sysKind=2, resvProperty=32, resvMember=[acc]),
+             "/reserve/update?sf_request_type=ajax", True),
+        ]
+        for tid, desc, pl, url, as_p in tests:
+            r = spa_post(pl, url, as_params=as_p)
+            msg = str(r.get("message", r.get("error", "")))[:70]
+            log(f"📥 {tid}({desc}): code={r.get('code')} msg={msg}")
+            findings.append(f"{tid}:{str(r.get('message', ''))[:24]}")
+    else:
+        findings.append("无冲突时段,跳过订房测试")
 
-        # GZHU 还用 /reserve 端点——试一下（XJTLU 可能兼容旧端点）
-        r4 = spa_post(gzhu_payload, "/reserve")
-        log(f"📥 GZHU式(/reserve): code={r4.get('code')} msg={str(r4.get('message', r4.get('error', '')))[:70]}")
-        findings.append(f"/reserve:{str(r4.get('message', ''))[:30]}")
-
-    # 零残留
+    # 3) 零残留
     begin = (_bjnow() - timedelta(days=1)).strftime("%Y-%m-%d")
     end = (_bjnow() + timedelta(days=3)).strftime("%Y-%m-%d")
     j5 = _room_api_on_page(
@@ -1958,10 +1973,11 @@ def _room_op_probe(page, captured, op):
                                       method="POST", data={"uuid": rv["uuid"]},
                                       timeout=25000)
                 log(f"🧹 {rv['uuid']}: {str(d)[:100]}")
+        findings.append(f"清理{len(rows)}条")
     else:
         log("✅ 零残留")
         findings.append("零残留✅")
-    return "🔬 probe v20 完成: " + "；".join(findings)
+    return "🔬 probe v21 完成: " + "；".join(findings)
 
 
 def run_room_op(op_json):
