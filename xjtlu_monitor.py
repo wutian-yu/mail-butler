@@ -1821,209 +1821,95 @@ def _room_op_query(page, captured, op):
 
 
 def _room_op_probe(page, captured, op):
-    """安全探测订房 API v14（关键组合测试 + 组件级捕获）：
-    1. sysKind=2（路由实证）+ 真实空闲时段 → 若成功立即取消（端到端）
-    2. 若失败 → monkey-patch axios 捕获 handleSubmit 构造的真实 payload（不联网）
+    """安全探测订房 API v15（纯情报：完整 API 面侦察）：
+    1. 提取 index.js 全部 url:"/xxx" 定义（看完整端点清单）
+    2. 提取 chunk-52d28091 里 handleSubmit 所在模块的 import 表（R=n(...) 映射到哪个模块）
+    3. 零副作用
     """
     today = _bjnow().strftime("%Y-%m-%d")
     findings = []
 
     acc_id, pid = _room_get_accid_from_storage(page)
     log(f"🆔 accId={acc_id!r}")
-    findings.append(f"accId={acc_id}")
 
-    raw = _room_query_avail_raw(page, today, captured)
-    free_room = None
-    free_window = None
-    if raw:
-        for campus in raw:
-            for lab in campus.get("labInfos") or []:
-                for rm in lab.get("roomInfos") or []:
-                    occ = [rv for rv in (rm.get("resvInfos") or [])
-                           if _room_slot_occupied(rv.get("resvStatus", 0))]
-                    if not occ:
-                        free_room = rm
-                        # 取开放时间窗
-                        ot = (rm.get("openTimes") or [{}])[0]
-                        free_window = (ot.get("openStartTime", "09:00"),
-                                       ot.get("openEndTime", "22:00"))
-                        break
-                if free_room:
-                    break
-            if free_room:
-                break
+    # 1. index.js 的全部 URL
+    try:
+        js_urls = page.evaluate(
+            "() => performance.getEntriesByType('resource')"
+            ".map(r => r.name).filter(u => u.endsWith('.js') && u.includes('index_'))")
+        if js_urls:
+            body = page.request.get(js_urls[0], timeout=20000).text()
+            log(f"📜 index.js {len(body)} 字节")
+            import re as _re
+            urls = _re.findall(r'url:\s*"(/[^"]+)"', body)
+            seen = []
+            for u in urls:
+                if u not in seen:
+                    seen.append(u)
+            log(f"📜 共 {len(seen)} 个 API 端点:")
+            for u in seen:
+                log(f"📜   {u}")
+            findings.append(f"端点数:{len(seen)}")
+            # 找 reserve 相关的端点详细上下文
+            for u in seen:
+                if "reserve" in u.lower() and u != "/reserve/update":
+                    idx = body.find(f'url:"{u}"')
+                    if idx >= 0:
+                        log(f"📜「{u}」上下文: {body[max(0, idx-150):idx+200][:350]}")
+            # /reserve/update 的函数定义和导出映射
+            idx = body.find('"/reserve/update"')
+            if idx >= 0:
+                # 向前找函数名
+                log(f"📜 /reserve/update 上下文: {body[max(0, idx-400):idx+300][:700]}")
+    except Exception as e:
+        log(f"⚠️ index.js 扫描失败: {e}")
 
-    if not free_room:
-        log("❌ 没有全天空闲房间")
-        return "❌ probe v14: 无空闲房间"
-
-    dev = free_room["devId"]
-    log(f"📍 空闲房间: {free_room.get('devName')} devId={dev} 窗口 {free_window}")
-
-    def to_min(t):
-        h, m = t.split(":")
-        return int(h) * 60 + int(m)
-
-    # 选 21:00-22:00（在开放窗口内；若窗口早于此则用窗口后半段）
-    s_m, e_m = to_min(free_window[0]), to_min(free_window[1])
-    bs, be = 21 * 60, 22 * 60
-    if e_m < be:
-        be = e_m
-        bs = max(be - 60, s_m)
-    t_start = f"{today} {bs // 60:02d}:{bs % 60:02d}:00"
-    t_end = f"{today} {be // 60:02d}:{be % 60:02d}:00"
-
-    def spa_post(payload):
-        js = (
-            "() => Promise.race(["
-            "new Promise((resolve) => {"
-            "try {"
-            "const el = document.querySelector('#app') || document.body.firstElementChild;"
-            "const vm = el && el.__vue__;"
-            "const axios = vm && vm.$axios;"
-            "if (!axios) { resolve({stage: 'noaxios'}); return; }"
-            "const p = " + json.dumps(payload, ensure_ascii=False) + ";"
-            "axios.post('/reserve/update', p)"
-            ".then(r => resolve({ok: 1, code: r.data && r.data.code, message: r.data && r.data.message}))"
-            ".catch(e => resolve({ok: 0, error: String(e).slice(0, 100)}));"
-            "} catch(e) { resolve({ok: -1, error: String(e).slice(0, 100)}); }"
-            "}),"
-            "new Promise((resolve) => setTimeout(() => resolve({stage: 'timeout'}), 15000))"
-            "])"
-        )
-        try:
-            return page.evaluate(js)
-        except Exception as e:
-            return {"ok": -2, "error": str(e)[:100]}
-
-    acc = int(acc_id) if str(acc_id).isdigit() else acc_id
-
-    # 1. sysKind=2 + 真实空闲时段（端到端，成功即删）
-    p1 = {
-        "sysKind": 2, "appAccNo": acc, "memberKind": 1,
-        "resvBeginTime": t_start, "resvEndTime": t_end,
-        "testName": "小组研讨", "resvKind": 2, "resvProperty": 32,
-        "appUrl": "", "resvMember": [acc], "resvDev": [dev],
-        "memo": "小组研讨", "captcha": "", "addServices": [],
-    }
-    log(f"📤 T1 sysKind=2 + 空闲时段 {t_start[11:]}-{t_end[11:]}（成功即删）")
-    r1 = spa_post(p1)
-    log(f"📥 T1 响应: {json.dumps(r1, ensure_ascii=False)[:250]}")
-    findings.append(f"T1sk2:{str(r1.get('message', r1.get('error', '')))[:35]}")
-
-    booked = r1.get("code") == 0
-    if booked:
-        log("🎯 sysKind=2 + 空闲时段订房成功！立即清理...")
-        time.sleep(1)
-        begin = (_bjnow() - timedelta(days=1)).strftime("%Y-%m-%d")
-        end = (_bjnow() + timedelta(days=3)).strftime("%Y-%m-%d")
-        j = _room_api_on_page(
-            page, f"/reserve/resvInfo?beginDate={begin}&endDate={end}"
-                  f"&needStatus=8582&page=1&pageNum=20&orderKey=gmt_create")
-        for rv in (j.get("data") or []):
-            if rv.get("uuid"):
-                d = _room_api_on_page(page, "/reserve/delete?sf_request_type=ajax",
-                                      method="POST", data={"uuid": rv["uuid"]},
-                                      timeout=25000)
-                log(f"🧹 删除 {rv['uuid']}: {json.dumps(d, ensure_ascii=False)[:150]}")
-                findings.append(f"清理:{str(d.get('message'))[:30]}")
-    else:
-        # 2. 失败 → 组件级捕获：monkey-patch axios.post（不联网）
-        log("📬 T1 失败，开始组件级捕获（不联网）...")
-        # 先导航到空间页让组件挂载
-        try:
-            nav = page.evaluate(
-                "() => {"
-                "const el = document.querySelector('#app') || document.body.firstElementChild;"
-                "const vm = el && el.__vue__;"
-                "if (vm && vm.$router) { vm.$router.push('/ic/researchSpace/2/5/5'); return 'pushed'; }"
-                "return 'no router';"
-                "}")
-            log(f"🔀 路由跳转: {nav}")
-            time.sleep(5)
-        except Exception as e:
-            log(f"⚠️ 路由失败: {e}")
-
-        capture_js = (
-            "() => {"
-            "const el = document.querySelector('#app') || document.body.firstElementChild;"
-            "const vm = el && el.__vue__;"
-            "if (!vm) return {error: 'no vm'};"
-            "const axios = vm.$axios;"
-            "if (!axios || !axios.post) return {error: 'no axios'};"
-            "window.__origPost = axios.post.bind(axios);"
-            "axios.post = function(url, data) {"
-            "window.__captured = {url: url, data: data};"
-            "return Promise.resolve({data: {code: 0, message: 'captured', data: null}});"
-            "};"
-            "let found = null;"
-            "const walk = (comp) => {"
-            "if (!comp) return;"
-            "if (comp.$options && comp.$options.methods && comp.$options.methods.handleSubmit) { found = comp; return; }"
-            "(comp.$children || []).forEach(walk);"
-            "};"
-            "walk(vm);"
-            "if (!found) return {error: 'no handleSubmit component mounted'};"
-            "const info = {"
-            "name: found.$options.name,"
-            "sysKind: found.sysKind,"
-            "activeSpace: found.activeSpace,"
-            "formData: found.formData,"
-            "selectAccNoList: found.selectAccNoList,"
-            "sysConfig: found.sysConfig,"
-            "hasFormRef: !!(found.$refs && found.$refs.formRef),"
-            "};"
-            "if (found.$refs && found.$refs.formRef) {"
-            "found.$refs.formRef.validate = function(cb) { cb(true); return true; };"
-            "}"
-            "try { found.selectAccNoList = [" + json.dumps(str(acc_id)) + "].map(Number); } catch(e) {}"
-            "try { found.formData = found.formData || {}; } catch(e) {}"
-            "try { found.activeSpace = " + json.dumps({"devId": dev, "minUser": 1}) + "; } catch(e) {}"
-            "try {"
-            "found.formData.title = '小组研讨';"
-            "found.formData.memo = '小组研讨';"
-            "found.formData.appUrl = '';"
-            "found.formData.captcha = '';"
-            "found.formData.startDate = " + json.dumps(f"{today} 21:00:00") + ";"
-            "found.formData.endDate = " + json.dumps(f"{today} 22:00:00") + ";"
-            "found.formData.startTime = '21:00';"
-            "found.formData.endTime = '22:00';"
-            "} catch(e) {}"
-            "try { found.selectedServices = []; } catch(e) {}"
-            "try { found.submitLoading = false; } catch(e) {}"
-            "if (!found.sysConfig) { try { found.sysConfig = {resvCode: '0'}; } catch(e) {} }"
-            "try { found.handleSubmit(); } catch(e) { return {error: 'handleSubmit: ' + String(e).slice(0, 200), info: info}; }"
-            "return {ok: 1, info: info, captured: window.__captured};"
-            "}"
-        )
-        try:
-            cap = page.evaluate(capture_js)
-            log(f"📸 组件捕获: {json.dumps(cap, ensure_ascii=False)[:800]}")
-            findings.append(f"捕获:{'✓' if cap and cap.get('captured') else str(cap.get('error', ''))[:40]}")
-        except Exception as e:
-            log(f"⚠️ 组件捕获失败: {e}")
-        # 恢复 axios.post
-        try:
-            page.evaluate("() => { if (window.__origPost) { document.querySelector('#app').__vue__.$axios.post = window.__origPost; } }")
-        except Exception:
-            pass
+    # 2. chunk-52d28091 的 handleSubmit 所在模块的 import 表
+    try:
+        js_urls2 = page.evaluate(
+            "() => performance.getEntriesByType('resource')"
+            ".map(r => r.name).filter(u => u.endsWith('.js') && u.includes('chunk-52d28091'))")
+        if js_urls2:
+            cbody = page.request.get(js_urls2[0], timeout=20000).text()
+            idx = cbody.find("handleSubmit:function")
+            if idx >= 0:
+                # 向前找模块包装函数开头 function(e,t,n){
+                mod_start = cbody.rfind("function(e,t,n){", max(0, idx - 15000), idx)
+                if mod_start >= 0:
+                    imports = cbody[mod_start:mod_start + 1500]
+                    log(f"📜 handleSubmit 模块的 import 表: {imports[:1500]}")
+                    findings.append("import表已dump")
+                else:
+                    log(f"📜 模块开头未找到，dump handleSubmit 前 500: {cbody[max(0, idx-500):idx]}")
+                # handleSubmit 里的 R["b"] 调用上下文
+                j2 = cbody.find('Object(R["b"])', idx)
+                if j2 >= 0:
+                    log(f"📜 R[\"b\"] 调用上下文: {cbody[max(0, j2-300):j2+300][:600]}")
+                # u["r"] 的定义（日期转换器）
+                j3 = cbody.find('Object(u["r"])')
+                if j3 >= 0:
+                    log(f"📜 u[\"r\"] 调用: {cbody[max(0, j3-100):j3+150][:250]}")
+    except Exception as e:
+        log(f"⚠️ chunk 扫描失败: {e}")
 
     # 零残留
     begin = (_bjnow() - timedelta(days=1)).strftime("%Y-%m-%d")
     end = (_bjnow() + timedelta(days=3)).strftime("%Y-%m-%d")
-    for ns in ("8582", "262"):
-        j5 = _room_api_on_page(
-            page, f"/reserve/resvInfo?beginDate={begin}&endDate={end}"
-                  f"&needStatus={ns}&page=1&pageNum=20&orderKey=gmt_create")
-        for rv in (j5.get("data") or []):
+    j5 = _room_api_on_page(
+        page, f"/reserve/resvInfo?beginDate={begin}&endDate={end}"
+              f"&needStatus=8582&page=1&pageNum=20&orderKey=gmt_create")
+    rows = j5.get("data") or []
+    if rows:
+        for rv in rows:
             if rv.get("uuid"):
                 d = _room_api_on_page(page, "/reserve/delete?sf_request_type=ajax",
                                       method="POST", data={"uuid": rv["uuid"]},
                                       timeout=25000)
-                log(f"🧹 清理 {rv['uuid']}: {str(d)[:100]}")
-    log("✅ 零残留确认完成")
-    findings.append("零残留✅")
-    return "🔬 probe v14 完成: " + "；".join(findings)
+                log(f"🧹 {rv['uuid']}: {str(d)[:100]}")
+    else:
+        log("✅ 零残留")
+        findings.append("零残留✅")
+    return "🔬 probe v15 完成: " + "；".join(findings)
 
 
 def run_room_op(op_json):
