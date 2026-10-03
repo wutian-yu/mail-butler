@@ -1821,94 +1821,81 @@ def _room_op_query(page, captured, op):
 
 
 def _room_op_probe(page, captured, op):
-    """安全探测 v27（实调 remoteMethod + 网络拦截，定位成员搜索真身）：
-    v26 教训：猜 /login/user 传输方式全错。本轮不再猜——
-    1. 遍历 Vue 组件树找有 remoteMethod 的组件（订房弹窗）
-    2. 找不到就点一个房间卡片让它挂载
-    3. 直接调用 comp.remoteMethod('GUANCHENG')（真实搜索）
-    4. 拦截发出的网络请求 → 拿到确切 URL/参数/请求头
-    5. 读回 comp.options（搜索结果）
-    remoteMethod 是纯搜索（GET 语义），零副作用。"""
+    """安全探测 v28（webpack 模块注册表解析，确定性定位搜索 URL）：
+    v27 教训：首页没有订房弹窗组件，UI 触发不可行。
+    本轮纯静态解析（页内 JS）：window.webpackJsonp 里每个 chunk 的模块工厂，
+    1. 找到含 remoteMethod 的模块 → 提取 be=n("模块ID")
+    2. 打开该模块源码 → dump 导出映射(a/b/c→内部名) + 全部 url:"..." 上下文
+    3. 从日志人工对应出 be["c"] 的真实 URL。零副作用。"""
     findings = []
     acc_id, pid = _room_get_accid_from_storage(page)
-    log(f"🆔 accId={acc_id!r} pid={pid!r}")
+    log(f"🆔 accId={acc_id!r}")
     findings.append(f"accId={acc_id}")
 
-    # 网络拦截器
-    net_log = []
-    def _net(resp):
-        try:
-            u = resp.url
-            if "/ic-web/" in u or "user" in u.lower():
-                net_log.append((resp.request.method, u))
-        except Exception:
-            pass
-    page.on("response", _net)
-
-    def find_and_call():
-        """找 remoteMethod 组件并调用，返回结果"""
-        js = (
-            "() => new Promise((resolve) => {"
-            "const root = (document.querySelector('#app') || document.body.firstElementChild).__vue__;"
-            "if (!root) { resolve({stage: 'noroot'}); return; }"
-            "let comp = null;"
-            "(function walk(vm) {"
-            "  if (!vm || comp) return;"
-            "  if (typeof vm.remoteMethod === 'function') { comp = vm; return; }"
-            "  (vm.$children || []).forEach(walk);"
-            "})(root);"
-            "if (!comp) { resolve({stage: 'nocomp'}); return; }"
-            "try { comp.remoteMethod(" + json.dumps(str(pid).split(".")[0]) + "); } catch(e) {"
-            "  resolve({stage: 'callerr', error: String(e).slice(0, 80)}); return; }"
-            "setTimeout(() => resolve({"
-            "  stage: 'ok', tag: comp.$options.name || '?',"
-            "  accLoading: comp.accLoading,"
-            "  options: (comp.options || []).slice(0, 5)"
-            "}), 4000);"
-            "})"
-        )
-        try:
-            return page.evaluate(js)
-        except Exception as e:
-            return {"stage": "evalerr", "error": str(e)[:100]}
-
-    r = find_and_call()
-    log(f"📥 直接找组件: {json.dumps(r, ensure_ascii=False, default=str)[:400]}")
+    js = (
+        "() => { try {"
+        "const keys = Object.keys(window).filter(k => /webpack/i.test(k));"
+        "const wpKey = keys.find(k => Array.isArray(window[k])) || keys[0];"
+        "if (!wpKey) return {stage: 'nowp', keys: keys};"
+        "const wp = window[wpKey];"
+        "let total = 0, found = null;"
+        "for (const entry of wp) {"
+        "  const mods = entry && entry[1];"
+        "  if (!mods) continue;"
+        "  total += Object.keys(mods).length;"
+        "  for (const id of Object.keys(mods)) {"
+        "    const src = Function.prototype.toString.call(mods[id]);"
+        "    const j = src.indexOf('remoteMethod:function');"
+        "    if (j >= 0 && !found) {"
+        "      const m = src.match(/be=n\\(\"([^\"]+)\"\\)/);"
+        "      const m2 = src.match(/([A-Za-z_$][\\w$]*)=n\\(\"([^\"]+)\"\\)/g);"
+        "      found = {mod: id, chunk: (entry[0]||[]).join(','),"
+        "        beMod: m ? m[1] : null,"
+        "        imports: m2 ? m2.slice(0, 10) : []};"
+        "    }"
+        "  }"
+        "}"
+        "return {stage: found ? 'ok' : 'nofactory', total: total, found: found};"
+        "} catch(e) { return {stage: 'err', error: String(e).slice(0, 100)}; } }"
+    )
+    r = page.evaluate(js)
+    log(f"📦 webpack注册表: {json.dumps(r, ensure_ascii=False, default=str)[:400]}")
     if r.get("stage") != "ok":
-        # 点房间卡片让订房弹窗挂载
-        findings.append("首页无组件,点房间")
-        try:
-            clicked = False
-            for sel in ("text=Room ", "text=房间"):
-                loc = page.locator(f"div:has-text('Room 5')").first
-                try:
-                    loc.click(timeout=3000)
-                    clicked = True
-                    log(f"🖱️ 已点击房间卡片 ({sel})")
-                    break
-                except Exception:
-                    continue
-            page.wait_for_timeout(2500)
-            log(f"📍 当前URL: {page.url}")
-            r = find_and_call()
-            log(f"📥 点击后再找: {json.dumps(r, ensure_ascii=False, default=str)[:400]}")
-        except Exception as e:
-            log(f"⚠️ 点击失败: {str(e)[:100]}")
-
-    if r.get("stage") == "ok":
-        opts = r.get("options") or []
-        hit = [o for o in opts if str(o.get("value")) == str(acc_id)]
-        findings.append(f"remoteMethod✓ opts={len(opts)}{'命中✓' if hit else ''}")
-        log(f"🎯 options: {json.dumps(opts, ensure_ascii=False, default=str)[:400]}")
-    else:
         findings.append(f"stage={r.get('stage')}")
+        return "🔬 probe v28 完成: " + "；".join(findings)
+    be_mod = r["found"].get("beMod")
+    findings.append(f"beMod={be_mod}")
+    if not be_mod:
+        return "🔬 probe v28 完成: " + "；".join(findings)
 
-    # 拦截到的请求（搜索真身）
-    log(f"📡 网络拦截({len(net_log)}条):")
-    for m, u in net_log[-12:]:
-        log(f"   {m} {u[:150]}")
-    if net_log:
-        findings.append(f"net={len(net_log)}")
+    # 打开 be 模块源码：导出映射 + 全部 url
+    js2 = (
+        "() => { try {"
+        "const keys = Object.keys(window).filter(k => /webpack/i.test(k));"
+        "const wpKey = keys.find(k => Array.isArray(window[k])) || keys[0];"
+        "const wp = window[wpKey];"
+        "let factory = null;"
+        "for (const entry of wp) {"
+        "  const mods = entry && entry[1];"
+        "  if (mods && mods[" + json.dumps(be_mod) + "]) { factory = mods[" + json.dumps(be_mod) + "]; break; }"
+        "}"
+        "if (!factory) return {stage: 'nomod'};"
+        "const src = Function.prototype.toString.call(factory);"
+        "const exps = [...src.matchAll(/[\\w$]+\\.d\\(t,\"([a-z])\",(function\\(\\)\\{return ([\\w$]+)\\})\\)/g)]"
+        "  .map(m => m[1] + '→' + m[2]);"
+        "const urls = [...src.matchAll(/url:\\s*\"([^\"]+)\"/g)]"
+        "  .map(m => m[1]);"
+        "const urlCtx = [...src.matchAll(/url:\\s*\"([^\"]+)\"/g)]"
+        "  .map(m => src.slice(Math.max(0, m.index - 80), m.index + m[0].length + 40));"
+        "return {stage: 'ok', len: src.length, exps: exps, urls: urls, urlCtx: urlCtx};"
+        "} catch(e) { return {stage: 'err', error: String(e).slice(0, 100)}; } }"
+    )
+    r2 = page.evaluate(js2)
+    log(f"📜 be模块({be_mod}): 长度={r2.get('len')} 导出={json.dumps(r2.get('exps'), ensure_ascii=False)}")
+    log(f"📜 be模块 urls: {json.dumps(r2.get('urls'), ensure_ascii=False)}")
+    for i, ctx in enumerate(r2.get("urlCtx") or []):
+        log(f"📜 url[{i}]上下文: {ctx[:220]}")
+    findings.append(f"urls={len(r2.get('urls') or [])}")
 
     # 零残留
     begin = (_bjnow() - timedelta(days=1)).strftime("%Y-%m-%d")
@@ -1928,7 +1915,7 @@ def _room_op_probe(page, captured, op):
     else:
         log("✅ 零残留")
         findings.append("零残留✅")
-    return "🔬 probe v27 完成: " + "；".join(findings)
+    return "🔬 probe v28 完成: " + "；".join(findings)
 
 
 def run_room_op(op_json):
