@@ -2823,14 +2823,15 @@ def gather_context(include_outlook=True):
             lines = []
             for ev in lm_events[:10]:
                 base = f"- {ev['summary'][:45]}"
+                exam_tag = "（⚠️机房考试页，需按分配场次到机房参加）" if "Exam Page" in (ev.get("categories") or "") else ""
                 if ev.get("close_dt"):
-                    lines.append(f"{base}：{ev['dt'].strftime('%m月%d日 %H:%M')} 开放（{ev['countdown']}）→ {ev['close_dt'].strftime('%m月%d日 %H:%M')} 截止（{ev['close_countdown']}）")
+                    lines.append(f"{base}：{ev['dt'].strftime('%m月%d日 %H:%M')} 开放（{ev['countdown']}）→ {ev['close_dt'].strftime('%m月%d日 %H:%M')} 截止（{ev['close_countdown']}）{exam_tag}")
                 elif ev.get("action") == "截止":
-                    lines.append(f"{base}：{ev['dt'].strftime('%m月%d日 %H:%M')} 截止（{ev['countdown']}）")
+                    lines.append(f"{base}：{ev['dt'].strftime('%m月%d日 %H:%M')} 截止（{ev['countdown']}）{exam_tag}")
                 elif ev.get("action") == "开放":
-                    lines.append(f"{base}：{ev['dt'].strftime('%m月%d日 %H:%M')} 开放（{ev['countdown']}）")
+                    lines.append(f"{base}：{ev['dt'].strftime('%m月%d日 %H:%M')} 开放（{ev['countdown']}）{exam_tag}")
                 else:
-                    lines.append(f"{base}：{ev['dt'].strftime('%m月%d日 %H:%M')}（{ev['countdown']}）")
+                    lines.append(f"{base}：{ev['dt'].strftime('%m月%d日 %H:%M')}（{ev['countdown']}）{exam_tag}")
             ctx_parts.append(f"LearningMall 近期作业/测验（共{len(lm_events)}项）。"
                              "重要：「开放」=可以开始做的时间，「截止」=必须提交的最后期限：\n" + "\n".join(lines))
     except Exception:
@@ -2943,6 +2944,22 @@ SYSTEM_PROMPT = (
     "系统自动转拼音按西浦账号规则搜索），之后订房自动带上同伴；"
     "用户提到和某位同学一起订时，把同学名字填进 partner 参数（中文名/账号均可）。"
     "用户没设同伴又要订房时，引导他设置；有 set_room_partner 工具可用。\n\n"
+    "## 西浦课程考核知识（以老师公告为准，绝不凭空编造作业性质）\n"
+    "LearningMall（LMC）是西浦的教学中枢：课程资料、作业提交、测验、公告全在上面。"
+    "「Exam Page for <课程>」是课程的考试页面（正式考试系统入口），它下面的 quiz 是"
+    "正式安排的机房考试项目，不是在家随手做的自测——绝不能描述成「练习性质、不用去」。\n\n"
+    "MTH026 微积分考核结构（老师 Kun Zhang 2026-10-03 公告 #6）：\n"
+    "· Weekly Assignments（每周作业）+ Practice Quiz 参与分 → coursework（满分 100）\n"
+    "· Practice Quiz 共 5 次（Week 4/6/8/10/12）：每次去分配的机房场次参加并尝试，"
+    "得 3 分参与 bonus（按参与给分不按答对；5 次全参加 = 15 分）\n"
+    "· quiz 分数本身不计入总成绩，但不参加 = 白丢参与分，务必去\n"
+    "· 场次在 SIP 校区机房用 Safe Exam Browser 进行，2 小时内最多 5 次尝试，题目随机；"
+    "要带手机（二次认证 + 拍错题）；「Review attempt」只能在机房内看\n"
+    "· practice quiz 与 In-Semester Exam 共享题库（练习目的是备考）；Final Exam 是纸笔考试\n\n"
+    "## 关于 LM 的新生模块\n"
+    "LM 首页还有「Your XJTU Journey」「A Guide for New Students」等新生指导模块，"
+    "介绍西浦的制度、资源和学习方法。用户问相关问题时如实说明这些是 LM 上的指导模块，"
+    "具体细节让用户登录 LM 查看，不要编造内容。\n\n"
     "## 工具调用（Function Calling）\n"
     "你可以在回复中调用工具（tools 参数），系统会执行并把结果回传给你，"
     "你再根据结果组织最终回复。用户想查房/订房/取消预定/查作业/查出勤/查日历时，"
@@ -3016,6 +3033,11 @@ SYSTEM_PROMPT = (
     "「截止」是必须提交的最后期限，二者绝不能混淆。quiz 类通常有几天做答窗口"
     "（如「10月05日 08:59 开放 → 10月09日 20:30 截止」），汇报时明确说「X 开放、Y 截止」，"
     "或只强调截止时间。把开放时间说成「明天截止」是严重错误。\n"
+    "18. LM 里分类为「Exam Page」的 quiz 是正式机房考试：汇报时必须说明「需按分配场次"
+    "到机房参加、有参与分」，严禁说成在家自测/不重要/不用去。具体机房房间和时间段"
+    "绝对不能编造——老师明确警告过 AI 给错场次信息：必须让学生自己在 LM 查 schedule PDF 确认。\n"
+    "19. 不确定某个作业/考试的性质（计不计分、在哪考、怎么考）时，如实说以老师公告为准，"
+    "引导用户查看课程公告或邮件原文；绝不凭常识脑补「开卷/闭卷/不计成绩」等未确认的细节。\n"
 )
 
 
