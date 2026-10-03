@@ -36,7 +36,12 @@ jobs:
       - name: Push 数据仓库变更
         run: |
           cd data
-          git config user.name "LM Scan Bot"
-          git config user.email "bot@xjtlu.edu.cn"
-          git add lm_pages.json
-          git diff --cached --quiet || (git commit -m "lm pages scan" && git push)
+          if [ -f lm_pages.json ]; then
+            git config user.name "LM Scan Bot"
+            git config user.email "bot@xjtlu.edu.cn"
+            git add lm_pages.json
+            git diff --cached --quiet || (git commit -m "lm pages scan" && git push)
+          else
+            echo "no lm_pages.json produced"
+            exit 1
+          fi
