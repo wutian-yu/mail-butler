@@ -1,0 +1,41 @@
+name: Mail Dump
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  dump:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout 代码仓库
+        uses: actions/checkout@v4
+
+      - name: Clone 私有数据仓库
+        run: git clone https://x-access-token:${{ secrets.GH_PAT }}@github.com/wutian-yu/butler-data.git data
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Run Mail Dump
+        env:
+          OUTLOOK_REFRESH_TOKEN: ${{ secrets.OUTLOOK_REFRESH_TOKEN }}
+          OUTLOOK_CLIENT_ID: ${{ secrets.OUTLOOK_CLIENT_ID }}
+          DATA_DIR: ${{ github.workspace }}/data
+        run: python mail_dump.py
+
+      - name: Push 数据仓库变更
+        run: |
+          cd data
+          if [ -f mails_dump.json ]; then
+            git config user.name "mail-dump-bot"
+            git config user.email "dump@users.noreply.github.com"
+            git add mails_dump.json
+            git diff --cached --quiet || (git commit -m "mails dump" && git push)
+          else
+            echo "no output"; exit 1
+          fi
