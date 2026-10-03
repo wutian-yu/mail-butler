@@ -27,7 +27,7 @@ jobs:
 
       - name: Install Playwright
         run: |
-          pip install playwright
+          pip install playwright pypinyin
           playwright install chromium --with-deps
 
       - name: Run Room Op
