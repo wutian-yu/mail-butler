@@ -1821,23 +1821,42 @@ def _room_op_query(page, captured, op):
 
 
 def _room_op_probe(page, captured, op):
-    """安全探测 v25（成员搜索接口实测）：
-    v24 已定位 remoteMethod 源码：Object(be["c"])({params:{key:e,page:1,pageNum:10}}) → POST /login/user。
-    本轮实测（用自己账号搜，预期命中 92604，纯只读）：
-    1. POST /login/user?key=GUANCHENG.WU26&page=1&pageNum=10（URL 参数 + 空 body，走 SPA axios 带 token）
-    2. 部分关键词 GUANCHENG（测前缀匹配）
-    3. 纯数字 92604（测是否也搜 accNo）
-    4. 完整 sysConfig/public 有趣键值
-    5. 零残留验证"""
+    """安全探测 v26（成员搜索接口传输方式补测）：
+    v25 教训：POST /login/user + URL查询串 key= 仍报参数错误。
+    新假设：chunk-common 的 API 定义可能用 data:n（JSON body）而非 params:n。
+    变体：A JSON body {key,page,pageNum} / B URL串+sf_request_type=ajax / C A+ajax
+    另 dump /login/user 完整函数定义（找 method/data/params 真相）。纯只读。"""
     findings = []
     acc_id, pid = _room_get_accid_from_storage(page)
     log(f"🆔 accId={acc_id!r} pid={pid!r}")
     findings.append(f"accId={acc_id}")
 
-    def spa_search(key):
-        """复刻 remoteMethod：vm.$axios.post('/login/user?key=...&page=1&pageNum=10', null)"""
-        import urllib.parse as up
-        url = "/login/user?key=" + up.quote(str(key), safe="") + "&page=1&pageNum=10"
+    # 0) /login/user 完整定义（两种引号风格都找，前后 700 字符）
+    js_urls = page.evaluate(
+        "() => performance.getEntriesByType('resource').map(r => r.name)"
+        ".filter(u => u.endsWith('.js'))")
+    for u in js_urls:
+        try:
+            body = page.request.get(u, timeout=25000).text()
+        except Exception:
+            continue
+        for pat_ in ('"/login/user"', "'/login/user'"):
+            j = body.find(pat_)
+            if j >= 0:
+                s = max(0, j - 550)
+                log(f"📜 /login/user定义@{u.split('/')[-1][:24]}: {body[s:j + 200][:750]}")
+                findings.append("定义✓")
+                break
+        else:
+            continue
+        break
+
+    def spa_req(url, json_body=None):
+        """SPA axios 请求：url 可含查询串；json_body 为 dict 时发 JSON body"""
+        if json_body is not None:
+            mid = "const p = " + json.dumps(json_body, ensure_ascii=False) + "; axios.post(url, p)"
+        else:
+            mid = "axios.post(url, null)"
         js = (
             "() => Promise.race(["
             "new Promise((resolve) => {"
@@ -1846,7 +1865,8 @@ def _room_op_probe(page, captured, op):
             "const vm = el && el.__vue__;"
             "const axios = vm && vm.$axios;"
             "if (!axios) { resolve({stage: 'noaxios'}); return; }"
-            "axios.post(" + json.dumps(url) + ", null)"
+            "const url = " + json.dumps(url) + ";"
+            + mid +
             ".then(r => resolve({ok: 1, code: r.data && r.data.code, message: r.data && r.data.message,"
             " count: r.data && r.data.count, data: r.data && r.data.data}))"
             ".catch(e => resolve({ok: 0, error: String(e).slice(0, 100)}));"
@@ -1861,30 +1881,28 @@ def _room_op_probe(page, captured, op):
             return {"ok": -2, "error": str(e)[:100]}
 
     import time as _t
-    for label, key in (("完整", pid), ("前缀", "GUANCHENG"), ("数字", str(acc_id))):
+    import urllib.parse as up
+    k = up.quote(str(pid), safe="")
+    variants = [
+        ("A jsonbody", f"/login/user", {"key": pid, "page": 1, "pageNum": 10}),
+        ("B url+ajax", f"/login/user?key={k}&page=1&pageNum=10&sf_request_type=ajax", None),
+        ("C json+ajax", f"/login/user?sf_request_type=ajax", {"key": pid, "page": 1, "pageNum": 10}),
+        ("D json简", f"/login/user", {"key": pid}),
+    ]
+    for label, url, body in variants:
         _t.sleep(3)
-        r = spa_search(key)
+        r = spa_req(url, body)
         rows = r.get("data") or []
-        log(f"📥 搜索[{label}] key={key}: code={r.get('code')} count={r.get('count')} "
-            f"rows={json.dumps(rows, ensure_ascii=False, default=str)[:400]}")
+        log(f"📥 [{label}]: code={r.get('code')} count={r.get('count')} "
+            f"msg={str(r.get('message', r.get('error', '')))[:40]} rows={json.dumps(rows, ensure_ascii=False, default=str)[:350]}")
         if r.get("code") == 0:
             hit = [x for x in rows if isinstance(x, dict) and str(x.get("accNo")) == str(acc_id)]
-            findings.append(f"{label}:{'命中✓' if hit else f'{len(rows)}行'}")
+            findings.append(f"{label}:OK{'命中✓' if hit else ''}")
             if hit:
-                log(f"🎯 命中: accNo={hit[0].get('accNo')} logonName={hit[0].get('logonName')} "
-                    f"trueName={hit[0].get('trueName')} status={hit[0].get('status')}")
+                log(f"🎯 命中: {json.dumps(hit[0], ensure_ascii=False, default=str)[:250]}")
+                break
         else:
-            findings.append(f"{label}:{str(r.get('message', r.get('error', '')))[:20]}")
-
-    # sysConfig/public 有趣键
-    r = _room_api_on_page(page, "/sysConfig/public", timeout=15000)
-    if r.get("code") == 0 and isinstance(r.get("data"), list):
-        for it in r["data"]:
-            k, v = it.get("sysKey"), it.get("sysValue")
-            if k and any(s in str(k).lower() for s in
-                        ("resvcode", "captcha", "themefix", "spacelist", "lim", "minuser", "member")):
-                log(f"📜 sysConfig {k} = {v}")
-        findings.append(f"sysConfig={len(r['data'])}项")
+            findings.append(f"{label}:{str(r.get('message', ''))[:18]}")
 
     # 零残留
     begin = (_bjnow() - timedelta(days=1)).strftime("%Y-%m-%d")
@@ -1904,7 +1922,7 @@ def _room_op_probe(page, captured, op):
     else:
         log("✅ 零残留")
         findings.append("零残留✅")
-    return "🔬 probe v25 完成: " + "；".join(findings)
+    return "🔬 probe v26 完成: " + "；".join(findings)
 
 
 def run_room_op(op_json):
