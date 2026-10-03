@@ -1821,14 +1821,10 @@ def _room_op_query(page, captured, op):
 
 
 def _room_op_probe(page, captured, op):
-    """安全探测订房 API v21（memberKind=1 单人流验证）：
-    依据：SPA handleSubmit 源码 memberKind = selectAccNoList.length>1 ? 2 : 1，
-    即单人提交 = memberKind:1 + resvMember:[自己]——"人数2-10"报错可能只针对 memberKind=2。
-    所有订房测试打在已占用时段 → 必被拒绝 → 零副作用。
-    T1 mk1+sk2+rp32（handleSubmit 原样）/ T2 mk1+sk2+rp0 / T3 mk1+sk1+rp0（GZHU 座位式）
-    T4 mk2+自己×2（测重复 accNo 能否过人数关）
-    T5 /reserve/update + URL参数串（SPA 原生传输：API 模块里是 method:post, params:n）
-    另：dump sysConfig（验证码开关等）+ 楼层 labId 映射 + 零残留验证"""
+    """安全探测订房 API v22（memberKind=1 单人流 · sysKind=1 限流版）：
+    v21 结论：sysKind=2 子系统未启用；连发请求触发限流 → 本版只测 sk1，请求间隔 8s。
+    R1 mk1+sk1+rp0（单人关键测试）/ R2 mk2+sk1+自己×2 / R3 mk1+sk1+rp32
+    所有订房测试打在已占用时段 → 必被拒绝 → 零副作用。"""
     today = _bjnow().strftime("%Y-%m-%d")
     ds = today.replace("-", "")
     findings = []
@@ -1939,19 +1935,18 @@ def _room_op_probe(page, captured, op):
             "appUrl": "",
             "resvKind": 2,
         }
+        # v21 教训：sk2 未启用；连发会触发限流(Frequent requests) → 只测 sk1 + 8s 间隔
         tests = [
-            ("T1", "mk1,sk2,rp32", dict(base, memberKind=1, sysKind=2, resvProperty=32, resvMember=[acc]),
+            ("R1", "mk1单人", dict(base, memberKind=1, sysKind=1, resvProperty=0, resvMember=[acc]),
              "/reserve", False),
-            ("T2", "mk1,sk2,rp0", dict(base, memberKind=1, sysKind=2, resvProperty=0, resvMember=[acc]),
+            ("R2", "mk2双自己", dict(base, memberKind=2, sysKind=1, resvProperty=0, resvMember=[acc, acc]),
              "/reserve", False),
-            ("T3", "mk1,sk1,rp0", dict(base, memberKind=1, sysKind=1, resvProperty=0, resvMember=[acc]),
+            ("R3", "mk1rp32", dict(base, memberKind=1, sysKind=1, resvProperty=32, resvMember=[acc]),
              "/reserve", False),
-            ("T4", "mk2,accx2", dict(base, memberKind=2, sysKind=1, resvProperty=0, resvMember=[acc, acc]),
-             "/reserve", False),
-            ("T5", "update+串", dict(base, memberKind=1, sysKind=2, resvProperty=32, resvMember=[acc]),
-             "/reserve/update?sf_request_type=ajax", True),
         ]
+        import time as _t
         for tid, desc, pl, url, as_p in tests:
+            _t.sleep(8)  # 限流保护
             r = spa_post(pl, url, as_params=as_p)
             msg = str(r.get("message", r.get("error", "")))[:70]
             log(f"📥 {tid}({desc}): code={r.get('code')} msg={msg}")
