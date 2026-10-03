@@ -2587,14 +2587,17 @@ def fetch_lm_assignments(days_ahead=14):
             if m_act:
                 action = {"opens": "开放", "closes": "截止", "is due": "截止"}[m_act.group(1).lower()]
                 title = title[:m_act.start()].strip()
-            # 倒计时
-            delta = dt - now
-            if delta.days == 0:
+            # 倒计时：按日历日差算，不能用 timedelta.days——
+            # 10-03 21点→10-05 08:59 相差 1.5 天会被截断成 1 报成「明天」，实际是「后天」
+            day_gap = (dt.date() - now.date()).days
+            if day_gap == 0:
                 countdown = f"今天 {dt.strftime('%H:%M')}"
-            elif delta.days == 1:
+            elif day_gap == 1:
                 countdown = f"明天 {dt.strftime('%H:%M')}"
+            elif day_gap == 2:
+                countdown = f"后天 {dt.strftime('%H:%M')}"
             else:
-                countdown = f"{delta.days}天后"
+                countdown = f"{day_gap}天后"
             # 拼接标题：【课程名】+ 英文作业名（不含动作词）
             full_title = f"【{course_label}】{title}" if course_label else title
             events.append({
@@ -2604,8 +2607,28 @@ def fetch_lm_assignments(days_ahead=14):
                 "countdown": countdown,
                 "categories": categories,
             })
-        events.sort(key=lambda e: e["dt"])
-        return events
+        # 合并同一作业的 opens/closes 事件：防止「开放时间」被误读成「截止时间」
+        # （2026-10-03 实测事故：Practice quiz opens 10-05 08:59 / closes 10-09 20:30，
+        #  两个事件分开注入时 AI 把开始时间说成了「明天截止」）
+        opens_ev = [e for e in events if e["action"] == "开放"]
+        close_ev = [e for e in events if e["action"] == "截止"]
+        plain_ev = [e for e in events if e["action"] not in ("开放", "截止")]
+        merged = []
+        matched_close = set()
+        for o in opens_ev:
+            key = (o["summary"], o["categories"])
+            for c in close_ev:
+                if id(c) in matched_close:
+                    continue
+                if (c["summary"], c["categories"]) == key and c["dt"] >= o["dt"]:
+                    o = dict(o, close_dt=c["dt"], close_countdown=c["countdown"])
+                    matched_close.add(id(c))
+                    break
+            merged.append(o)
+        merged.extend(c for c in close_ev if id(c) not in matched_close)
+        merged.extend(plain_ev)
+        merged.sort(key=lambda e: e["dt"])
+        return merged
     except Exception as e:
         log(f"❌ LM作业拉取失败: {e}")
         return []
@@ -2618,9 +2641,17 @@ def format_homework(events):
     lines = [f"📚 近期作业/测验（共{len(events)}项）："]
     for i, ev in enumerate(events, 1):
         lines.append(f"{i}. {ev['summary'][:50]}")
-        act = ev.get("action", "")
-        lines.append(f"　　⏰ {ev['dt'].strftime('%m月%d日 %H:%M')} · {act} · {ev['countdown']}" if act
-                     else f"　　⏰ {ev['dt'].strftime('%m月%d日 %H:%M')} · {ev['countdown']}")
+        t_str = ev['dt'].strftime('%m月%d日 %H:%M')
+        if ev.get("close_dt"):
+            # 合并了开放+截止的 quiz 类：明确展示两个时间点
+            lines.append(f"　　🟢 {t_str} 开放（{ev['countdown']}）")
+            lines.append(f"　　🔴 {ev['close_dt'].strftime('%m月%d日 %H:%M')} 截止（{ev['close_countdown']}）")
+        elif ev.get("action") == "截止":
+            lines.append(f"　　🔴 {t_str} 截止 · {ev['countdown']}")
+        elif ev.get("action") == "开放":
+            lines.append(f"　　🟢 {t_str} 开放 · {ev['countdown']}")
+        else:
+            lines.append(f"　　⏰ {t_str} · {ev['countdown']}")
     return "\n".join(lines)
 
 
@@ -2657,6 +2688,8 @@ def format_homework_card(events):
             "time": ev["dt"].strftime('%m月%d日 %H:%M'),
             "action": ev.get("action", ""),
             "countdown": ev["countdown"],
+            "close_time": ev["close_dt"].strftime('%m月%d日 %H:%M') if ev.get("close_dt") else None,
+            "close_countdown": ev.get("close_countdown", ""),
         })
     elements = []
     for idx, course in enumerate(order):
@@ -2669,8 +2702,10 @@ def format_homework_card(events):
                      "content": f"**📘 {course}**（{len(items)}项）"}
         })
         for it in items:
-            # 状态图标：截止🔴 开放🟢
-            if it["action"] == "截止":
+            # 状态图标：截止🔴 开放🟢；合并事件（开放+截止）双行展示
+            if it.get("close_time"):
+                status = f"🟢 {it['countdown']} 开放\n🔴 {it['close_countdown']} 截止"
+            elif it["action"] == "截止":
                 status = f"🔴 截止 · {it['countdown']}"
             elif it["action"] == "开放":
                 status = f"🟢 开放 · {it['countdown']}"
@@ -2781,12 +2816,23 @@ def gather_context(include_outlook=True):
                 ctx_parts.append(f"今天的Outlook日程（共{len(today_events)}个）：\n" + "\n".join(lines))
         except Exception:
             pass
-    # 注入 LM 作业上下文（关键词触发或 include_outlook 时）
+    # 注入 LM 作业上下文（带完整时间语义：开放=开始时间，截止=提交期限）
     try:
         lm_events = fetch_lm_assignments()
         if lm_events:
-            lines = [f"- {ev['summary'][:45]} ({ev['dt'].strftime('%m月%d日 %H:%M')}, {ev['countdown']})" for ev in lm_events[:10]]
-            ctx_parts.append(f"LearningMall 近期作业/测验（共{len(lm_events)}项）：\n" + "\n".join(lines))
+            lines = []
+            for ev in lm_events[:10]:
+                base = f"- {ev['summary'][:45]}"
+                if ev.get("close_dt"):
+                    lines.append(f"{base}：{ev['dt'].strftime('%m月%d日 %H:%M')} 开放（{ev['countdown']}）→ {ev['close_dt'].strftime('%m月%d日 %H:%M')} 截止（{ev['close_countdown']}）")
+                elif ev.get("action") == "截止":
+                    lines.append(f"{base}：{ev['dt'].strftime('%m月%d日 %H:%M')} 截止（{ev['countdown']}）")
+                elif ev.get("action") == "开放":
+                    lines.append(f"{base}：{ev['dt'].strftime('%m月%d日 %H:%M')} 开放（{ev['countdown']}）")
+                else:
+                    lines.append(f"{base}：{ev['dt'].strftime('%m月%d日 %H:%M')}（{ev['countdown']}）")
+            ctx_parts.append(f"LearningMall 近期作业/测验（共{len(lm_events)}项）。"
+                             "重要：「开放」=可以开始做的时间，「截止」=必须提交的最后期限：\n" + "\n".join(lines))
     except Exception:
         pass
     # 注入 AMS 出勤数据 + 房间预定状态（同一份 xjtlu_state.json，只读一次）
@@ -2966,6 +3012,10 @@ SYSTEM_PROMPT = (
     "告诉用户「这条已经撤回了，不用再操作」，不要让用户重复发指令。\n"
     "16. 不要自作主张汇报「已加日历」「已写入」——加日历是固定命令，只有用户发了命令系统才有结果。"
     "你只能引导格式，不能替代执行。\n"
+    "17. 汇报作业/测验时间必须区分「开放」和「截止」：「开放」是可以开始做题的时间，"
+    "「截止」是必须提交的最后期限，二者绝不能混淆。quiz 类通常有几天做答窗口"
+    "（如「10月05日 08:59 开放 → 10月09日 20:30 截止」），汇报时明确说「X 开放、Y 截止」，"
+    "或只强调截止时间。把开放时间说成「明天截止」是严重错误。\n"
 )
 
 
