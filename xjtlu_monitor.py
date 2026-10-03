@@ -1821,10 +1821,10 @@ def _room_op_query(page, captured, op):
 
 
 def _room_op_probe(page, captured, op):
-    """安全探测订房 API v6（决定性测试）：
-    1. 在浏览器里直接调用 SPA 的 axios 实例发订房请求（倒置时间，零副作用）
-    2. 拦截实际发出的网络请求看完整内容（URL + body + headers）
-    3. 扫描 chunk-52d28091 完整 JS 找 submit 函数的完整字段（含 clickNum 等）
+    """安全探测订房 API v7（决定性测试）：
+    1. 用 SPA 自身 axios 实例（含拦截器）发订房请求（倒置时间，零副作用）
+    2. 拦截该请求看完整内容（真实URL含baseURL + 真实headers + 真实body格式）
+    3. 测 resvProperty=32（JS里发现的值）和 0 对照
     4. 零副作用确认
     """
     today = _bjnow().strftime("%Y-%m-%d")
@@ -1834,133 +1834,122 @@ def _room_op_probe(page, captured, op):
     log(f"🆔 accId={acc_id!r} pid={pid!r}")
     findings.append(f"accId={acc_id}")
 
-    # 1. 拦截 /reserve/update 请求看完整内容
-    intercepted = {}
+    # 1. 拦截 /reserve/update 请求
+    intercepted = []
 
     def _on_request(req):
         try:
-            if "/reserve/update" in req.url:
-                intercepted["url"] = req.url
-                intercepted["method"] = req.method
-                intercepted["headers"] = dict(req.headers)
+            if "reserve/update" in req.url:
+                item = {"url": req.url, "method": req.method,
+                        "headers": dict(req.headers)}
                 try:
-                    intercepted["post_data"] = req.post_data
+                    item["post_data"] = req.post_data
                 except Exception:
-                    intercepted["post_data"] = "(无法读取)"
+                    item["post_data"] = "(无法读取)"
+                intercepted.append(item)
         except Exception:
             pass
 
     page.on("request", _on_request)
 
-    # 2. 在浏览器里用 SPA 自己的 axios 实例发请求
-    js_code = f"""
-    () => new Promise((resolve) => {{
-        try {{
-            // 找 Vue 根实例
-            const el = document.querySelector('#app');
-            if (!el || !el.__vue__) {{ resolve({{error: 'no vue instance'}}); return; }}
-            const vm = el.__vue__;
-            const store = vm.$store;
-            const axios = vm.$axios || vm.$http;
-            if (!axios) {{ resolve({{error: 'no axios'}}); return; }}
-            const userInfo = store.state.userInfo;
-            const accNo = userInfo.accNo;
-
-            // JS 实证的研讨室订房 payload
-            const payload = {{
-                sysKind: 1,
-                appAccNo: accNo,
-                memberKind: 1,
-                resvBeginTime: "{today} 15:00:00",
-                resvEndTime: "{today} 14:00:00",
-                testName: "研讨",
-                resvKind: 2,
-                resvProperty: 0,
-                appUrl: "",
-                resvMember: [accNo],
-                resvDev: [6],
-                memo: "probe",
-                captcha: "",
-                addServices: [],
-            }};
-
-            // 用 SPA 的 axios 封装发请求
-            axios({{method: "post", url: "/reserve/update", params: payload}})
-                .then(r => resolve({{ok: true, code: r.code, message: r.message, data: r.data}}))
-                .catch(e => resolve({{ok: false, error: String(e)}}));
-        }} catch(e) {{ resolve({{error: String(e)}}); }}
-    }})
-    """
+    # 2. SPA 自身 axios 实测（纯字符串拼接，不用 f-string；JS侧10秒超时兜底）
+    js_code = (
+        "() => Promise.race(["
+        "new Promise((resolve) => {"
+        "try {"
+        "const el = document.querySelector('#app') || document.body.firstElementChild;"
+        "const vm = el && el.__vue__;"
+        "if (!vm) { resolve({stage: 'vue', error: 'no vue on ' + (el && el.tagName)}); return; }"
+        "const axios = vm.$axios || vm.$http;"
+        "if (!axios || !axios.post) { resolve({stage: 'axios', error: 'no $axios'}); return; }"
+        "const store = vm.$store;"
+        "if (!store || !store.state.userInfo) { resolve({stage: 'store', error: 'no userInfo'}); return; }"
+        "const accNo = store.state.userInfo.accNo;"
+        "const today = " + json.dumps(today) + ";"
+        "const mk = (rp) => ({"
+        "sysKind: 1,"
+        "appAccNo: accNo,"
+        "memberKind: 1,"
+        "resvBeginTime: today + ' 15:00:00',"
+        "resvEndTime: today + ' 14:00:00',"
+        "testName: '研讨',"
+        "resvKind: 2,"
+        "resvProperty: rp,"
+        "appUrl: '',"
+        "resvMember: [accNo],"
+        "resvDev: [6],"
+        "memo: 'probe',"
+        "captcha: '',"
+        "addServices: [],"
+        "});"
+        "axios.post('/reserve/update', mk(32))"
+        ".then(r => resolve({stage: 'rp32', status: r.status, code: r.data && r.data.code, message: r.data && r.data.message}))"
+        ".catch(e => resolve({stage: 'rp32', error: String(e).slice(0, 150)}));"
+        "} catch(e) { resolve({stage: 'outer', error: String(e).slice(0, 150)}); }"
+        "}),"
+        "new Promise((resolve) => setTimeout(() => resolve({stage: 'jstimeout'}), 10000))"
+        "])"
+    )
     try:
-        result = page.evaluate(js_code, timeout=30000)
-        log(f"📥 SPA axios 响应: {json.dumps(result, ensure_ascii=False)[:300]}")
-        findings.append(f"SPAaxios:{str(result.get('message', result.get('error', '')))[:30]}")
+        result = page.evaluate(js_code)
+        log(f"📥 SPA axios(rp32): {json.dumps(result, ensure_ascii=False)[:300]}")
+        findings.append(f"rp32:{str(result.get('message', result.get('error', result.get('stage'))))[:30]}")
     except Exception as e:
         log(f"⚠️ SPA axios 执行失败: {e}")
-        findings.append(f"SPAaxios:执行失败")
+        findings.append("SPAaxios:执行失败")
 
     time.sleep(2)
+
+    # 3. 若第一发发出去了 → 打印拦截内容 + 第二发 rp=0 对照
+    if intercepted:
+        it = intercepted[-1]
+        log("🔍 拦截到 SPA 请求:")
+        log(f"   URL: {it['url'][:250]}")
+        log(f"   Method: {it['method']}")
+        log(f"   Headers: {json.dumps(it['headers'], ensure_ascii=False)[:500]}")
+        log(f"   PostData: {str(it.get('post_data'))[:600]}")
+        findings.append("拦截✓")
+        js2 = (
+            "() => Promise.race(["
+            "new Promise((resolve) => {"
+            "try {"
+            "const el = document.querySelector('#app') || document.body.firstElementChild;"
+            "const vm = el && el.__vue__;"
+            "const axios = vm && vm.$axios;"
+            "const store = vm && vm.$store;"
+            "if (!axios || !store || !store.state.userInfo) { resolve({stage: 'noaxios'}); return; }"
+            "const accNo = store.state.userInfo.accNo;"
+            "const today = " + json.dumps(today) + ";"
+            "const p = {"
+            "sysKind: 1, appAccNo: accNo, memberKind: 1,"
+            "resvBeginTime: today + ' 15:00:00', resvEndTime: today + ' 14:00:00',"
+            "testName: '研讨', resvKind: 2, resvProperty: 0, appUrl: '',"
+            "resvMember: [accNo], resvDev: [6], memo: 'probe',"
+            "captcha: '', addServices: [],"
+            "};"
+            "axios.post('/reserve/update', p)"
+            ".then(r => resolve({stage: 'rp0', code: r.data && r.data.code, message: r.data && r.data.message}))"
+            ".catch(e => resolve({stage: 'rp0', error: String(e).slice(0, 120)}));"
+            "} catch(e) { resolve({stage: 'outer', error: String(e).slice(0, 120)}); }"
+            "}),"
+            "new Promise((resolve) => setTimeout(() => resolve({stage: 'jstimeout2'}), 10000))"
+            "])"
+        )
+        try:
+            r2 = page.evaluate(js2)
+            log(f"📥 SPA axios(rp0): {json.dumps(r2, ensure_ascii=False)[:250]}")
+            findings.append(f"rp0:{str(r2.get('message', r2.get('error', r2.get('stage'))))[:25]}")
+        except Exception as e:
+            log(f"⚠️ rp0 执行失败: {e}")
+    else:
+        log("📭 未拦截到 /reserve/update（SPA axios 没发出请求）")
+
     try:
         page.remove_listener("request", _on_request)
     except Exception:
         pass
 
-    # 3. 打印拦截到的完整请求
-    if intercepted:
-        log(f"🔍 拦截到 SPA 请求:")
-        log(f"   URL: {str(intercepted.get('url'))[:200]}")
-        log(f"   Method: {intercepted.get('method')}")
-        log(f"   Headers: {json.dumps(intercepted.get('headers', {}), ensure_ascii=False)[:400]}")
-        log(f"   PostData: {str(intercepted.get('post_data'))[:500]}")
-    else:
-        log("📭 未拦截到 /reserve/update 请求（SPA axios 可能没真正发出）")
-
-    # 4. 扫描 chunk-52d28091 完整 JS（找 submit 函数完整定义 + clickNum 来源）
-    try:
-        js_urls = page.evaluate(
-            "() => performance.getEntriesByType('resource')"
-            ".map(r => r.name).filter(u => u.includes('chunk-52d28091'))")
-        if js_urls:
-            body = page.request.get(js_urls[0], timeout=20000).text()
-            # 找 submit/reserve/update 附近的完整代码
-            for kw in ("/reserve/update", "clickNum", "selectAccNoList", "submitForm"):
-                idx = 0
-                for _ in range(3):
-                    idx = body.find(kw, idx)
-                    if idx < 0:
-                        break
-                    log(f"📜 chunk-52d28091「{kw}」@{idx}: ...{body[max(0, idx - 200):idx + 400]}...")
-                    idx += len(kw)
-        else:
-            log("📜 chunk-52d28091 未找到")
-    except Exception as e:
-        log(f"⚠️ JS 扫描失败: {e}")
-
-    # 5. 用 SPA 实证的方式重试（如果有 clickNum 等新发现）
-    # 先用 Playwright request + JSON body 重新确认（加 clickNum）
-    payload2 = {
-        "sysKind": 1,
-        "appAccNo": int(acc_id) if str(acc_id).isdigit() else acc_id,
-        "memberKind": 1,
-        "resvBeginTime": f"{today} 15:00:00",
-        "resvEndTime": f"{today} 14:00:00",
-        "testName": "研讨",
-        "resvKind": 2,
-        "resvProperty": 0,
-        "appUrl": "",
-        "resvMember": [int(acc_id) if str(acc_id).isdigit() else acc_id],
-        "resvDev": [6],
-        "memo": "",
-        "captcha": "",
-        "addServices": [],
-        "clickNum": 1,
-    }
-    r5 = _room_api_on_page(page, "/reserve/update?sf_request_type=ajax",
-                           method="POST", data=payload2, timeout=25000)
-    log(f"📥 +clickNum: code={r5.get('code')} msg={str(r5.get('message'))[:80]}")
-    findings.append(f"+clickNum:{str(r5.get('message'))[:25]}")
-
-    # 6. 零副作用确认
+    # 4. 零副作用确认
     begin = (_bjnow() - timedelta(days=1)).strftime("%Y-%m-%d")
     end = (_bjnow() + timedelta(days=3)).strftime("%Y-%m-%d")
     j5 = _room_api_on_page(
@@ -1978,7 +1967,7 @@ def _room_op_probe(page, captured, op):
     else:
         log("✅ 零副作用：没有创建任何预约")
         findings.append("零残留✅")
-    return "🔬 probe v6 完成: " + "；".join(findings)
+    return "🔬 probe v7 完成: " + "；".join(findings)
 
 
 def run_room_op(op_json):
