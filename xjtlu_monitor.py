@@ -1821,85 +1821,109 @@ def _room_op_query(page, captured, op):
 
 
 def _room_op_probe(page, captured, op):
-    """安全探测订房 API v16（周视图数据对比）：
-    1. GET /reserve 用正确参数（sysKind=2, labId=单数, resvDates=YYYYMMDD,YYYYMMDD范围）
-    2. 对比周视图房间对象 vs roomDevice/roomInfos 的 devId/devSn
-    3. 用周视图数据的房间对象字段试订房（冲突时段，零副作用）
+    """安全探测订房 API v17（导航到周视图捕获真实请求）：
+    1. attach 请求监听 + router.push 到空间页
+    2. 捕获 SPA 发的全部 /ic-web/ 请求 URL（含周视图查询的精确参数）
+    3. 捕获周视图响应（房间对象真实结构，含 devId）
+    4. 用周视图数据试订冲突时段（零副作用）
     """
     today = _bjnow().strftime("%Y-%m-%d")
-    week_end = (_bjnow() + timedelta(days=6)).strftime("%Y-%m-%d")
-    ds = today.replace("-", "")
-    de = week_end.replace("-", "")
     findings = []
 
     acc_id, pid = _room_get_accid_from_storage(page)
     log(f"🆔 accId={acc_id!r}")
     findings.append(f"accId={acc_id}")
 
-    # 1. 周视图数据（正确参数格式：labId 单数 + resvDates 逗号范围）
-    for sk in (2, 1):
-        r = _room_api_on_page(
-            page, f"/reserve?sysKind={sk}&labId=5&resvDates={ds},{de}&page=1&pageNum=100")
-        log(f"📥 GET /reserve sk={sk} labId=5 range: code={r.get('code')} "
-            f"msg={str(r.get('message'))[:50]} data={str(r.get('data'))[:100]}")
-        findings.append(f"GETsk{sk}:{r.get('code')}")
-        if r.get("code") == 0 and r.get("data"):
-            # dump 第一个房间的完整结构
-            data = r["data"]
+    # 1. 捕获全部请求 + 响应
+    reqs = []
+    week_resp = {}
+
+    def _on_req(req):
+        try:
+            if "/ic-web/" in req.url:
+                reqs.append(req.url.split("/ic-web/", 1)[1][:150])
+        except Exception:
+            pass
+
+    def _on_resp(resp):
+        try:
+            u = resp.url
+            if "/ic-web/reserve" in u and "update" not in u and "resvInfo" not in u:
+                week_resp[u.split("/ic-web/", 1)[1][:120]] = resp.json()
+        except Exception:
+            pass
+
+    page.on("request", _on_req)
+    page.on("response", _on_resp)
+
+    # 2. 导航到 5F 空间页
+    try:
+        nav = page.evaluate(
+            "() => {"
+            "const el = document.querySelector('#app') || document.body.firstElementChild;"
+            "const vm = el && el.__vue__;"
+            "if (vm && vm.$router) { vm.$router.push('/ic/researchSpace/2/5/5').catch(()=>{}); return 'pushed'; }"
+            "return 'no router';"
+            "}")
+        log(f"🔀 路由: {nav}")
+    except Exception as e:
+        log(f"⚠️ 路由失败: {e}")
+    time.sleep(10)
+
+    try:
+        page.remove_listener("request", _on_req)
+        page.remove_listener("response", _on_resp)
+    except Exception:
+        pass
+
+    # 3. 打印捕获的请求
+    log(f"🔍 捕获 {len(reqs)} 个 ic-web 请求:")
+    for u in list(dict.fromkeys(reqs))[:20]:
+        log(f"🔍   {u}")
+    findings.append(f"reqs:{len(reqs)}")
+
+    # 4. 打印周视图响应（房间结构）
+    for path, body in list(week_resp.items())[:5]:
+        log(f"📜 响应 {path}: {str(body)[:600]}")
+        if isinstance(body, dict) and body.get("data"):
+            data = body["data"]
             if isinstance(data, list) and data:
                 campus = data[0]
                 labs = campus.get("labInfos") or []
                 if labs:
-                    rooms = labs[0].get("roomInfos") or labs[0].get("rooms") or []
+                    rooms = labs[0].get("roomInfos") or []
                     if rooms:
-                        log(f"📜 sk={sk} 房间完整结构: {json.dumps(rooms[0], ensure_ascii=False)[:600]}")
-                        # 找一个有 resvRule/devProp/devSn 的房间
-                        for rm in rooms[:3]:
-                            log(f"📜 房间字段: name={rm.get('devName')} devId={rm.get('devId')} "
-                                f"devSn={rm.get('devSn')} kindId={rm.get('kindId')} "
-                                f"devProp={rm.get('devProp')} resvRule={str(rm.get('resvRule'))[:100]}")
-            elif isinstance(data, dict):
-                log(f"📜 sk={sk} data 是 dict: {json.dumps(data, ensure_ascii=False)[:600]}")
-            break
+                        log(f"📜 周视图房间[0]完整: {json.dumps(rooms[0], ensure_ascii=False)[:800]}")
+                        findings.append(f"房间:{rooms[0].get('devName')}/{rooms[0].get('devId')}")
 
-    # 2. roomDevice/roomInfos 对照
-    r2 = _room_api_on_page(page, f"/roomDevice/roomInfos?resvDate={ds}")
-    if r2.get("code") == 0 and r2.get("data"):
-        for campus in r2["data"]:
-            for lab in campus.get("labInfos") or []:
-                if lab.get("labName") == "5F":
-                    for rm in (lab.get("roomInfos") or [])[:2]:
-                        log(f"📜 roomDevice 5F 房间: {json.dumps(rm, ensure_ascii=False)[:400]}")
-
-    # 3. 从周视图找真实房间对象试订（冲突时段——周视图里带 resvInfos 的）
-    # 先重新查周视图 5F（sysKind=2），找一个被占时段
+    # 5. 用周视图的房间数据试订冲突时段（零副作用）
     week_room = None
     occupied = None
-    r3 = _room_api_on_page(
-        page, f"/reserve?sysKind=2&labId=5&resvDates={ds},{de}&page=1&pageNum=100")
-    if r3.get("code") == 0 and r3.get("data"):
-        for campus in r3["data"]:
+    for path, body in week_resp.items():
+        if not isinstance(body, dict) or not body.get("data"):
+            continue
+        data = body["data"]
+        if not isinstance(data, list):
+            continue
+        for campus in data:
             for lab in campus.get("labInfos") or []:
-                rooms = lab.get("roomInfos") or []
-                for rm in rooms:
-                    ris = rm.get("resvInfos") or rm.get("resvInfo") or []
+                for rm in lab.get("roomInfos") or []:
+                    ris = rm.get("resvInfos") or []
                     if ris:
-                        week_room = rm
-                        occupied = ris[0]
+                        week_room, occupied = rm, ris[0]
                         break
                 if week_room:
                     break
             if week_room:
                 break
-        log(f"📍 周视图冲突房间: {week_room and week_room.get('devName')} "
-            f"resvInfos={occupied and json.dumps(occupied, ensure_ascii=False)[:200]}")
+        if week_room:
+            break
 
     if week_room and occupied:
-        # 用周视图房间的字段构造订房
         s = occupied.get("resvBeginTime", "")
         e = occupied.get("resvEndTime", "")
         dev_id = week_room.get("devId")
-        log(f"📤 用周视图数据试订冲突时段（零副作用）: devId={dev_id} {s}-{e}")
+        log(f"📍 周视图房间: {week_room.get('devName')} devId={dev_id} 冲突 {s}-{e}")
 
         def spa_post(payload):
             js = (
@@ -1933,10 +1957,10 @@ def _room_op_probe(page, captured, op):
             "memo": "小组研讨", "captcha": "", "addServices": [],
         }
         rb = spa_post(payload)
-        log(f"📥 周视图冲突订房: code={rb.get('code')} msg={str(rb.get('message', rb.get('error', '')))[:60]}")
-        findings.append(f"冲突试:{str(rb.get('message', ''))[:30]}")
+        log(f"📥 周视图数据订房: code={rb.get('code')} msg={str(rb.get('message', rb.get('error', '')))[:70]}")
+        findings.append(f"订:{str(rb.get('message', ''))[:30]}")
     else:
-        log("📭 周视图没有已占房间或查询失败")
+        log("📭 周视图没有已占房间或数据未捕获")
 
     # 零残留
     begin = (_bjnow() - timedelta(days=1)).strftime("%Y-%m-%d")
@@ -1955,7 +1979,7 @@ def _room_op_probe(page, captured, op):
     else:
         log("✅ 零残留")
         findings.append("零残留✅")
-    return "🔬 probe v16 完成: " + "；".join(findings)
+    return "🔬 probe v17 完成: " + "；".join(findings)
 
 
 def run_room_op(op_json):
