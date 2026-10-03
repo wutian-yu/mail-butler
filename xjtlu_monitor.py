@@ -1821,95 +1821,108 @@ def _room_op_query(page, captured, op):
 
 
 def _room_op_probe(page, captured, op):
-    """安全探测订房 API v2（不创建真实预约）：
-    1. sessionStorage 提取 accId（SPA 自存）
-    2. 扫描 SPA JS 源码找订房 payload 的真实构造（关键词定位 + 上下文）
-    3. 变体矩阵：全部用「倒置时间」请求（100% 必被服务器拒绝），对比响应差异
-    4. 若某变体通过参数校验 → 用冲突时段再验证（仍零副作用）
-    5. 结束前验证「我的预约」为空
+    """安全探测订房 API v3（零副作用）：
+    1. JS 全量扫描：找订房 payload 构造（resvDev/memberKind:2/resvKind）和端点定义（reserve/update）
+    2. GET /reserve 加 sf_request_type=ajax 测试（修可用性查询路径）
+    3. POST /reserve/update 变体矩阵（全部倒置时间，必被拒）
+    4. 结束前验证「我的预约」为空
     """
     today = _bjnow().strftime("%Y-%m-%d")
     findings = []
 
     # 1. accId
     acc_id, pid = _room_get_accid_from_storage(page)
-    log(f"🆔 probe accId={acc_id!r} pid={pid!r}")
+    log(f"🆔 accId={acc_id!r} pid={pid!r}")
     findings.append(f"accId={acc_id}")
 
-    # 2. JS 源码扫描（找 appAccNo/resvBeginTime 的构造上下文 + 请求 URL）
+    # 2. JS 全量扫描（订房 payload 构造 + 端点定义）
     try:
         js_urls = page.evaluate(
             "() => performance.getEntriesByType('resource')"
             ".map(r => r.name).filter(u => u.endsWith('.js'))")
-        log(f"📜 已加载 JS {len(js_urls or [])} 个")
-        seen = 0
+        log(f"📜 已加载 JS {len(js_urls or [])} 个，扫描订房相关代码...")
+        contexts = 0
         for src in (js_urls or []):
-            if seen >= 3:
+            if contexts >= 14:
                 break
             try:
-                resp = page.request.get(src, timeout=20000)
-                body = resp.text()
-                for kw in ("appAccNo", "resvBeginTime"):
-                    idx = body.find(kw)
-                    if idx >= 0:
-                        log(f"📜 {src.split('/')[-1][:50]} 含 {kw} @ {idx}:")
-                        log(f"📜 上下文: ...{body[max(0, idx-200):idx+300]}...")
-                        seen += 1
+                body = page.request.get(src, timeout=20000).text()
+                fname = src.split("/")[-1][:45]
+                for kw in ("reserve/update", "resvDev", "memberKind:2", "resvKind"):
+                    idx = 0
+                    for _ in range(2):
+                        idx = body.find(kw, idx)
+                        if idx < 0:
+                            break
+                        log(f"📜 {fname}「{kw}」: ...{body[max(0, idx - 160):idx + 300]}...")
+                        contexts += 1
+                        idx += len(kw)
+                        if contexts >= 14:
+                            break
+                    if contexts >= 14:
                         break
             except Exception:
                 continue
-        if not seen:
-            log("📜 未在任何 JS 中找到 appAccNo/resvBeginTime（订房代码可能在懒加载 chunk）")
     except Exception as e:
         log(f"⚠️ JS 扫描失败: {e}")
 
-    # 3. 变体矩阵（全部倒置时间 15:00→14:00，服务器必拒，零副作用）
-    def mk(sf, secs, acc, dev_objs, minimal):
+    # 3. GET /reserve 加 sf_request_type=ajax（修可用性路径）
+    ds = today.replace("-", "")
+    r = _room_api_on_page(
+        page, f"/reserve?sysKind=1&resvDates={ds}&labIds=3,4,5,1,7,9&sf_request_type=ajax")
+    log(f"📥 GET /reserve+sf: code={r.get('code')} msg={str(r.get('message'))[:40]} "
+        f"data={len(r.get('data') or []) if isinstance(r.get('data'), list) else r.get('data')}")
+    findings.append(f"GET+sf:{r.get('code')}")
+
+    # 4. POST /reserve/update 变体矩阵（全部倒置时间 15:00→14:00，零副作用）
+    def mk(dev_objs, acc_num, seat_style, minimal):
+        acc = int(acc_id) if (acc_num and str(acc_id).isdigit()) else acc_id
         p = {
-            "appAccNo": str(acc_id) if acc else "",
+            "appAccNo": acc,
             "captcha": "",
-            "memberKind": 2,
-            "memo": "probe",
-            "resvBeginTime": f"{today} 15:00:00" if secs else f"{today} 15:00",
+            "memberKind": 1 if seat_style else 2,
+            "memo": "研讨",
+            "resvBeginTime": f"{today} 15:00:00",
             "resvDev": [{"devId": 6}] if dev_objs else [6],
-            "resvEndTime": f"{today} 14:00:00" if secs else f"{today} 14:00",
-            "resvMember": [str(acc_id)] if acc else [],
+            "resvEndTime": f"{today} 14:00:00",
+            "resvMember": [acc],
             "resvProperty": 0,
-            "sysKind": 1,
-            "testName": "probe",
+            "sysKind": 2 if seat_style else 1,
+            "testName": "研讨",
             "addServices": [],
             "appUrl": "",
-            "resvKind": 2,
         }
+        if not seat_style:
+            p["resvKind"] = 2
         if minimal:
             for k in ("captcha", "memo", "testName", "addServices", "appUrl", "resvProperty"):
                 p.pop(k, None)
-        query = "?sf_request_type=ajax" if sf else ""
-        return p, query
+        return p
 
     variants = [
-        ("A sf标记",            mk(True,  False, False, False, False)),
-        ("B sf+秒",             mk(True,  True,  False, False, False)),
-        ("C sf+accId",          mk(True,  False, True,  False, False)),
-        ("D sf+秒+accId+对象dev", mk(True,  True,  True,  True,  False)),
-        ("E 最小+sf+accId",      mk(True,  False, True,  False, True)),
-        ("F 秒+accId(无sf)",     mk(False, True,  True,  False, False)),
+        ("U1 dev=[6] acc数字 房间式", mk(False, True, False, False), True),
+        ("U2 dev=[{devId}] acc数字 房间式", mk(True, True, False, False), True),
+        ("U3 dev=[6] acc字符串 房间式", mk(False, False, False, False), True),
+        ("U4 座位式 sys2/mk1", mk(False, True, True, False), True),
+        ("U5 最小payload 房间式", mk(False, True, False, True), True),
+        ("U6 房间式 无sf", mk(False, True, False, False), False),
     ]
     winner = None
-    for name, (payload, query) in variants:
-        r = _room_api_on_page(page, "/reserve" + query, method="POST",
-                              data=payload, timeout=25000)
-        msg = str(r.get("message", ""))
-        log(f"📥 变体{name}: code={r.get('code')} msg={msg[:60]}")
-        findings.append(f"{name}:{msg[:30]}")
+    for name, payload, sf in variants:
+        q = "?sf_request_type=ajax" if sf else ""
+        rr = _room_api_on_page(page, "/reserve/update" + q, method="POST",
+                               data=payload, timeout=25000)
+        msg = str(rr.get("message", ""))
+        log(f"📥 {name}: code={rr.get('code')} msg={msg[:70]}")
+        findings.append(f"{name[:6]}:{msg[:25]}")
         if "参数" not in msg:
-            winner = (name, payload, query)
-            log(f"🎯 变体{name} 通过参数校验！")
+            winner = (name, payload, sf)
+            log(f"🎯 {name} 通过参数校验！")
             break
 
-    # 4. 若有变体通过参数校验 → 用真实冲突时段验证（仍零副作用）
+    # 5. 若通过参数校验 → 冲突时段验证（仍零副作用）
     if winner:
-        name, payload, query = winner
+        name, payload, sf = winner
         raw = _room_query_avail_raw(page, today, captured)
         conflict = None
         if raw:
@@ -1929,34 +1942,32 @@ def _room_op_probe(page, captured, op):
         if conflict:
             rm, rv = conflict
             try:
-                s = rv["resvBeginTime"][11:16]
-                e = rv["resvEndTime"][11:16]
-
                 def to_min(t):
                     h, m = t.split(":")
                     return int(h) * 60 + int(m)
-                ms = to_min(s)
-                me = min(to_min(s) + 30, to_min(e))
-                cs = f"{ms // 60:02d}:{ms % 60:02d}"
-                ce = f"{me // 60:02d}:{me % 60:02d}"
-            except Exception:
-                conflict = None
-        if conflict:
-            p2 = json.loads(json.dumps(payload))  # deep copy
-            p2["resvDev"] = [{"devId": rm["devId"]}] if isinstance(payload.get("resvDev"), list) and isinstance(payload["resvDev"][0], dict) else [rm["devId"]]
-            p2["resvBeginTime"] = f"{today} {cs}"
-            p2["resvEndTime"] = f"{today} {ce}"
-            r2 = _room_api_on_page(page, "/reserve" + query, method="POST",
-                                   data=p2, timeout=25000)
-            log(f"📥 冲突验证({rm.get('devName')} {cs}-{ce}): code={r2.get('code')} "
-                f"msg={str(r2.get('message'))[:80]}")
-            findings.append(f"冲突验证:{str(r2.get('message'))[:40]}")
-            if r2.get("code") == 0:
-                log("🚨 意外成功！立即查 uuid 清理")
+                s = to_min(rv["resvBeginTime"][11:16])
+                e = min(to_min(rv["resvBeginTime"][11:16]) + 30, to_min(rv["resvEndTime"][11:16]))
+                cs = f"{s // 60:02d}:{s % 60:02d}"
+                ce = f"{e // 60:02d}:{e % 60:02d}"
+                p2 = json.loads(json.dumps(payload))
+                if isinstance(payload.get("resvDev"), list) and isinstance(payload["resvDev"][0], dict):
+                    p2["resvDev"] = [{"devId": rm["devId"]}]
+                else:
+                    p2["resvDev"] = [rm["devId"]]
+                p2["resvBeginTime"] = f"{today} {cs}:00"
+                p2["resvEndTime"] = f"{today} {ce}:00"
+                q = "?sf_request_type=ajax" if sf else ""
+                r2 = _room_api_on_page(page, "/reserve/update" + q, method="POST",
+                                       data=p2, timeout=25000)
+                log(f"📥 冲突验证({rm.get('devName')} {cs}-{ce}): code={r2.get('code')} "
+                    f"msg={str(r2.get('message'))[:90]}")
+                findings.append(f"冲突:{str(r2.get('message'))[:35]}")
+            except Exception as e:
+                log(f"⚠️ 冲突验证异常: {e}")
         else:
             log("📭 没有已占用房间可做冲突验证")
 
-    # 5. 确认没有创建任何预约（关键安全验证）
+    # 6. 零副作用确认
     begin = (_bjnow() - timedelta(days=1)).strftime("%Y-%m-%d")
     end = (_bjnow() + timedelta(days=3)).strftime("%Y-%m-%d")
     j5 = _room_api_on_page(
@@ -1973,7 +1984,7 @@ def _room_op_probe(page, captured, op):
                 log(f"🧹 清理预约 {rv['uuid']}: {str(d)[:100]}")
     else:
         log("✅ 探测零副作用：没有创建任何预约")
-    return "🔬 probe v2 完成（零副作用）: " + "；".join(findings)
+    return "🔬 probe v3 完成（零副作用）: " + "；".join(findings)
 
 
 def run_room_op(op_json):
