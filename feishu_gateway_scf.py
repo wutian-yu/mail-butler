@@ -179,6 +179,7 @@ def gh_write_json(path, data, sha, message="update", retries=2):
 def trigger_github():
     """触发 GitHub Actions 重新生成 ICS"""
     if not GH_TOKEN:
+        log("⚠️ trigger_github: 无 GH_TOKEN")
         return
     try:
         req = urllib.request.Request(
@@ -189,12 +190,17 @@ def trigger_github():
                      "Content-Type": "application/json",
                      "X-GitHub-Api-Version": "2022-11-28"})
         urllib.request.urlopen(req, timeout=10)
-    except Exception:
-        pass
+    except Exception as e:
+        log(f"⚠️ trigger_github 失败: {e}")  # M7 修复：不再静默吞掉
 
 
 # ============ Outlook API ============
+_OUTLOOK_TOKEN_CACHE = {"token": "", "expires": 0}
+
 def get_outlook_token():
+    # M3 修复：加缓存，避免同一请求重复获取 token
+    if _OUTLOOK_TOKEN_CACHE["token"] and time.time() < _OUTLOOK_TOKEN_CACHE["expires"]:
+        return _OUTLOOK_TOKEN_CACHE["token"]
     body = urllib.parse.urlencode({
         "client_id": OUTLOOK_CLIENT_ID,
         "grant_type": "refresh_token",
@@ -206,7 +212,10 @@ def get_outlook_token():
         data=body, method="POST",
         headers={"Content-Type": "application/x-www-form-urlencoded"})
     with urllib.request.urlopen(req, timeout=30) as r:
-        return json.loads(r.read().decode())["access_token"]
+        tok = json.loads(r.read().decode())
+    _OUTLOOK_TOKEN_CACHE["token"] = tok["access_token"]
+    _OUTLOOK_TOKEN_CACHE["expires"] = time.time() + tok.get("expires_in", 3600) - 60
+    return tok["access_token"]
 
 
 def outlook_events():
@@ -294,20 +303,27 @@ def item_md(item):
 # ============ 命令处理 ============
 HELP_TEXT = (
     "🤖 AI邮件管家 · 帮助\n\n"
-    "📋「列表」待确认活动\n"
-    "✅「批准 [N]」加入日历\n"
-    "✅「批准全部」批量加入\n"
-    "⏭️「跳过 [N]」忽略活动\n"
-    "⏭️「跳过全部」批量忽略\n"
-    "📊「日历」管家已加入的活动\n"
-    "📅「日程」Outlook全部日程\n"
-    "🗑️「删除」查看可删除清单\n"
-    "🗑️「删除 N / 日期 / 名称」删除指定日程\n"
-    "🗑️「删除全部」一键清空\n"
-    "🏫「签到 码」远程签到 AMS（72小时内可补）\n"
-    "📊「出勤」AMS 出勤率统计\n"
-    "🏥「请假 日期 原因」申请准假（发证明图自动提交）\n\n"
-    "💡 删除=自动判断从哪移除，不用操心\n"
+    "📋 邮件活动\n"
+    "「列表」待确认活动\n"
+    "「批准 [N]」加入日历　「批准全部」批量\n"
+    "「跳过 [N]」忽略活动　「跳过全部」批量\n\n"
+    "📅 日历\n"
+    "「日历」管家已加入的活动\n"
+    "「日程」Outlook全部日程\n"
+    "「删日历」查看可删清单\n"
+    "「删日历 N」删第N个\n"
+    "「删日历 10月9号的数学」按条件删\n"
+    "「删日历全部 📚」删所有作业日程\n\n"
+    "📚 作业\n"
+    "「作业」查看 LearningMall 截止\n"
+    "「把XX作业加到日历」写进 Outlook 日历\n\n"
+    "🏫 AMS 考勤\n"
+    "「签到 码」远程签到（72小时内可补）\n"
+    "「出勤」出勤率统计\n"
+    "「请假 日期 原因」申请准假\n"
+    "「改假条 新原因」修改假条正文\n"
+    "「取消请假」放弃进行中假条\n"
+    "「撤回请假」撤回已提交申请\n\n"
     "💡 也可以直接跟我聊天～"
 )
 
@@ -353,8 +369,8 @@ def _save_chat_history(messages, sha):
     messages = messages[-20:]
     try:
         gh_write_json(CHAT_HISTORY_FILE, {"messages": messages}, sha, "chat history")
-    except Exception:
-        pass
+    except Exception as e:
+        log(f"⚠️ 对话历史保存失败: {e}")
 
 
 def cmd_help(chat_id):
@@ -443,16 +459,25 @@ def _create_outlook_event_from_item(item):
         now = datetime.now()
         if dates:
             d = dates[0]
-            if time_range and len(time_range) == 4:
+            # H1 修复：JSON 反序列化后 dates 可能是字符串，转为 datetime
+            if isinstance(d, str):
+                try:
+                    d = datetime.strptime(d[:10], "%Y-%m-%d")
+                except ValueError:
+                    d = None
+            if d and time_range and len(time_range) == 4:
                 start = d.replace(hour=time_range[0], minute=time_range[1])
                 end = d.replace(hour=time_range[2], minute=time_range[3])
+            elif d:
+                start = d.replace(hour=9, minute=0)
+                end = d.replace(hour=10, minute=0)
             else:
-                start = d.replace(hour=9)
-                end = d.replace(hour=10)
+                start = (now + timedelta(days=1)).replace(hour=9, minute=0, second=0, microsecond=0)
+                end = start.replace(hour=10)
+                title += "（时间待定）"
         else:
             # 时间待定：占位明天 9-10 点
-            start = now + timedelta(days=1)
-            start = start.replace(hour=9, minute=0, second=0, microsecond=0)
+            start = (now + timedelta(days=1)).replace(hour=9, minute=0, second=0, microsecond=0)
             end = start.replace(hour=10)
             title += "（时间待定）"
         eid = outlook_create_event(title, start, end, body=body)
@@ -1021,7 +1046,8 @@ def parse_leave_date(text, now=None):
     if m:
         try:
             d = datetime(now.year, int(m.group(1)), int(m.group(2)))
-            if d < now.replace(month=1, day=1):
+            # H4 修复：日期已过则跨年（原代码比较 1月1日几乎永不为 True）
+            if d < now.replace(hour=0, minute=0, second=0, microsecond=0):
                 d = datetime(now.year + 1, int(m.group(1)), int(m.group(2)))
             return d.strftime("%Y-%m-%d")
         except ValueError:
@@ -1151,7 +1177,8 @@ def cmd_leave(chat_id, text):
                 break
     # 3. 原因 = 去掉日期和课程码后的文本
     reason_raw = re.sub(r"\b([A-Z]{3}\d{3})\b", "", rest, flags=re.I).strip()
-    reason_raw = re.sub(r"\d{1,2}[-月]\d{1,2}(日|号)?", "", reason_raw).strip(" ，,.-")
+    reason_raw = re.sub(r"\d{1,2}[-月.]\d{1,2}(日|号)?", "", reason_raw).strip()
+    reason_raw = re.sub(r"(明天|后天|今天|周[一二三四五六日天]|星期[一二三四五六日天])", "", reason_raw).strip(" ，,.-")
     if not reason_raw:
         feishu_send(chat_id, "❓ 请补充请假原因，例如「请假 10-05 崴脚了腿瘸了去不了学校」。")
         return
@@ -1297,6 +1324,11 @@ def cmd_leave_revoke(chat_id):
         # 撤回最新一条（用 leaveOdd 或 id）
         cancel = _http(f"{AMS_URL}/xjtlu/stuapi/xjtlu-leave/cancelLeave/{leave_odd}",
                        headers={"x-token": token}, timeout=15)
+        # M5 修复：撤回也检查 token 失效
+        if _ams_token_dead(cancel):
+            trigger_monitor_refresh()
+            feishu_send(chat_id, "⏳ AMS 凭证过期，已触发刷新（约2~4分钟），稍后重试撤回。")
+            return
         if isinstance(cancel, dict) and cancel.get("code") == 0:
             feishu_send_action(chat_id, "✅ 请假申请已撤回",
                 f"{latest.get('startTime', '')} 的申请已从 AMS 撤回（原状态：{status}）。", color="green")
@@ -1540,8 +1572,9 @@ def process_command(text, chat_id):
         cmd_leave(chat_id, text)
         return
     # 作业写日历：用户说"把XX作业加到日历"/"添加到日历"+作业/课程关键词
-    if ("日历" in text or "日历" in t) and any(kw in text for kw in ["作业", "assignment", "截止", "ddl", "MTH", "EAP", "SCI", "CCT", "PHE", "PSP", "微积分", "线代", "英语", "数学", "科学", "体育"]):
-        if any(kw in text for kw in ["加", "添加", "写", "标", "放", "同步", "导入"]) or "日历" in text:
+    if "日历" in text and any(kw in text for kw in ["作业", "assignment", "截止", "ddl", "MTH", "EAP", "SCI", "CCT", "PHE", "PSP", "微积分", "线代", "英语", "数学", "科学", "体育"]):
+        # H3 修复：去掉 or "日历" in text（恒True），只凭动作关键词触发
+        if any(kw in text for kw in ["加", "添加", "写", "标", "放", "同步", "导入"]):
             cmd_homework_to_calendar(chat_id, text)
             return
     if t in ("取消请假", "取消申请", "放弃请假"):
@@ -1594,7 +1627,8 @@ def process_command(text, chat_id):
         if "跳过" in t or "skip" in t or "忽略" in t or "消除" in t or "清除" in t or "清掉" in t or "不要" in t:
             cmd_skip(chat_id, t + " 全部")
             return
-        if "删除" in t or "delete" in t or "取消" in t or "revoke" in t or "去掉" in t or "移除" in t:
+        if "删除" in t or "delete" in t or "去掉" in t or "移除" in t:
+            # H2 修复："取消"不再触删除日历（"取消请假"已提前处理）
             cmd_smart_delete(chat_id, "全部")
             return
 
@@ -1612,9 +1646,10 @@ def process_command(text, chat_id):
         cmd_schedule(chat_id)
     elif t in ("作业", "homework", "hw", "ddl", "deadline", "learningmall", "lm", "学习"):
         cmd_homework(chat_id)
-    elif t.startswith("删除") or t.startswith("delete") or t.startswith("取消") or t.startswith("revoke") or t.startswith("去掉") or t.startswith("移除"):
+    elif t.startswith("删除") or t.startswith("delete") or t.startswith("revoke") or t.startswith("去掉") or t.startswith("移除"):
+        # H2 修复：移除"取消"前缀路由到删除，避免"取消N"误删日历
         rest = t
-        for prefix in ("删除", "delete", "取消", "revoke", "去掉", "移除"):
+        for prefix in ("删除", "delete", "revoke", "去掉", "移除"):
             if rest.startswith(prefix):
                 rest = rest[len(prefix):].strip()
                 break
@@ -2376,8 +2411,6 @@ def main_handler(event, context):
                     pass
         t = threading.Thread(target=_async_process, daemon=True)
         t.start()
-        return {"statusCode": 200, "body": "ok"}
-
     return {"statusCode": 200, "body": "ok"}
 
     return {"statusCode": 200, "body": "ok"}
