@@ -2263,11 +2263,81 @@ def cmd_homework_to_calendar(chat_id, text):
     feishu_send(chat_id, "\n".join(summary_lines))
 
 
+def cmd_add_calendar(chat_id, text):
+    """自由格式加日历：用户说「加日历 <标题> <日期> <开始时间> <结束时间>」
+    例如：加日历 微积分 Practice quiz 1 - W4 截止 10-03 22:00 23:00
+    智能解析标题/日期/时段 → 创建 Outlook 日历事件"""
+    # 去掉前缀
+    rest = re.sub(r"^(加日历|添加日历|写入日历|标到日历|加到日历)\s*", "", text.strip())
+    # 提取日期：MM-DD 或 MM月DD日 或 今天/明天/后天
+    date_str = None
+    dm = re.search(r"(\d{1,2})[月./\-](\d{1,2})", rest)
+    if dm:
+        try:
+            date_str = datetime(datetime.now().year, int(dm.group(1)), int(dm.group(2))).strftime("%Y-%m-%d")
+        except ValueError:
+            pass
+    else:
+        for kw, offset in [("今天", 0), ("明天", 1), ("后天", 2)]:
+            if kw in rest:
+                date_str = (datetime.now() + timedelta(days=offset)).strftime("%Y-%m-%d")
+                break
+    if not date_str:
+        feishu_send(chat_id, "❓ 没看懂日期。格式：「加日历 <标题> 10-03 22:00 23:00」\n"
+                             "或「加日历 <标题> 今天 19:00 20:00」")
+        return
+    # 提取时间：HH:MM（找所有 HH:MM 模式）
+    times = re.findall(r"(\d{1,2}[:：]\d{2})", rest)
+    if len(times) < 2:
+        feishu_send(chat_id, "❓ 需要开始和结束时间。格式：「加日历 <标题> 10-03 22:00 23:00」")
+        return
+    start_t = times[0].replace("：", ":")
+    end_t = times[1].replace("：", ":")
+    # 提取标题：去掉日期、时间、动词后的剩余文本
+    title_raw = rest
+    title_raw = re.sub(r"\d{1,2}[月./\-]\d{1,2}(日|号)?", "", title_raw)
+    title_raw = re.sub(r"\d{1,2}[:：]\d{2}", "", title_raw)
+    title_raw = re.sub(r"(今天|明天|后天|晚上|下午|上午|早上)", "", title_raw)
+    title_raw = title_raw.strip(" ，,。-")
+    if not title_raw:
+        feishu_send(chat_id, "❓ 没有标题。格式：「加日历 微积分测验 10-03 22:00 23:00」")
+        return
+    # 组合 datetime
+    try:
+        start_dt = datetime.strptime(f"{date_str} {start_t}", "%Y-%m-%d %H:%M")
+        end_dt = datetime.strptime(f"{date_str} {end_t}", "%Y-%m-%d %H:%M")
+    except ValueError:
+        feishu_send(chat_id, f"❌ 时间解析失败：{date_str} {start_t}~{end_t}")
+        return
+    if end_dt <= start_dt:
+        feishu_send(chat_id, "❌ 结束时间不能早于开始时间。")
+        return
+    # 创建 Outlook 事件
+    try:
+        eid = outlook_create_event(title_raw[:120], start_dt, end_dt,
+                                    body=f"管家添加：{title_raw}")
+    except Exception as e:
+        feishu_send(chat_id, f"❌ 写入 Outlook 日历失败：{e}")
+        return
+    if eid:
+        wd = ["周一", "周二", "周三", "周四", "周五", "周六", "周日"][start_dt.weekday()]
+        feishu_send_action(chat_id, "✅ 已加入日历",
+            f"📅 {title_raw[:60]}\n"
+            f"{start_dt.strftime('%m月%d日')}（{wd}）{start_t}~{end_t}\n\n"
+            "已写入 Outlook 日历，iPhone 日历会自动同步显示。", color="green")
+    else:
+        feishu_send(chat_id, "❌ Outlook 日历写入失败（API 返回空），请稍后重试。")
+
+
 def process_command(text, chat_id):
     t = text.lower().strip()
     # 请假流程（优先级高，避免「请假」被其他规则吞掉）
     if text.strip().startswith("请假") or t.startswith("请个假") or t.startswith("申请请假"):
         cmd_leave(chat_id, text)
+        return
+    # 自由格式加日历：「加日历 <标题> <日期> <开始> <结束>」
+    if t.startswith(("加日历", "添加日历", "写入日历", "标到日历", "加到日历")):
+        cmd_add_calendar(chat_id, text)
         return
     # 作业写日历：用户说"把XX作业加到日历"/"添加到日历"+作业/课程关键词
     if "日历" in text and any(kw in text for kw in ["作业", "assignment", "截止", "ddl", "MTH", "EAP", "SCI", "CCT", "PHE", "PSP", "微积分", "线代", "英语", "数学", "科学", "体育"]):
@@ -2724,6 +2794,24 @@ def gather_context(include_outlook=True):
             )
     except Exception:
         pass
+    # 注入 AMS 请假申请状态（让 AI 知道哪些申请 Pending、哪些已撤回，避免误导用户）
+    try:
+        ams_ctx = (_xjtlu_state or {}).get("ams") or {}
+        ams_token = ams_ctx.get("token", "")
+        if ams_token:
+            from datetime import datetime as _dt
+            lresp = _http(f"{AMS_URL}/xjtlu/stuapi/xjtlu-leave/getLeaveList?pageNum=1&pageSize=5",
+                          headers={"x-token": ams_token}, timeout=15)
+            if isinstance(lresp, dict) and lresp.get("code") == 0:
+                leaves = (lresp.get("data") or {}).get("leaveList") or []
+                if leaves:
+                    lines = []
+                    for lv in leaves[:5]:
+                        st_name = lv.get("statusName", "?")
+                        lines.append(f"- {lv.get('leaveOdd', '?')} {lv.get('startDate', '?')}~{lv.get('endDate', '?')} [{st_name}]")
+                    ctx_parts.append("AMS 请假申请状态（真实数据，回复时据此判断）：\n" + "\n".join(lines))
+    except Exception:
+        pass
     return "\n\n".join(ctx_parts) if ctx_parts else "当前没有待确认活动，日历也是空的。"
 
 
@@ -2774,10 +2862,13 @@ SYSTEM_PROMPT = (
     "过期后需要用户从浏览器重新导出。如果用户说监控失效了，可能是 Cookie 过期，"
     "引导用户检查 GitHub Actions 是否正常运行，而不是说我做不到。\n\n"
     "## 关于日历/iPhone\n"
-    "管家加的日程会进 Outlook 日历。如果用户想在 iPhone 自带日历 app 里看到，"
-    "需要在 iPhone 设置 → 日历 → 账户 里添加学生的 Outlook 账户（一次性设置）。"
-    "加完后 Outlook 日历的日程会自动同步到 iPhone 自带日历。"
-    "当用户说标到手机日历上时，告诉用户：我加到 Outlook 日历里，你在 iPhone 日历设置里加一下 Outlook 账户就能看到，一次性设置。\n\n"
+    "管家可以随时往 Outlook 日历加日程——这是你真实的能力，不是「做不到」的事。\n"
+    "加日历有两种方式：\n"
+    "· 自由格式（推荐）：用户说「加日历 <标题> <日期> <开始时间> <结束时间>」，"
+    "例如「加日历 微积分测验 10-03 22:00 23:00」——系统直接写入 Outlook 日历。\n"
+    "· 作业写日历：用户说「把XX作业加到日历」——系统从 LearningMall 匹配作业后写入。\n"
+    "加完后 Outlook 日历的日程会自动同步到 iPhone 自带日历（前提是已添加 Outlook 账户，一次性设置）。\n"
+    "当用户要求加日历时，直接引导 TA 发「加日历」命令，不要说「我这边没法自己写进去」——那是假的。\n\n"
     "## 命令列表\n"
     "你可以执行以下操作，在回复末尾加 [ACTION:xxx] 标记：\n"
     "- 查看待确认列表：[ACTION:列表]\n"
@@ -2792,7 +2883,8 @@ SYSTEM_PROMPT = (
     "- 删除第N个：[ACTION:删除N]\n"
     "- 删除全部：[ACTION:删除全部]\n"
     "- 查看帮助：[ACTION:帮助]\n"
-    "签到/出勤/请假是固定命令（不走 LLM），用户直接发「签到 码」「出勤」「请假 日期 原因」即可。\n\n"
+    "签到/出勤/请假是固定命令（不走 LLM），用户直接发「签到 码」「出勤」「请假 日期 原因」即可。\n"
+    "加日历也是固定命令：「加日历 <标题> <日期> <开始> <结束>」直接写入 Outlook。\n\n"
     "## 规则\n"
     "1. 理解用户意图后加对应的 [ACTION:xxx] 标记，系统自动执行\n"
     "2. 回复正文用自然语言说明你要做什么，不要说「你可以用xxx指令」\n"
@@ -2813,11 +2905,21 @@ SYSTEM_PROMPT = (
     "（独立成段、前后空行、箭头提示、【】框住，禁止混在聊天长文里）：\n"
     "· 请假 →\n\n⬇️ 直接复制这条发送：\n【请假 10-05 10-14 崴脚了】\n\n"
     "· 撤回 →\n\n⬇️ 全部撤回：\n【撤回请假】\n⬇️ 只撤某天：\n【撤回请假 10-11】\n\n"
+    "· 加日历 →\n\n⬇️ 直接复制这条发送：\n【加日历 标题 日期 开始时间 结束时间】\n"
+    "例：【加日历 微积分测验 10-03 22:00 23:00】\n\n"
     "· 上传证明 → 走请假流程收到预览后把照片直接发群里\n"
     "示例——用户说「帮我撤回11号的假」，你的回复格式：\n"
     "「好的，撤回我帮你走流程。⬇️ 直接复制这条发送：\n【撤回请假 10-11】」\n"
     "除以上格式外，任何「我帮你直接做」的说法都是欺骗，禁止。"
-    "12. 不确定系统某功能是否可用时，如实说「我确认一下」，不要编造「通道/入口/收不到」等解释。"
+    "12. 不确定系统某功能是否可用时，如实说「我确认一下」，不要编造「通道/入口/收不到」等解释。\n"
+    "13. 加日历是你能做的——不要说「我这边没法自己写进去」「得由你发指令触发」。"
+    "用户要加日历时，直接引导发「加日历」命令格式即可。\n"
+    "14. 不要反复追问同一件事。用户说了「不用了」「已经解决了」就立刻翻篇，"
+    "不再提那件事，不再「记一下」「帮你标注」。一次提醒到位，不重复。\n"
+    "15. 撤回请假前看上下文里的 AMS 申请状态：如果该日期的课节已经撤回（Canceled/Completed），"
+    "告诉用户「这条已经撤回了，不用再操作」，不要让用户重复发指令。\n"
+    "16. 不要自作主张汇报「已加日历」「已写入」——加日历是固定命令，只有用户发了命令系统才有结果。"
+    "你只能引导格式，不能替代执行。\n"
 )
 
 
