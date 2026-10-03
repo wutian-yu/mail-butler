@@ -2028,8 +2028,24 @@ def run_room_op(op_json):
             context = browser.new_context(**iphone, locale="zh-CN")
             page = context.new_page()
             logged_in = cookie_login(context, page)
+            # cookie_login 因网络抖动失败 ≠ Cookie 无效：selfcare 页 = TGC 有效
+            if not logged_in:
+                try:
+                    if "selfcare" in page.url:
+                        log("✅ 检测到 selfcare 页，uim Cookie 实际有效（eBridge 超时属网络抖动）")
+                        logged_in = True
+                except Exception:
+                    pass
             if not logged_in and XJTLU_USERNAME and XJTLU_PASSWORD:
                 logged_in = sso_login(page)
+                # sso_login 也可能在已登录状态找不到表单 → 再查一次 selfcare
+                if not logged_in:
+                    try:
+                        if "selfcare" in page.url:
+                            log("✅ 账密登录后停在 selfcare，视为已登录")
+                            logged_in = True
+                    except Exception:
+                        pass
             if not logged_in:
                 feishu_send("❌ 房间操作失败：西浦账号登录未成功，请稍后重试。")
                 return
