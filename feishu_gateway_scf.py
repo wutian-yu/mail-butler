@@ -146,7 +146,8 @@ def feishu_send_action(chat_id, title, content, color="green"):
 
 # ============ GitHub API (读写状态文件) ============
 def gh_read_json(path):
-    """读取私有数据仓库中的 JSON 文件，返回 (data, sha)；失败重试1次"""
+    """读取私有数据仓库中的 JSON 文件，返回 (data, sha)；失败重试1次；
+    404（文件不存在）不重试——那是确定状态，重试只会白白多等几秒"""
     url = f"https://api.github.com/repos/{DATA_REPO}/contents/{urllib.parse.quote(path, safe='/')}"
     last_err = None
     for attempt in range(2):
@@ -156,6 +157,8 @@ def gh_read_json(path):
             content = base64.b64decode(resp["content"]).decode("utf-8")
             return json.loads(content), resp.get("sha", "")
         except Exception as e:
+            if getattr(e, "code", None) == 404:
+                raise
             last_err = e
             log(f"GitHub读取失败(第{attempt+1}次): {e}")
             if attempt == 0:
@@ -336,10 +339,10 @@ HELP_TEXT = (
     "🏫 AMS 考勤\n"
     "「签到 码」远程签到（72小时内可补）\n"
     "「出勤」出勤率统计\n"
-    "「请假 日期 原因」申请准假\n"
+    "「请假 日期 [结束日期] 原因」申请准假（支持范围：「请假 10-05 10-14 崴脚」）\n"
     "「改假条 新原因」修改假条正文\n"
     "「取消请假」放弃进行中假条\n"
-    "「撤回请假」撤回已提交申请\n\n"
+    "「撤回请假 [日期]」撤回待审批申请（「撤回请假」全撤；「撤回请假 10-11」只撤那天）\n\n"
     "🏛️ 图书馆研讨室\n"
     "「查房 [日期] [楼层]」查空闲房间\n"
     "「订房 房间号 日期 时段」预定（自动带同伴）\n"
@@ -1057,7 +1060,9 @@ def _save_leave_pending(data):
 def parse_leave_date(text, now=None):
     """解析请假日期：10-05 / 10月5日 / 2026-10-05 / 明天 / 后天 / 今天 / 周一~周日"""
     now = now or datetime.now()
-    t = text.replace("年", "-").replace("月", "-").replace("日", "")
+    # 规范化：去掉日期数字与分隔符之间的空格（「10 月 11」→「10月11」）
+    t = re.sub(r"(\d)\s*([-月.])\s*(\d)", r"\1\2\3", str(text or ""))
+    t = t.replace("年", "-").replace("月", "-").replace("日", "")
     # 明确日期：MM-DD 或 YYYY-MM-DD
     m = re.search(r"(?<!\d)(\d{4})-(\d{1,2})-(\d{1,2})(?!\d)", t)
     if m:
@@ -1106,9 +1111,45 @@ def _guess_leave_type(text):
     return "Unforeseen/unpreventable event"
 
 
+def _translate_reason_en(text):
+    """把中文请假原因翻译成一句正式英文（用于 AMS 假条正文）；失败返回 None"""
+    if not any('\u4e00' <= ch <= '\u9fff' for ch in text):
+        return text.strip()  # 已是英文
+    if not DEEPSEEK_API_KEY:
+        return None
+    try:
+        resp = _http("https://api.deepseek.com/v1/chat/completions",
+                     method="POST",
+                     headers={"Authorization": f"Bearer {DEEPSEEK_API_KEY}"},
+                     data={"model": "deepseek-chat",
+                           "messages": [
+                               {"role": "system",
+                                "content": "You are a translator. Translate the student's "
+                                           "leave-of-absence reason into ONE formal English "
+                                           "sentence in the first person (starting with 'I ...'). "
+                                           "Output ONLY the English sentence - no Chinese, "
+                                           "no quotes, no markdown, no explanations."},
+                               {"role": "user", "content": text}],
+                           "max_tokens": 160, "temperature": 0.3},
+                     timeout=15)
+        out = (((resp.get("choices") or [{}])[0].get("message") or {}).get("content", "") or "").strip()
+        out = out.strip('"').strip("'").strip()
+        if out and not any('\u4e00' <= ch <= '\u9fff' for ch in out):
+            return out
+        return None
+    except Exception as e:
+        log(f"原因翻译失败: {e}")
+        return None
+
+
 def _format_leave_reason(user_reason, leave_type):
     """把口语原因整理成正式、真诚的英文 Reason（学生口吻，给 DA 和老师看）"""
     detail = user_reason.strip().rstrip("。.").strip()
+    # 原因含中文时先翻译成正式英文，保证假条正文纯英文（不再出现中英混合）
+    if any('\u4e00' <= ch <= '\u9fff' for ch in detail):
+        en = _translate_reason_en(detail)
+        if en:
+            detail = en.rstrip(".")
     if leave_type == "Illness or injury":
         return (f"I am unable to attend the selected session(s) due to a medical condition: {detail}. "
                 f"I have sought medical advice where necessary, and the medical certificate is attached "
@@ -1165,7 +1206,7 @@ def cmd_leave(chat_id, text):
     """
     rest = re.sub(r"^(?:请假|请个假|申请请假|authorized absence|leave)", "", text.strip(), flags=re.I).strip()
     if not rest:
-        feishu_send(chat_id, "🏫 AMS 请假用法：\n\n「请假 10-05 崴脚了去不了学校」\n「请假 明天 EAP043 病了」\n\n"
+        feishu_send(chat_id, "🏫 AMS 请假用法：\n\n⬇️ 直接复制发送：\n【请假 10-05 崴脚了去不了学校】\n\n⬇️ 或日期范围：\n【请假 10-05 10-14 崴脚了】\n\n"
                              "流程：我先写好假条给你确认 → 你发病假条照片 → 自动提交到 AMS 等 DA 审批。\n"
                              "规则：缺课日前后 7 天内可申请；每门课最多准假 30% 课时；证明材料必传。")
         return
@@ -1177,14 +1218,25 @@ def cmd_leave(chat_id, text):
                              + ("⏳ 已触发监控立刻刷新（约 2~4 分钟），稍后重说一遍「请假 日期 原因」即可。" if triggered
                                 else "监控每 30 分钟自动刷新一次，稍后再试；若持续失败请检查监控 Actions。"))
         return
-    # 1. 解析日期
-    date = parse_leave_date(rest)
+    # 1. 解析日期（支持范围：「请假 10-05 10-14 原因」「请假 10月5日到10月14日 原因」）
+    end_date = None
+    m_range = re.search(r"((?:\d{1,2}[-月.]\d{1,2}日?|今天|明天|后天)(?:\s*(?:到|至|~|—)\s*|\s+)(\d{1,2}[-月.]\d{1,2}日?|今天|明天|后天))", rest)
+    if m_range:
+        date = parse_leave_date(m_range.group(1))
+        end_date = parse_leave_date(m_range.group(2))
+        if date and end_date and end_date < date:
+            date, end_date = end_date, date
+    else:
+        date = parse_leave_date(rest)
     if not date:
-        feishu_send(chat_id, "❓ 没看懂日期，试试「请假 10-05」或「请假 明天」+ 原因。")
+        feishu_send(chat_id, "❓ 没看懂日期，试试「请假 10-05」或「请假 10-05 10-14」+ 原因。")
         return
+    if not end_date:
+        end_date = date
     d = datetime.strptime(date, "%Y-%m-%d")
-    if abs((d - datetime.now()).days) > 7:
-        feishu_send(chat_id, f"⚠️ {date} 超出申请窗口（缺课日前后 7 天内），AMS 不接受。")
+    d2 = datetime.strptime(end_date, "%Y-%m-%d")
+    if abs((d - datetime.now()).days) > 7 or (d2 - d).days > 14:
+        feishu_send(chat_id, f"⚠️ {date}~{end_date} 超出申请窗口（缺课日前后 7 天内，单次最长 14 天），AMS 不接受。")
         return
     # 2. 解析课程过滤（可选）：EAP043 / 体育 / 微积分...
     course_filter = None
@@ -1201,14 +1253,14 @@ def cmd_leave(chat_id, text):
     # 3. 原因 = 去掉日期和课程码后的文本
     reason_raw = re.sub(r"\b([A-Z]{3}\d{3})\b", "", rest, flags=re.I).strip()
     reason_raw = re.sub(r"\d{1,2}[-月.]\d{1,2}(日|号)?", "", reason_raw).strip()
-    reason_raw = re.sub(r"(明天|后天|今天|周[一二三四五六日天]|星期[一二三四五六日天])", "", reason_raw).strip(" ，,.-")
+    reason_raw = re.sub(r"(明天|后天|今天|周[一二三四五六日天]|星期[一二三四五六日天])", "", reason_raw).strip(" ，,.-到至~")
     if not reason_raw:
         feishu_send(chat_id, "❓ 请补充请假原因，例如「请假 10-05 崴脚了腿瘸了去不了学校」。")
         return
-    # 4. 查当天课节
+    # 4. 查范围内课节（AMS 支持起止日期，返回 dateList 多天）
     try:
         resp = _http(f"{AMS_URL}/xjtlu/stuapi/xjtlu-leave/getLeaveModuleListByDate"
-                     f"?startDate={date}&endDate={date}", headers={"x-token": token}, timeout=15)
+                     f"?startDate={date}&endDate={end_date}", headers={"x-token": token}, timeout=15)
     except Exception as e:
         feishu_send(chat_id, f"❌ 查询课节失败：{e}")
         return
@@ -1224,20 +1276,32 @@ def cmd_leave(chat_id, text):
         return
     data = resp["data"]
     all_sessions = []
+    sess_days = []   # 与 all_sessions 平行：每节课所属日期（用于按天分组预览）
     for day in (data.get("dateList") or []):
+        day_date = None
+        for _k in ("date", "leaveDate", "day", "moduleDate"):
+            _m = re.search(r"\d{4}-\d{2}-\d{2}", str(day.get(_k) or ""))
+            if _m:
+                day_date = _m.group(0)
+                break
         for s in (day.get("leaveModuleList") or []):
             if course_filter and s.get("moduleCode") != course_filter:
                 continue
+            if not day_date:
+                _m = re.search(r"\d{4}-\d{2}-\d{2}", str(s.get("time") or ""))
+                if _m:
+                    day_date = _m.group(0)
             all_sessions.append(s)
+            sess_days.append(day_date)
     if not all_sessions:
-        feishu_send(chat_id, f"📭 {date} 没有{(' ' + course_filter) if course_filter else ''}的课节。")
+        feishu_send(chat_id, f"📭 {date}~{end_date} 没有{(' ' + course_filter) if course_filter else ''}的课节。")
         return
     leave_type = _guess_leave_type(text)
     leave_reason = _format_leave_reason(reason_raw, leave_type)
     # 5. 暂存待提交申请
     pending = {
         "status": "awaiting_attachment",
-        "startDate": date, "endDate": date,
+        "startDate": date, "endDate": end_date,
         "leaveType": leave_type, "leaveReason": leave_reason,
         "leaveModuleList": all_sessions,
         "course_filter": course_filter,
@@ -1245,12 +1309,40 @@ def cmd_leave(chat_id, text):
         "created_ts": time.time(),
     }
     _save_leave_pending(pending)
-    # 6. 预览
+    # 6. 预览（多天范围：按天分组紧凑显示，避免逐节罗列过长；单日保持详细格式）
     wd = ["周一", "周二", "周三", "周四", "周五", "周六", "周日"][d.weekday()]
-    lines = [f"📝 假条已写好，请确认（{date} {wd}）\n\n**要请假的课节：**"]
-    for s in all_sessions:
-        quota = f"，该课已准假 {s.get('leaveCount', 0)}/{s.get('totalCount', 0)} 课时" if s.get("totalCount") else ""
-        lines.append(f"· {s.get('moduleCode')} {s.get('moduleTitle', '')[:36]}\n  {s.get('time', '')} · {s.get('moduleTypeGroup', '')}{quota}")
+    wd2 = ["周一", "周二", "周三", "周四", "周五", "周六", "周日"][d2.weekday()]
+    date_disp = f"{date} ~ {end_date}（{wd} ~ {wd2}）" if end_date != date else f"{date}（{wd}）"
+    if end_date != date and sess_days and all(sess_days):
+        by_day = {}
+        for _s, _dd in zip(all_sessions, sess_days):
+            by_day.setdefault(_dd or date, []).append(_s)
+        lines = [f"📝 假条已写好，请确认（{date_disp}）\n\n"
+                 f"**要请假的课节（共 {len(all_sessions)} 节 · {len(by_day)} 天）：**"]
+        for _dstr in sorted(by_day.keys()):
+            try:
+                _dd = datetime.strptime(_dstr, "%Y-%m-%d")
+                _wdd = ["周一", "周二", "周三", "周四", "周五", "周六", "周日"][_dd.weekday()]
+                _dlabel = f"{_dstr[5:]}（{_wdd}）"
+            except Exception:
+                _dlabel = _dstr
+            _segs = []
+            for _s in by_day[_dstr]:
+                # 真实数据：课节有 startTime/endTime 字段；time 为 "09:00～11:00"（全角～）
+                _st, _et = _s.get("startTime"), _s.get("endTime")
+                if _st and _et:
+                    _tstr = f"{_st}-{_et}"
+                else:
+                    _t = str(_s.get("time") or "")
+                    _mt = re.search(r"(\d{1,2}:\d{2})\s*[~～\-—到]\s*(\d{1,2}:\d{2})", _t)
+                    _tstr = f"{_mt.group(1)}-{_mt.group(2)}" if _mt else _t
+                _segs.append(f"{_s.get('moduleCode')} {_tstr} {_s.get('moduleTypeGroup') or ''}".strip())
+            lines.append(f"· {_dlabel}（{len(by_day[_dstr])} 节）：" + " · ".join(_segs))
+    else:
+        lines = [f"📝 假条已写好，请确认（{date_disp}）\n\n**要请假的课节（{len(all_sessions)} 节）：**"]
+        for s in all_sessions:
+            quota = f"，该课已准假 {s.get('leaveCount', 0)}/{s.get('totalCount', 0)} 课时" if s.get("totalCount") else ""
+            lines.append(f"· {s.get('moduleCode')} {s.get('moduleTitle', '')[:36]}\n  {s.get('time', '')} · {s.get('moduleTypeGroup', '')}{quota}")
     lines.append(f"\n**类型：** {leave_type}")
     lines.append(f"**假条正文（提交到 AMS 的 Reason）：**\n{leave_reason}")
     lines.append("\n**学期准假额度剩余：** " + str(data.get("semesterLeaveRate", "?")) + "%")
@@ -1286,11 +1378,33 @@ def cmd_leave_confirm_attachment(chat_id, image_bytes, filename):
             feishu_send(chat_id, f"❌ 证明上传失败：{up.get('message', '未知错误')}")
             return True
         fd = up["data"]
+        # 关键修复（2026-10-03 实测）：AMS 课节的内部 ID 是动态的，暂存几分钟就会失效导致 addLeave 500；
+        # 提交前必须用 pending 的日期范围重新查课节，用新鲜数据组装 body
+        fresh_resp = _http(f"{AMS_URL}/xjtlu/stuapi/xjtlu-leave/getLeaveModuleListByDate"
+                           f"?startDate={pending['startDate']}&endDate={pending['endDate']}",
+                           headers={"x-token": token}, timeout=15)
+        if _ams_token_dead(fresh_resp):
+            trigger_monitor_refresh()
+            feishu_send(chat_id, "⏳ AMS 凭证刚好过期，已触发监控刷新（约 2~4 分钟）。\n\n"
+                                 "申请还暂存着，几分钟后重发这张图片即可提交。")
+            return True
+        fresh_sessions = []
+        for day in ((fresh_resp.get("data") or {}).get("dateList") or []):
+            for s in (day.get("leaveModuleList") or []):
+                if pending.get("course_filter") and s.get("moduleCode") != pending["course_filter"]:
+                    continue
+                fresh_sessions.append(s)
+        if not fresh_sessions:
+            feishu_send(chat_id, f"❌ 课节查询为空（{pending['startDate']}~{pending['endDate']}）："
+                                 f"可能已被其他申请占用或超出窗口。\n\n"
+                                 f"申请暂存已清空，请重新发「请假 日期 原因」。")
+            _save_leave_pending({})
+            return True
         body = {
             "startDate": pending["startDate"], "endDate": pending["endDate"],
             "leaveType": pending["leaveType"], "leaveReason": pending["leaveReason"],
             "fileName": fd.get("originalFileName", filename), "fileUrl": fd.get("fileUrl", ""),
-            "leaveModuleList": pending["leaveModuleList"],
+            "leaveModuleList": fresh_sessions,
         }
         resp = _http(f"{AMS_URL}/xjtlu/stuapi/xjtlu-leave/addLeave", method="POST",
                      headers={"x-token": token, "Content-Type": "application/json"},
@@ -1305,9 +1419,9 @@ def cmd_leave_confirm_attachment(chat_id, image_bytes, filename):
         return True
     if isinstance(resp, dict) and resp.get("code") == 0:
         _save_leave_pending({})
-        n = len(pending["leaveModuleList"])
+        n = len(fresh_sessions)
         feishu_send_action(chat_id, "✅ 请假申请已提交",
-                           f"{pending['startDate']} · {n} 节课 · {pending['leaveType']}\n\n"
+                           f"{pending['startDate']}{'~' + pending['endDate'] if pending['endDate'] != pending['startDate'] else ''} · {n} 节课 · {pending['leaveType']}\n\n"
                            "已提交到 AMS，等你的 DA 审批。通过后课节状态变为「已准假」，不影响出勤率。\n"
                            "审批结果管家监控到变化会提醒你。", color="green")
     else:
@@ -1327,39 +1441,237 @@ def cmd_leave_cancel(chat_id):
         feishu_send(chat_id, "📭 当前没有进行中的请假申请。")
 
 
-def cmd_leave_revoke(chat_id):
-    """撤回最近一次请假申请（DA 审批前可自助撤回，误触/改主意的救命勢）"""
+def _revoke_actually_done(leave_odd, date_arg):
+    """验证撤回是否真正生效（AMS 受理≠生效）：
+    全撤=该申请已无 Pending 课节；按天撤=该日期课节全部 Canceled(status==4)"""
+    ams, _, _ = _ams_state()
+    token = ams.get("token", "")
+    if not token:
+        return False
+    try:
+        resp = _http(f"{AMS_URL}/xjtlu/stuapi/xjtlu-leave/getLeaveList?pageNum=1&pageSize=10",
+                     headers={"x-token": token}, timeout=15)
+        rows = (resp.get("data") or {}).get("leaveList") or []
+        app = next((r for r in rows if r.get("leaveOdd") == leave_odd), None)
+        if not app:
+            return True  # 申请已不在列表（极端情况视为生效）
+        det = _http(f"{AMS_URL}/xjtlu/stuapi/xjtlu-leave/detail/{app.get('leaveId')}",
+                    headers={"x-token": token}, timeout=15)
+        mlist = (det.get("data") or {}).get("moduleList") or []
+        if not mlist:
+            return True
+        if not date_arg:
+            return all(m.get("status") != 2 for m in mlist)
+        day_mods = [m for m in mlist if date_arg in str(m.get("time") or "")]
+        return bool(day_mods) and all(m.get("status") == 4 for m in day_mods)
+    except Exception:
+        return False
+
+
+def cmd_leave_revoke(chat_id, arg=""):
+    """撤回请假（2026-10-03 实测破译：AMS 撤回是【课节级】，参数为 leaveModuleId，动态需现拉现用）
+    用法：「撤回请假」= 撤最近一条待审批申请的全部课节；「撤回 10-11」= 只撤该日期的课节
+    流程：getLeaveList 拿最新 leaveId → detail 拿课节列表 → cancelLeave/{leaveModuleId} 逐节撤
+    反馈两段式（用户实测要求）：发起→「正在处理中」→ 验证 AMS 真正生效→ 才发「已撤回」；
+    30 秒内未生效则挂起，由轮询兜底验证后再通知，绝不提前宣称完成。"""
     ams, _, _ = _ams_state()
     token = ams.get("token", "")
     if not token:
         feishu_send(chat_id, "❌ 暂无 AMS 凭证，无法撤回。")
         return
+    date_arg = None
+    # 规范化日期内空格（「10 月 11」→「10月11」），否则提取不到导致误撤全部
+    arg_norm = re.sub(r"(\d)\s*([-月.])\s*(\d)", r"\1\2\3", arg)
+    m = re.search(r"(\d{1,2}[-月.]\d{1,2})", arg_norm)
+    if m:
+        date_arg = parse_leave_date(m.group(1))
     try:
         resp = _http(f"{AMS_URL}/xjtlu/stuapi/xjtlu-leave/getLeaveList?pageNum=1&pageSize=5",
                      headers={"x-token": token}, timeout=15)
-        rows = (resp.get("data") or {}).get("list") or [] if isinstance(resp, dict) else []
-        if not rows:
-            feishu_send(chat_id, "📭 没有找到任何请假申请。")
-            return
-        latest = rows[0]
-        leave_odd = latest.get("leaveOdd") or latest.get("id")
-        status = latest.get("status", "")
-        # 撤回最新一条（用 leaveOdd 或 id）
-        cancel = _http(f"{AMS_URL}/xjtlu/stuapi/xjtlu-leave/cancelLeave/{leave_odd}",
-                       headers={"x-token": token}, timeout=15)
-        # M5 修复：撤回也检查 token 失效
-        if _ams_token_dead(cancel):
+        if _ams_token_dead(resp):
             trigger_monitor_refresh()
             feishu_send(chat_id, "⏳ AMS 凭证过期，已触发刷新（约2~4分钟），稍后重试撤回。")
             return
-        if isinstance(cancel, dict) and cancel.get("code") == 0:
-            feishu_send_action(chat_id, "✅ 请假申请已撤回",
-                f"{latest.get('startTime', '')} 的申请已从 AMS 撤回（原状态：{status}）。", color="green")
+        rows = (resp.get("data") or {}).get("leaveList") or []
+        pending_apps = [r for r in rows if r.get("status") == 1]
+        if not pending_apps:
+            feishu_send(chat_id, "📭 没有待审批（Pending）的请假申请可撤回。\n\n"
+                                 "注：AMS 只能撤「待审批」状态；已办结/已批准的记录是历史，无法删除。")
+            return
+        app = pending_apps[0]
+        det = _http(f"{AMS_URL}/xjtlu/stuapi/xjtlu-leave/detail/{app.get('leaveId')}",
+                    headers={"x-token": token}, timeout=15)
+        mlist = (det.get("data") or {}).get("moduleList") or []
+        # 课节 status==2 为 Pending 可撤；==4 为 Canceled
+        targets = [mo for mo in mlist
+                   if mo.get("status") == 2
+                   and (not date_arg or date_arg in str(mo.get("time") or ""))]
+        if not targets:
+            feishu_send(chat_id, f"📭 申请（{app.get('startDate')}~{app.get('endDate')}）里没有"
+                                 f"{(' ' + date_arg) if date_arg else ''} 待审批的课节可撤。")
+            return
+        ok = 0
+        for mo in targets:
+            try:
+                c = _http(f"{AMS_URL}/xjtlu/stuapi/xjtlu-leave/cancelLeave/{mo.get('leaveModuleId')}",
+                          headers={"x-token": token}, timeout=15)
+                if isinstance(c, dict) and c.get("code") == 0:
+                    ok += 1
+                time.sleep(0.3)
+            except Exception:
+                pass
+        if ok == 0:
+            feishu_send(chat_id, "❌ 撤回指令全部被 AMS 拒绝，请稍后重试或联系管理员。")
+            return
+        # 第 1 段：立即告知"正在处理中"（不宣称完成）
+        scope = date_arg or "全部"
+        feishu_send(chat_id, f"⏳ 正在处理中：撤回 {scope} 课节的指令已提交 AMS（{ok}/{len(targets)} 节受理）。\n"
+                             f"正在确认 AMS 真正生效，确认后立刻通知你，一般几秒到几分钟。")
+        # 第 2 段：同步验证循环（最多约 30 秒）
+        odd = app.get("leaveOdd")
+        done = False
+        for _ in range(10):
+            time.sleep(3)
+            if _revoke_actually_done(odd, date_arg):
+                done = True
+                break
+        if done:
+            _mark_leave_status(odd, 2)   # 同步快照，防审批监控误报
+            feishu_send_action(chat_id, "✅ 请假已撤回（已验证生效）",
+                f"申请 {odd}（{app.get('startDate')}~{app.get('endDate')}）\n"
+                f"{scope} 课节 {len(targets)} 节已在 AMS 真正撤销（状态：已办结/Cancelled）。\n\n"
+                f"注：撤回记录保留作历史，不会再生效或占额度。", color="green")
         else:
-            msg = (cancel or {}).get("message", "未知错误") if isinstance(cancel, dict) else str(cancel)
-            feishu_send(chat_id, f"❌ 撤回失败：{msg}\n\n如果申请已在审批中，可能需在 AMS 网页或联系 DA 处理。")
+            # 30 秒未生效：挂起，轮询兜底验证后再发完成通知
+            try:
+                gh_write_json("revoke_check.json",
+                              {"odd": odd, "date": date_arg, "n": len(targets), "ts": time.time()},
+                              "", "revoke pending confirm")
+            except Exception:
+                pass
+            feishu_send(chat_id, f"⏳ AMS 还在处理撤回（{scope} {len(targets)} 节），已受理但尚未生效。\n"
+                                 f"生效后我会立刻通知你，无需再发指令。")
     except Exception as e:
         feishu_send(chat_id, f"❌ 撤回异常：{e}")
+
+
+def _check_pending_revoke(chat_id):
+    """轮询兜底：验证之前挂起的撤回是否真正生效，生效则发完成通知"""
+    try:
+        rc, sha = gh_read_json("revoke_check.json")
+        if not (isinstance(rc, dict) and rc.get("odd")):
+            return
+        if _revoke_actually_done(rc.get("odd"), rc.get("date")):
+            _mark_leave_status(rc.get("odd"), 2)   # 同步快照，防审批监控误报
+            gh_write_json("revoke_check.json", {}, sha, "revoke done")
+            scope = rc.get("date") or "全部"
+            feishu_send_action(chat_id, "✅ 请假已撤回（已验证生效）",
+                f"AMS 已处理完成：{scope} 课节 {rc.get('n', '?')} 节真正撤销生效。\n"
+                f"撤回记录保留作历史，不会再生效。", color="green")
+    except urllib.error.HTTPError as e:
+        if getattr(e, "code", None) != 404:
+            pass  # 404=无挂起撤回，静默
+    except Exception:
+        pass
+
+
+def _mark_leave_status(odd, status):
+    """把申请状态写入 leave_status.json 快照（撤回验证完成时调用），
+    避免审批监控把「自己撤回」误报成「审批结果」"""
+    try:
+        snap, sha = {}, ""
+        try:
+            snap, sha = gh_read_json("leave_status.json")
+        except Exception as e:
+            if getattr(e, "code", None) != 404:
+                return
+        if not isinstance(snap, dict):
+            snap = {}
+        apps = snap.get("apps") or {}
+        apps[str(odd)] = status
+        gh_write_json("leave_status.json", {"apps": apps}, sha, "mark leave status")
+    except Exception:
+        pass
+
+
+def _check_leave_approval(chat_id):
+    """轮询：监控 AMS 请假审批结果（兑现提交成功卡片里「审批结果会提醒」的承诺）
+    快照对比 leave_status.json（odd→status）：status 从 1（待审批）变为其他值 →
+    调 detail 拿审批细节（statusName/通过数/审批意见）发提醒卡片。
+    新申请入库只记快照不提醒（提交成功卡片已通知过）；
+    撤回造成的 1→2 由 _mark_leave_status 同步快照 + revoke_check 排除双重防误报。"""
+    ams, _, _ = _ams_state()
+    token = ams.get("token", "")
+    if not token:
+        return
+    snap, sha = {}, ""
+    try:
+        snap, sha = gh_read_json("leave_status.json")
+        if not isinstance(snap, dict):
+            snap = {}
+    except Exception as e:
+        if getattr(e, "code", None) != 404:
+            return  # 网络/限流等异常：下轮再查，不写快照
+    known = snap.get("apps") or {}
+    try:
+        resp = _http(f"{AMS_URL}/xjtlu/stuapi/xjtlu-leave/getLeaveList?pageNum=1&pageSize=20",
+                     headers={"x-token": token}, timeout=15)
+        if _ams_token_dead(resp) or not isinstance(resp, dict) or resp.get("code") != 0:
+            return  # 凭证过期由监控 Actions 定期刷新，静默下轮再查
+        rows = (resp.get("data") or {}).get("leaveList") or []
+    except Exception:
+        return
+    # 排除正在撤回验证中的申请（避免把撤回误报为审批结果）
+    pending_odd = ""
+    try:
+        rc, _ = gh_read_json("revoke_check.json")
+        pending_odd = str((rc or {}).get("odd") or "")
+    except Exception:
+        pass
+    dirty, notices = False, []
+    for r in rows:
+        odd = str(r.get("leaveOdd") or "")
+        st = r.get("status")
+        if not odd or st is None:
+            continue
+        old = known.get(odd)
+        if old == st:
+            continue
+        if old is None:
+            known[odd] = st   # 新申请入库：只记快照不提醒
+            dirty = True
+            continue
+        if old == 1 and st != 1 and odd != pending_odd:
+            notices.append(r)
+        known[odd] = st
+        dirty = True
+    if dirty:
+        try:
+            gh_write_json("leave_status.json", {"apps": known}, sha, "leave status snapshot")
+        except Exception:
+            pass  # 写失败下轮重对比；重复提醒的风险远低于漏提醒
+    for r in notices:
+        odd = r.get("leaveOdd")
+        try:
+            det = _http(f"{AMS_URL}/xjtlu/stuapi/xjtlu-leave/detail/{r.get('leaveId')}",
+                        headers={"x-token": token}, timeout=15)
+            dd = det.get("data") or {}
+        except Exception:
+            dd = {}
+        sname = r.get("statusName") or dd.get("statusName") or f"status {r.get('status')}"
+        bits = []
+        pc, uc = dd.get("passCount"), dd.get("unPassCount")
+        if pc is not None or uc is not None:
+            bits.append(f"通过 {pc if pc is not None else 0} 节 / 未通过 {uc if uc is not None else 0} 节")
+        ex = str(dd.get("explainContent") or "").strip()
+        if ex:
+            bits.append(f"审批意见：{ex}")
+        body = (f"申请 {odd}（{r.get('startDate')}~{r.get('endDate')} · {r.get('leaveType')}）\n"
+                f"状态变化：待审批 → {sname}")
+        if bits:
+            body += "\n" + "\n".join(bits)
+        body += "\n\n到 ams.xjtlu.edu.cn → Leave 可查看完整记录。"
+        feishu_send_action(chat_id, f"📬 请假审批有结果（{sname}）", body, color="blue")
 
 
 # ============ 图书馆房间预定系统（Information Commons） ============
@@ -1954,8 +2266,14 @@ def process_command(text, chat_id):
     if t in ("取消请假", "取消申请", "放弃请假"):
         cmd_leave_cancel(chat_id)
         return
-    if t in ("撤回请假", "撤销请假", "撤回申请"):
-        cmd_leave_revoke(chat_id)
+    # 撤回请假：放宽匹配——"撤回/撤销"开头 + 含请假语义或日期均可
+    # （覆盖自然表达：「撤回 10月11号的请假」「撤回10-11」「撤销昨天请的假」等，避免落到 AI 聊天被假执行）
+    if t.startswith(("撤回请假", "撤销请假", "撤回申请", "撤销申请")):
+        cmd_leave_revoke(chat_id, text)
+        return
+    if t.startswith(("撤回", "撤销")) and any(k in t for k in ["假", "申请"]) or \
+       (t.startswith(("撤回", "撤销")) and re.search(r"\d{1,2}[-月.]\d{1,2}", t)):
+        cmd_leave_revoke(chat_id, text)
         return
     # 删日历：列出/删第N个/删所有作业
     if t.startswith("删日历") or t.startswith("删除日历"):
@@ -2398,9 +2716,17 @@ def gather_context(include_outlook=True):
 
 
 SYSTEM_PROMPT = (
-    "你是「AI邮件管家」，一个贴心、智能的私人助理。"
-    "用户是西交利物浦大学大一学生，名叫吴冠呈。"
-    "你的风格：友善、简洁、有温度，像朋友一样聊天，不要太官方。\n\n"
+    "你是「AI邮件管家」，吴冠呈（西交利物浦大学大一学生）的私人管家。"
+    "你背后有一套真实运行中的自动化系统，负责他的邮件、日历、作业、考勤、请假、研讨室预定。"
+    "你的风格——像一位真正的管家：**沉稳、简练、可靠、有分寸**。"
+    "话不多，但每句都在点上；办事让人放心，汇报并井有条。\n\n"
+    "## 管家风度（严格遵守）\n"
+    "· 称呼用户「冠呈」，语气自然亲切但不油滑\n"
+    "· 少用 emoji：每条回复最多 1 个，只在关键节点（提醒/成功/道歉）用；不用「哈哈」「嘻嘻」等语气词\n"
+    "· 结果先行：汇报习惯是「已办妥 / 正在办 / 需要你做一件事」开头，再说细节\n"
+    "· 犯错处理：道歉一次就够，立即转向解决方案，不反复自责、不谄媚讨好\n"
+    "· 简洁克制：正文 2-3 句话，信息密度优先；细节用列表，不用大段文字\n"
+    "· 该提醒的事主动提醒（截止、审批、额度），但不刷屏\n\n"
     "## 你背后有一套真实的自动化系统\n"
     "你不是一个只会聊天的 AI——你背后有 GitHub Actions + Playwright 浏览器自动化，"
     "每 30 分钟自动登录西浦系统（eBridge、LearningMall、AMS 考勤系统），抓取最新数据。\n"
@@ -2459,8 +2785,8 @@ SYSTEM_PROMPT = (
     "1. 理解用户意图后加对应的 [ACTION:xxx] 标记，系统自动执行\n"
     "2. 回复正文用自然语言说明你要做什么，不要说「你可以用xxx指令」\n"
     "3. 闲聊/问问题不需要 [ACTION] 标记\n"
-    "4. 回复正文控制在 2-3 句话，简洁有温度\n"
-    "5. 用中文回复，可以用少量 emoji\n"
+    "4. 回复正文控制在 2-3 句话，信息密度优先，细节用列表\n"
+    "5. 用中文回复；emoji 每条最多 1 个（见「管家风度」）\n"
     "6. 不要过度谦虚说我做不到——先想想系统是否已经能做到，不确定时说我帮你查一下\n"
     "7. 能用工具就优先用工具（房间查询/预定/取消、作业、出勤、日历），工具结果才是真实数据\n"
     "8. 只有用户明确表达要预定/取消时才调用订房/取消工具，不要擅自预定\n"
@@ -2468,6 +2794,18 @@ SYSTEM_PROMPT = (
     "绝对不使用中文占位符（如 [受伤日期]、[课程名]）——缺具体信息时先向用户询问，"
     "或用通顺的英文通用措辞（如 the date of the injury）表达。"
     "10. 对中文以外的回复：若正文是给老师/官方的正式英文信，整篇必须是纯英文，不可混入中文。"
+    "11. 绝不虚构已执行的操作：只有工具真实返回成功，才可以说「已提交/已上传/已撤回」；"
+    "没实际执行就不得声称「开始了/正在做/已经做完」（「这就帮你撤回」「开始处理」都不行）。"
+    "你（聊天）本身不能执行任何系统操作——请假提交、撤回、上传证明全部是命令流程完成的。"
+    "用户表达这些意图时，你只能引导 TA 发准确命令，且命令必须用以下**显眼格式**输出"
+    "（独立成段、前后空行、箭头提示、【】框住，禁止混在聊天长文里）：\n"
+    "· 请假 →\n\n⬇️ 直接复制这条发送：\n【请假 10-05 10-14 崴脚了】\n\n"
+    "· 撤回 →\n\n⬇️ 全部撤回：\n【撤回请假】\n⬇️ 只撤某天：\n【撤回请假 10-11】\n\n"
+    "· 上传证明 → 走请假流程收到预览后把照片直接发群里\n"
+    "示例——用户说「帮我撤回11号的假」，你的回复格式：\n"
+    "「好的，撤回我帮你走流程。⬇️ 直接复制这条发送：\n【撤回请假 10-11】」\n"
+    "除以上格式外，任何「我帮你直接做」的说法都是欺骗，禁止。"
+    "12. 不确定系统某功能是否可用时，如实说「我确认一下」，不要编造「通道/入口/收不到」等解释。"
 )
 
 
@@ -2882,13 +3220,39 @@ def _save_poll_state(processed_ids, last_msg_id):
         except Exception:
             pass
 
+_LAST_IMAGE_HINT = {"ts": 0}
+
+
+def _maybe_notify_no_pending_image(chat_id):
+    """收到图片但无进行中请假申请时的提示：每张必回，避免用户误以为图片未被识别；
+    5分钟内的后续图只回一行简短版，避免长文刷屏"""
+    try:
+        now = time.time()
+        if now - _LAST_IMAGE_HINT.get("ts", 0) < 300:
+            msg = "📷 图片已收到（当前无进行中的请假申请）"
+        else:
+            msg = ("🤔 收到图片，但当前没有进行中的请假申请。\n\n"
+                   "\n\n⬇️ 直接复制发送：\n【请假 10-05 左腿受伤需静养】\n\n收到预览后发证明照片 → 自动提交。")
+        _LAST_IMAGE_HINT["ts"] = now
+        feishu_send(chat_id, msg)
+    except Exception:
+        pass
+
+
 def poll_group_messages():
     """主动查群消息，处理用户发的新消息（带回检测：已回复过的不再重复处理）"""
+    # 兑底：验证之前挂起的撤回是否真正生效（生效则发完成通知）
+    _check_pending_revoke(CHAT_ID_FALLBACK)
+    # 审批结果监控：Pending → 已办结/已批准时发提醒（兑现提交卡片的承诺）
+    _check_leave_approval(CHAT_ID_FALLBACK)
     try:
         processed_ids, last_msg_id = _load_poll_state()
         token = get_feishu_token()
+        # 关键：必须传 start_time/end_time（单位秒）——不传则返回最早的历史消息（9月22日的），新消息永远拉不到
+        now_s = int(time.time())
         url = (f"https://open.feishu.cn/open-apis/im/v1/messages"
-               f"?container_id_type=chat&container_id={CHAT_ID_FALLBACK}&page_size=30")
+               f"?container_id_type=chat&container_id={CHAT_ID_FALLBACK}"
+               f"&start_time={now_s - 7200}&end_time={now_s}&page_size=50")
         req = urllib.request.Request(url, headers={
             "Authorization": f"Bearer {token}",
             "Content-Type": "application/json"})
@@ -2916,7 +3280,8 @@ def poll_group_messages():
             if msg_id in processed_ids or msg_id == last_msg_id:
                 continue
             # 跨路径去重：事件推送路径已处理过 → 同步到state并跳过
-            if msg_id in _PROCESSED_MSG_IDS:
+            # 注意：图片消息不由事件路径负责（事件受3秒限制、线程不可靠），统一交给轮询同步处理，因此对 image 放行
+            if msg_id in _PROCESSED_MSG_IDS and mtype != "image":
                 processed_ids.add(msg_id)
                 last_msg_id = msg_id
                 new_processed = True
@@ -2929,7 +3294,9 @@ def poll_group_messages():
                 new_processed = True
                 continue
             # 跳过超过5分钟前的旧消息（避免处理历史消息）
-            if msg_ts < time.time() - 300:
+            # 注意：图片消息放行——轮询周期（5分钟）与过滤窗口同长，图片常被误判为旧消息而永不处理；
+            #       图片处理有 pending 状态校验兜底（无进行中请假则忽略/限流提示），重复处理无害
+            if msg_ts < time.time() - 300 and mtype != "image":
                 processed_ids.add(msg_id)
                 last_msg_id = msg_id
                 new_processed = True
@@ -2955,30 +3322,31 @@ def poll_group_messages():
                         log(f"❌ 处理失败: {e}")
                 threading.Thread(target=_process_async, daemon=True).start()
             else:
-                # 图片消息：下载 → 若在等请假证明则自动上传提交（与事件推送路径同逻辑）
+                # 图片消息：同步处理（不用 daemon 线程——函数返回后线程可能被回收，
+                # 必须在本周期内完成 下载→上传AMS→提交 全流程）
                 raw = m.get("body", {}).get("content", "{}")
                 log("📩 轮询收到图片消息")
-                def _process_async_image(msg_id_=msg_id, raw_=raw, chat_id_=CHAT_ID_FALLBACK):
-                    try:
-                        pending, _ = _load_leave_pending()
-                        if pending.get("status") != "awaiting_attachment":
-                            log("收到图片但无进行中请假申请，忽略")
-                            return
-                        content = json.loads(raw_ or "{}")
+                try:
+                    pending, _ = _load_leave_pending()
+                    if pending.get("status") != "awaiting_attachment":
+                        _maybe_notify_no_pending_image(CHAT_ID_FALLBACK)
+                        log("收到图片但无进行中请假申请，忽略")
+                    else:
+                        content = json.loads(raw or "{}")
                         image_key = content.get("image_key", "")
                         if not image_key:
                             log("❌ 图片消息缺 image_key")
-                            return
-                        ftok = get_feishu_token()
-                        img = _http_bin(
-                            f"{FEISHU_BASE}/open-apis/im/v1/messages/{msg_id_}/resources"
-                            f"?file_key={urllib.parse.quote(image_key)}&type=image",
-                            headers={"Authorization": f"Bearer {ftok}"}, timeout=20)
-                        filename = f"medical-cert-{datetime.now().strftime('%Y%m%d%H%M%S')}.png"
-                        cmd_leave_confirm_attachment(chat_id_, img, filename)
-                    except Exception as e:
-                        log(f"❌ 轮询图片处理失败: {e}")
-                threading.Thread(target=_process_async_image, daemon=True).start()
+                        else:
+                            ftok = get_feishu_token()
+                            # 关键：file_key 是路径参数（?file_key= 会404）；实测完整 message_id+路径参数返回200
+                            img = _http_bin(
+                                f"{FEISHU_BASE}/open-apis/im/v1/messages/{msg_id}/resources/"
+                                f"{urllib.parse.quote(image_key)}?type=image",
+                                headers={"Authorization": f"Bearer {ftok}"}, timeout=20)
+                            filename = f"medical-cert-{datetime.now().strftime('%Y%m%d%H%M%S')}.png"
+                            cmd_leave_confirm_attachment(CHAT_ID_FALLBACK, img, filename)
+                except Exception as e:
+                    log(f"❌ 轮询图片处理失败: {e}")
         if new_processed:
             _save_poll_state(processed_ids, last_msg_id)
     except Exception as e:
@@ -3088,6 +3456,22 @@ def main_handler(event, context):
 
     # 去重：飞书超时重发同一事件时跳过
     if msg_id:
+        # ---- 图片消息：秒级确认 + 轮询兜底 ----
+        # （事件路径须 3 秒内响应，daemon 线程在函数返回后不可靠；
+        #   所以这里只同步发一条"已收到"确认（用户立即知道图片被看见），
+        #   真正的下载→上传→提交由轮询路径同步完成（跨路径去重已对 image 放行））
+        if msg_type == "image":
+            try:
+                pending, _ = _load_leave_pending()
+                if pending.get("status") == "awaiting_attachment":
+                    feishu_send(chat_id, "📷 收到证明照片！\n\n"
+                                         "正在：下载 → 上传 AMS → 提交申请，约 1～5 分钟内给你结果，请稍候。")
+                else:
+                    # 复用限流提示（更新时间戳，避免轮询兜底时再重复发一遍）
+                    _maybe_notify_no_pending_image(chat_id)
+            except Exception as e:
+                log(f"图片即时确认失败（轮询兜底会正常处理）: {e}")
+            return {"statusCode": 200, "body": "ok"}
         if msg_id in _PROCESSED_MSG_IDS:
             log(f"⏭️ 跳过重复消息: {msg_id}")
             return {"statusCode": 200, "body": "ok"}
@@ -3095,37 +3479,6 @@ def main_handler(event, context):
         # 渐进淘汰：超限只丢最旧的，保留近期记录（避免全清导致重复处理）
         while len(_PROCESSED_MSG_IDS) > 300:
             _PROCESSED_MSG_IDS.popitem(last=False)
-
-        # ---- 图片消息：请假证明附件流程 ----
-        if msg_type == "image":
-            import threading
-            def _async_image():
-                try:
-                    pending, _ = _load_leave_pending()
-                    if pending.get("status") != "awaiting_attachment":
-                        log("收到图片但无进行中请假申请，忽略")
-                        return
-                    content = json.loads(msg_raw_content or "{}")
-                    image_key = content.get("image_key", "")
-                    if not image_key:
-                        log("❌ 图片消息缺 image_key")
-                        return
-                    ftok = get_feishu_token()
-                    img = _http_bin(
-                        f"{FEISHU_BASE}/open-apis/im/v1/messages/{msg_id}/resources"
-                        f"?file_key={urllib.parse.quote(image_key)}&type=image",
-                        headers={"Authorization": f"Bearer {ftok}"}, timeout=20)
-                    filename = f"medical-cert-{datetime.now().strftime('%Y%m%d%H%M%S')}.png"
-                    cmd_leave_confirm_attachment(chat_id, img, filename)
-                except Exception as e:
-                    log(f"❌ 图片处理失败: {e}")
-                    try:
-                        feishu_send(chat_id, f"⚠️ 证明图片处理失败：{str(e)[:80]}\n\n可重发图片重试。")
-                    except Exception:
-                        pass
-            t = threading.Thread(target=_async_image, daemon=True)
-            t.start()
-            return {"statusCode": 200, "body": "ok"}
 
         if not msg_text:
             return {"statusCode": 200, "body": "ok"}
@@ -3145,6 +3498,4 @@ def main_handler(event, context):
                     pass
         t = threading.Thread(target=_async_process, daemon=True)
         t.start()
-    return {"statusCode": 200, "body": "ok"}
-
     return {"statusCode": 200, "body": "ok"}
