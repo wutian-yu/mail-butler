@@ -1482,9 +1482,18 @@ def cmd_leave_revoke(chat_id, arg=""):
     date_arg = None
     # 规范化日期内空格（「10 月 11」→「10月11」），否则提取不到导致误撤全部
     arg_norm = re.sub(r"(\d)\s*([-月.])\s*(\d)", r"\1\2\3", arg)
-    m = re.search(r"(\d{1,2}[-月.]\d{1,2})", arg_norm)
-    if m:
-        date_arg = parse_leave_date(m.group(1))
+    # 先试 YYYY-MM-DD（避免被 MM-DD 正则提取出中间数字）
+    m_full = re.search(r"(?<!\d)(\d{4})-(\d{1,2})-(\d{1,2})(?!\d)", arg_norm)
+    if m_full:
+        try:
+            date_arg = datetime(int(m_full.group(1)), int(m_full.group(2)),
+                                 int(m_full.group(3))).strftime("%Y-%m-%d")
+        except ValueError:
+            pass
+    else:
+        m = re.search(r"(?<!\d)(\d{1,2})[-月.](\d{1,2})(?!\d)", arg_norm)
+        if m:
+            date_arg = parse_leave_date(m.group(1))
     try:
         resp = _http(f"{AMS_URL}/xjtlu/stuapi/xjtlu-leave/getLeaveList?pageNum=1&pageSize=5",
                      headers={"x-token": token}, timeout=15)
@@ -1498,17 +1507,29 @@ def cmd_leave_revoke(chat_id, arg=""):
             feishu_send(chat_id, "📭 没有待审批（Pending）的请假申请可撤回。\n\n"
                                  "注：AMS 只能撤「待审批」状态；已办结/已批准的记录是历史，无法删除。")
             return
-        app = pending_apps[0]
-        det = _http(f"{AMS_URL}/xjtlu/stuapi/xjtlu-leave/detail/{app.get('leaveId')}",
-                    headers={"x-token": token}, timeout=15)
-        mlist = (det.get("data") or {}).get("moduleList") or []
-        # 课节 status==2 为 Pending 可撤；==4 为 Canceled
-        targets = [mo for mo in mlist
-                   if mo.get("status") == 2
-                   and (not date_arg or date_arg in str(mo.get("time") or ""))]
+        # 如果有多条 Pending 申请且未指定日期，全部撤回（HELP_TEXT 承诺「全撤」）
+        # 指定日期时只处理第一条（日期过滤会精确匹配课节）
+        all_targets = []
+        all_app = []
+        for app in pending_apps:
+            det = _http(f"{AMS_URL}/xjtlu/stuapi/xjtlu-leave/detail/{app.get('leaveId')}",
+                        headers={"x-token": token}, timeout=15)
+            mlist = (det.get("data") or {}).get("moduleList") or []
+            # 课节 status==2 为 Pending 可撤；==4 为 Canceled
+            app_targets = [mo for mo in mlist
+                           if mo.get("status") == 2
+                           and (not date_arg or date_arg in str(mo.get("time") or ""))]
+            if app_targets:
+                all_targets.extend(app_targets)
+                all_app.append(app)
+        targets = all_targets
         if not targets:
-            feishu_send(chat_id, f"📭 申请（{app.get('startDate')}~{app.get('endDate')}）里没有"
-                                 f"{(' ' + date_arg) if date_arg else ''} 待审批的课节可撤。")
+            scope_hint = f"{(' ' + date_arg) if date_arg else ''}"
+            if len(pending_apps) == 1:
+                feishu_send(chat_id, f"📭 申请（{pending_apps[0].get('startDate')}~{pending_apps[0].get('endDate')}）里没有"
+                                     f"{scope_hint} 待审批的课节可撤。")
+            else:
+                feishu_send(chat_id, f"📭 {len(pending_apps)} 条待审批申请里没有{scope_hint} 待审批的课节可撤。")
             return
         ok = 0
         for mo in targets:
@@ -1525,10 +1546,13 @@ def cmd_leave_revoke(chat_id, arg=""):
             return
         # 第 1 段：立即告知"正在处理中"（不宣称完成）
         scope = date_arg or "全部"
-        feishu_send(chat_id, f"⏳ 正在处理中：撤回 {scope} 课节的指令已提交 AMS（{ok}/{len(targets)} 节受理）。\n"
+        app_desc = f"{len(all_app)} 条申请" if len(all_app) > 1 else f"申请 {all_app[0].get('leaveOdd', '')}"
+        feishu_send(chat_id, f"⏳ 正在处理中：撤回 {scope} 课节的指令已提交 AMS（{ok}/{len(targets)} 节受理，{app_desc}）。\n"
                              f"正在确认 AMS 真正生效，确认后立刻通知你，一般几秒到几分钟。")
         # 第 2 段：同步验证循环（最多约 30 秒）
-        odd = app.get("leaveOdd")
+        odd = all_app[0].get("leaveOdd") if all_app else ""
+        app_start = all_app[0].get("startDate") if all_app else ""
+        app_end = all_app[0].get("endDate") if all_app else ""
         done = False
         for _ in range(10):
             time.sleep(3)
@@ -1538,7 +1562,7 @@ def cmd_leave_revoke(chat_id, arg=""):
         if done:
             _mark_leave_status(odd, 2)   # 同步快照，防审批监控误报
             feishu_send_action(chat_id, "✅ 请假已撤回（已验证生效）",
-                f"申请 {odd}（{app.get('startDate')}~{app.get('endDate')}）\n"
+                f"申请 {odd}（{app_start}~{app_end}）\n"
                 f"{scope} 课节 {len(targets)} 节已在 AMS 真正撤销（状态：已办结/Cancelled）。\n\n"
                 f"注：撤回记录保留作历史，不会再生效或占额度。", color="green")
         else:
@@ -1583,9 +1607,17 @@ def _check_pending_revoke(chat_id):
         log(f"⚠️ _check_pending_revoke 异常: {e}")
 
 
+# 内存级审批快照缓存：防止 GitHub 写入失败时下一轮重复通知（同一 SCF 实例生命周期内有效）
+# 提前定义：_mark_leave_status 在 _check_leave_approval 之前就需引用
+_LEAVE_APPROVAL_CACHE = {}
+
+
 def _mark_leave_status(odd, status):
     """把申请状态写入 leave_status.json 快照（撤回验证完成时调用），
     避免审批监控把「自己撤回」误报成「审批结果」"""
+    # 内存缓存先行（即使 GitHub 写失败也能防误报）
+    global _LEAVE_APPROVAL_CACHE
+    _LEAVE_APPROVAL_CACHE[str(odd)] = status
     try:
         snap, sha = {}, ""
         try:
@@ -1600,10 +1632,6 @@ def _mark_leave_status(odd, status):
         gh_write_json("leave_status.json", {"apps": apps}, sha, "mark leave status")
     except Exception:
         pass
-
-
-# 内存级审批快照缓存：防止 GitHub 写入失败时下一轮重复通知（同一 SCF 实例生命周期内有效）
-_LEAVE_APPROVAL_CACHE = {}
 
 
 def _check_leave_approval(chat_id):
@@ -2269,36 +2297,53 @@ def cmd_add_calendar(chat_id, text):
     智能解析标题/日期/时段 → 创建 Outlook 日历事件"""
     # 去掉前缀
     rest = re.sub(r"^(加日历|添加日历|写入日历|标到日历|加到日历)\s*", "", text.strip())
-    # 提取日期：MM-DD 或 MM月DD日 或 今天/明天/后天
-    date_str = None
-    dm = re.search(r"(\d{1,2})[月./\-](\d{1,2})", rest)
-    if dm:
-        try:
-            date_str = datetime(datetime.now().year, int(dm.group(1)), int(dm.group(2))).strftime("%Y-%m-%d")
-        except ValueError:
-            pass
-    else:
-        for kw, offset in [("今天", 0), ("明天", 1), ("后天", 2)]:
-            if kw in rest:
-                date_str = (datetime.now() + timedelta(days=offset)).strftime("%Y-%m-%d")
-                break
-    if not date_str:
-        feishu_send(chat_id, "❓ 没看懂日期。格式：「加日历 <标题> 10-03 22:00 23:00」\n"
-                             "或「加日历 <标题> 今天 19:00 20:00」")
-        return
-    # 提取时间：HH:MM（找所有 HH:MM 模式）
+    # 提取时间：HH:MM（找所有 HH:MM 模式，时间无歧义先提取）
     times = re.findall(r"(\d{1,2}[:：]\d{2})", rest)
     if len(times) < 2:
         feishu_send(chat_id, "❓ 需要开始和结束时间。格式：「加日历 <标题> 10-03 22:00 23:00」")
         return
     start_t = times[0].replace("：", ":")
     end_t = times[1].replace("：", ":")
-    # 提取标题：去掉日期、时间、动词后的剩余文本
+    # 提取日期：优先 YYYY-MM-DD，再试 MM-DD / MM月DD日 / 今天/明天/后天
+    date_str = None
+    date_match_text = None  # 记录匹配到的原文，用于后面精确清理标题
+    m_full = re.search(r"(?<!\d)(\d{4})-(\d{1,2})-(\d{1,2})(?!\d)", rest)
+    if m_full:
+        try:
+            date_str = datetime(int(m_full.group(1)), int(m_full.group(2)),
+                                int(m_full.group(3))).strftime("%Y-%m-%d")
+            date_match_text = m_full.group(0)
+        except ValueError:
+            pass
+    if not date_str:
+        # 取最后一个 MM-DD 匹配（日期在标题之后、时间之前，取最后避免标题中的数字-数字被误匹配）
+        m_all = list(re.finditer(r"(?<!\d)(\d{1,2})[月./\-](\d{1,2})(?!\d)", rest))
+        if m_all:
+            m_short = m_all[-1]
+            try:
+                date_str = datetime(datetime.now().year, int(m_short.group(1)),
+                                    int(m_short.group(2))).strftime("%Y-%m-%d")
+                date_match_text = m_short.group(0)
+            except ValueError:
+                pass
+    if not date_str:
+        for kw, offset in [("今天", 0), ("明天", 1), ("后天", 2)]:
+            if kw in rest:
+                date_str = (datetime.now() + timedelta(days=offset)).strftime("%Y-%m-%d")
+                date_match_text = kw
+                break
+    if not date_str:
+        feishu_send(chat_id, "❓ 没看懂日期。格式：「加日历 <标题> 10-03 22:00 23:00」\n"
+                             "或「加日历 <标题> 今天 19:00 20:00」")
+        return
+    # 提取标题：只删已识别的日期/时间原文，不用全局 sub（避免误删标题里的数字-数字）
     title_raw = rest
-    title_raw = re.sub(r"\d{1,2}[月./\-]\d{1,2}(日|号)?", "", title_raw)
-    title_raw = re.sub(r"\d{1,2}[:：]\d{2}", "", title_raw)
+    if date_match_text:
+        title_raw = title_raw.replace(date_match_text, "")
+    for tm in times[:2]:
+        title_raw = title_raw.replace(tm, "", 1)
     title_raw = re.sub(r"(今天|明天|后天|晚上|下午|上午|早上)", "", title_raw)
-    title_raw = title_raw.strip(" ，,。-")
+    title_raw = title_raw.strip(" ，,。\n。-")
     if not title_raw:
         feishu_send(chat_id, "❓ 没有标题。格式：「加日历 微积分测验 10-03 22:00 23:00」")
         return
@@ -2819,7 +2864,7 @@ SYSTEM_PROMPT = (
     "你是「AI邮件管家」，吴冠呈（西交利物浦大学大一学生）的私人管家。"
     "你背后有一套真实运行中的自动化系统，负责他的邮件、日历、作业、考勤、请假、研讨室预定。"
     "你的风格——像一位真正的管家：**沉稳、简练、可靠、有分寸**。"
-    "话不多，但每句都在点上；办事让人放心，汇报并井有条。\n\n"
+    "话不多，但每句都在点上；办事让人放心，汇报井井有条。\n\n"
     "## 管家风度（严格遵守）\n"
     "· 称呼用户「冠呈」，语气自然亲切但不油滑\n"
     "· 少用 emoji：每条回复最多 1 个，只在关键节点（提醒/成功/道歉）用；不用「哈哈」「嘻嘻」等语气词\n"
@@ -2884,7 +2929,8 @@ SYSTEM_PROMPT = (
     "- 删除全部：[ACTION:删除全部]\n"
     "- 查看帮助：[ACTION:帮助]\n"
     "签到/出勤/请假是固定命令（不走 LLM），用户直接发「签到 码」「出勤」「请假 日期 原因」即可。\n"
-    "加日历也是固定命令：「加日历 <标题> <日期> <开始> <结束>」直接写入 Outlook。\n\n"
+    "加日历也是固定命令：「加日历 <标题> <日期> <开始> <结束>」直接写入 Outlook。\n"
+    "改假条原因也是固定命令：「改假条 <新原因>」——重新生成假条正文，发证明照片即可提交。\n\n"
     "## 规则\n"
     "1. 理解用户意图后加对应的 [ACTION:xxx] 标记，系统自动执行\n"
     "2. 回复正文用自然语言说明你要做什么，不要说「你可以用xxx指令」\n"
@@ -3129,12 +3175,14 @@ def execute_tool(name, args_raw, chat_id):
             att = ams.get("attendance") or {}
             if not att:
                 return "出勤数据暂未同步（监控每30分钟更新）。"
-            sess = ams.get("sessions") or []
-            absent = [s for s in sess if s.get("status") == 3]
+            # sessions 是 dict（rid → 课节对象），不是 list
+            sess_raw = ams.get("sessions") or {}
+            sess_list = list(sess_raw.values()) if isinstance(sess_raw, dict) else sess_raw
+            absent = [s for s in sess_list if s.get("status") == 3]
             lines = [f"总体出勤率 {att.get('overall', '?')}%"]
             if absent:
                 lines.append("缺勤课节：" + "；".join(
-                    f"{s.get('course', '?')} {s.get('time', '')[:16]}" for s in absent[:5]))
+                    f"{s.get('code', '?')} {s.get('time_text', '')[:16]}" for s in absent[:5]))
             return "\n".join(lines)
         if name == "query_calendar":
             days = int(args.get("days") or 3)
@@ -3147,11 +3195,12 @@ def execute_tool(name, args_raw, chat_id):
             rows = []
             for ev in events:
                 try:
-                    s = datetime.strptime(ev.get("start", "")[:19], "%Y-%m-%dT%H:%M:%S")
+                    # outlook_events 返回大写键：Start.DateTime / Subject
+                    s = datetime.strptime(ev.get("Start", {}).get("DateTime", "")[:19], "%Y-%m-%dT%H:%M:%S")
                 except Exception:
                     continue
                 if now - timedelta(hours=12) <= s <= horizon:
-                    rows.append(f"{s.strftime('%m-%d %H:%M')} {ev.get('subject', '')}")
+                    rows.append(f"{s.strftime('%m-%d %H:%M')} {ev.get('Subject', '')}")
             return "\n".join(rows) if rows else f"未来{days}天没有日程安排。"
         return f"未知工具: {name}"
     except Exception as e:
@@ -3304,7 +3353,8 @@ def extract_msg_text(msg_type, content_str):
 POLL_STATE_FILE = "poll_state.json"
 
 # 内存缓存（同一实例内复用，避免每次都读 GitHub）
-_poll_cache = {"last_check_ts": 0, "processed_ids": set()}
+# 用 OrderedDict 保持处理顺序，淘汰时丢最旧的（与 _PROCESSED_MSG_IDS 设计一致，避免 set 无序截断丢最近的）
+_poll_cache = {"last_check_ts": 0, "processed_ids": collections.OrderedDict()}
 
 def _load_poll_state():
     """从 GitHub 读取已处理的消息 ID（带内存缓存）"""
@@ -3312,27 +3362,30 @@ def _load_poll_state():
         return _poll_cache["processed_ids"], _poll_cache.get("last_msg_id", "")
     try:
         data, _ = gh_read_json(POLL_STATE_FILE)
-        _poll_cache["processed_ids"] = set(data.get("processed_ids", []))
+        od = collections.OrderedDict()
+        for mid in data.get("processed_ids", []):
+            od[mid] = True
+        _poll_cache["processed_ids"] = od
         _poll_cache["last_msg_id"] = data.get("last_msg_id", "")
         return _poll_cache["processed_ids"], _poll_cache["last_msg_id"]
     except Exception:
-        return set(), ""
+        return collections.OrderedDict(), ""
 
 def _save_poll_state(processed_ids, last_msg_id):
     """保存已处理的消息 ID 到 GitHub"""
     _poll_cache["processed_ids"] = processed_ids
     _poll_cache["last_msg_id"] = last_msg_id
     try:
-        id_list = list(processed_ids)[-100:]
+        id_list = list(processed_ids.keys())[-100:]
         data, sha = gh_read_json(POLL_STATE_FILE)
         gh_write_json(POLL_STATE_FILE, {"processed_ids": id_list, "last_msg_id": last_msg_id},
                        sha, "poll state")
     except Exception:
         try:
-            gh_write_json(POLL_STATE_FILE, {"processed_ids": list(processed_ids)[-100:], "last_msg_id": last_msg_id},
+            gh_write_json(POLL_STATE_FILE, {"processed_ids": list(processed_ids.keys())[-100:], "last_msg_id": last_msg_id},
                           None, "poll state init")
-        except Exception:
-            pass
+        except Exception as e:
+            log(f"⚠️ poll_state 保存失败: {e}")
 
 _LAST_IMAGE_HINT = {"ts": 0}
 
@@ -3420,12 +3473,9 @@ def poll_group_messages():
             new_processed = True
             import threading
             if mtype == "text":
-                # 提取文本
+                # 提取文本（复用 extract_msg_text 支持 post/富文本，与事件路径一致）
                 body = m.get("body", {}).get("content", "{}")
-                try:
-                    text = json.loads(body).get("text", "").strip()
-                except Exception:
-                    continue
+                text = extract_msg_text("text", body)
                 if not text:
                     continue
                 log(f"📩 轮询收到: {text[:30]}")
@@ -3461,6 +3511,13 @@ def poll_group_messages():
                             cmd_leave_confirm_attachment(CHAT_ID_FALLBACK, img, filename)
                 except Exception as e:
                     log(f"❌ 轮询图片处理失败: {e}")
+                    # 失败必通知：用户已被承诺"约1~5分钟给结果"，不能石沉大海
+                    try:
+                        feishu_send(CHAT_ID_FALLBACK,
+                            f"❌ 证明照片处理失败：{str(e)[:80]}\n\n"
+                            "请假申请仍暂存着，请重新发一张照片即可提交。")
+                    except Exception:
+                        pass
         if new_processed:
             _save_poll_state(processed_ids, last_msg_id)
     except Exception as e:
