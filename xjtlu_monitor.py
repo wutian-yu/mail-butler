@@ -1821,78 +1821,72 @@ def _room_op_query(page, captured, op):
 
 
 def _room_op_probe(page, captured, op):
-    """安全探测 v24（成员搜索 API 定位与实测）：
-    v23 发现：订房弹窗有 remote-method 成员搜索（响应映射 {accNo, logonName, disable}），
-    候选端点 /login/user。本轮：
-    1. dump remoteMethod 完整源码（确认调哪个 API、传什么参数）
-    2. dump /login/user 在 chunk-common 的函数定义（method/params）
-    3. 实测搜索：用用户自己的 logonName/姓名/accNo 搜（预期命中 92604，纯只读）
-    4. dump /sysConfig/public（验证码开关等公共配置）
-    全程只读，零副作用。"""
+    """安全探测 v25（成员搜索接口实测）：
+    v24 已定位 remoteMethod 源码：Object(be["c"])({params:{key:e,page:1,pageNum:10}}) → POST /login/user。
+    本轮实测（用自己账号搜，预期命中 92604，纯只读）：
+    1. POST /login/user?key=GUANCHENG.WU26&page=1&pageNum=10（URL 参数 + 空 body，走 SPA axios 带 token）
+    2. 部分关键词 GUANCHENG（测前缀匹配）
+    3. 纯数字 92604（测是否也搜 accNo）
+    4. 完整 sysConfig/public 有趣键值
+    5. 零残留验证"""
     findings = []
     acc_id, pid = _room_get_accid_from_storage(page)
     log(f"🆔 accId={acc_id!r} pid={pid!r}")
     findings.append(f"accId={acc_id}")
 
-    js_urls = page.evaluate(
-        "() => performance.getEntriesByType('resource').map(r => r.name)"
-        ".filter(u => u.endsWith('.js'))")
-    log(f"📦 已加载 {len(js_urls)} 个JS")
-
-    remote_src = ""
-    login_user_ctx = ""
-    for u in js_urls:
+    def spa_search(key):
+        """复刻 remoteMethod：vm.$axios.post('/login/user?key=...&page=1&pageNum=10', null)"""
+        import urllib.parse as up
+        url = "/login/user?key=" + up.quote(str(key), safe="") + "&page=1&pageNum=10"
+        js = (
+            "() => Promise.race(["
+            "new Promise((resolve) => {"
+            "try {"
+            "const el = document.querySelector('#app') || document.body.firstElementChild;"
+            "const vm = el && el.__vue__;"
+            "const axios = vm && vm.$axios;"
+            "if (!axios) { resolve({stage: 'noaxios'}); return; }"
+            "axios.post(" + json.dumps(url) + ", null)"
+            ".then(r => resolve({ok: 1, code: r.data && r.data.code, message: r.data && r.data.message,"
+            " count: r.data && r.data.count, data: r.data && r.data.data}))"
+            ".catch(e => resolve({ok: 0, error: String(e).slice(0, 100)}));"
+            "} catch(e) { resolve({ok: -1, error: String(e).slice(0, 100)}); }"
+            "}),"
+            "new Promise((resolve) => setTimeout(() => resolve({stage: 'timeout'}), 15000))"
+            "])"
+        )
         try:
-            body = page.request.get(u, timeout=25000).text()
-        except Exception:
-            continue
-        short = u.split("/")[-1][:24]
-        if not remote_src:
-            j = body.find("remoteMethod:function")
-            if j >= 0:
-                remote_src = body[j:j + 1000]
-                log(f"📜 remoteMethod@{short}: {remote_src[:1000]}")
-                findings.append("remoteMethod✓")
-        if not login_user_ctx:
-            j = body.find('"/login/user"')
-            if j < 0:
-                j = body.find("url:\"/login/user\"")
-            if j >= 0:
-                login_user_ctx = body[max(0, j - 350):j + 250]
-                log(f"📜 /login/user定义@{short}: {login_user_ctx[:600]}")
+            return page.evaluate(js)
+        except Exception as e:
+            return {"ok": -2, "error": str(e)[:100]}
 
-    # 2) 实测搜索端点（只读）：用自己的信息搜，预期返回 92604
-    if pid:
-        tries = [
-            ("GET", f"/login/user?keyword={pid}", None),
-            ("GET", f"/login/user?logonName={pid}", None),
-            ("GET", f"/login/user?name=Guancheng", None),
-            ("GET", "/login/user", None),
-            ("POST", "/login/user?sf_request_type=ajax", {"keyword": pid}),
-        ]
-        import time as _t
-        for i, (m, path, data) in enumerate(tries):
-            if i:
-                _t.sleep(2)
-            r = _room_api_on_page(page, path, method=m, data=data, timeout=15000)
-            snippet = json.dumps(r, ensure_ascii=False, default=str)[:300]
-            log(f"📥 {m} {path[:60]}: {snippet}")
-            if r.get("code") == 0 and r.get("data"):
-                d = r["data"]
-                rows = d if isinstance(d, list) else d.get("list") or d.get("records") or [d]
-                hit = [x for x in rows if isinstance(x, dict) and (
-                    str(x.get("accNo")) == str(acc_id) or pid in str(x.get("logonName") or ""))]
-                if hit:
-                    log(f"🎯 命中自己: {json.dumps(hit[0], ensure_ascii=False, default=str)[:250]}")
-                    findings.append(f"搜索OK@{path.split('?')[1].split('=')[0] if '?' in path else '无参'}")
-                    break
-            findings.append(f"试{i + 1}:{str(r.get('message', ''))[:16]}")
+    import time as _t
+    for label, key in (("完整", pid), ("前缀", "GUANCHENG"), ("数字", str(acc_id))):
+        _t.sleep(3)
+        r = spa_search(key)
+        rows = r.get("data") or []
+        log(f"📥 搜索[{label}] key={key}: code={r.get('code')} count={r.get('count')} "
+            f"rows={json.dumps(rows, ensure_ascii=False, default=str)[:400]}")
+        if r.get("code") == 0:
+            hit = [x for x in rows if isinstance(x, dict) and str(x.get("accNo")) == str(acc_id)]
+            findings.append(f"{label}:{'命中✓' if hit else f'{len(rows)}行'}")
+            if hit:
+                log(f"🎯 命中: accNo={hit[0].get('accNo')} logonName={hit[0].get('logonName')} "
+                    f"trueName={hit[0].get('trueName')} status={hit[0].get('status')}")
+        else:
+            findings.append(f"{label}:{str(r.get('message', r.get('error', '')))[:20]}")
 
-    # 3) /sysConfig/public（公共配置：验证码、限流等）
+    # sysConfig/public 有趣键
     r = _room_api_on_page(page, "/sysConfig/public", timeout=15000)
-    log(f"📜 sysConfig/public: {json.dumps(r, ensure_ascii=False, default=str)[:500]}")
+    if r.get("code") == 0 and isinstance(r.get("data"), list):
+        for it in r["data"]:
+            k, v = it.get("sysKey"), it.get("sysValue")
+            if k and any(s in str(k).lower() for s in
+                        ("resvcode", "captcha", "themefix", "spacelist", "lim", "minuser", "member")):
+                log(f"📜 sysConfig {k} = {v}")
+        findings.append(f"sysConfig={len(r['data'])}项")
 
-    # 4) 零残留
+    # 零残留
     begin = (_bjnow() - timedelta(days=1)).strftime("%Y-%m-%d")
     end = (_bjnow() + timedelta(days=3)).strftime("%Y-%m-%d")
     j5 = _room_api_on_page(
@@ -1910,7 +1904,7 @@ def _room_op_probe(page, captured, op):
     else:
         log("✅ 零残留")
         findings.append("零残留✅")
-    return "🔬 probe v24 完成: " + "；".join(findings)
+    return "🔬 probe v25 完成: " + "；".join(findings)
 
 
 def run_room_op(op_json):
