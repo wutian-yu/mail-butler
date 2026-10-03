@@ -1468,13 +1468,34 @@ def _room_api_on_page(page, path, method="GET", data=None, timeout=20000):
 
 
 def _room_query_avail_raw(page, date_str):
-    """查 SIP 全楼层当天可用性，返回原始 data 数组（可能为 None）"""
+    """查 SIP 当天可用性，返回原始 data 数组（可能为 None）
+    方案A: 全楼层逗号分隔 → 方案B: 逐楼层调用合并 → 方案C: roomDevice/roomInfos（仅今天）
+    """
+    ds = date_str.replace("-", "")
+    # 方案A: 合并 labIds
     resp = _room_api_on_page(
-        page, f"/reserve?sysKind=1&resvDates={date_str.replace('-', '')}&labIds={ROOM_SIP_LABS}")
-    if resp.get("code") != 0:
-        log(f"⚠️ 查房失败 {date_str}: {str(resp.get('message'))[:60]}")
-        return None
-    return resp.get("data") or []
+        page, f"/reserve?sysKind=1&resvDates={ds}&labIds={ROOM_SIP_LABS}")
+    if resp.get("code") == 0 and resp.get("data"):
+        return resp["data"]
+    log(f"⚠️ /reserve 合并labIds失败 {date_str}: {str(resp.get('message'))[:50]} → 试逐楼层")
+    # 方案B: 逐楼层调用合并
+    labs_data = []
+    for lid in (3, 4, 5, 1, 7, 9):
+        r = _room_api_on_page(
+            page, f"/reserve?sysKind=1&resvDates={ds}&labIds={lid}")
+        if r.get("code") == 0 and r.get("data"):
+            for campus in r["data"]:
+                if "SIP" in (campus.get("campusName") or ""):
+                    labs_data.extend(campus.get("labInfos") or [])
+    if labs_data:
+        return [{"campusName": "SIP Campus", "labInfos": labs_data}]
+    # 方案C: roomDevice/roomInfos（SPA 自调的接口，仅今天）
+    if ds == _bjnow().strftime("%Y%m%d"):
+        r = _room_api_on_page(page, "/roomDevice/roomInfos")
+        if r.get("code") == 0 and r.get("data"):
+            return r["data"]
+    log(f"⚠️ 查房失败 {date_str}: 所有方案均失败")
+    return None
 
 
 def _room_compact_avail(raw_data):
