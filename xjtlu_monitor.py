@@ -18,7 +18,7 @@ import hashlib
 import urllib.request
 import urllib.parse
 import html as html_mod
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 
 try:
     from playwright.sync_api import sync_playwright
@@ -1395,11 +1395,197 @@ def _url_host(u):
         return ""
 
 
-def fetch_roombookings_session(browser, main_context):
-    """登录房间预定系统，抓 API session cookies + accId，存入 state['room']
+# 北京时间（Actions 是 UTC 系统，房间系统的日期/时段都是北京时间）
+BJ_TZ = timezone(timedelta(hours=8))
 
-    跳转链：roombookings → trust → sso.xjtlu → uim esc-sso（OAuth2）
-    复用主 context 的 uim TGC，通常自动跳回；停在登录页则填账密。
+
+def _bjnow():
+    return datetime.now(BJ_TZ).replace(tzinfo=None)
+
+
+ROOM_SIP_LABS = "3,4,5,1,7,9"   # SIP 全部楼层 labId（roomMenu 实测）
+ROOM_MAX_AHEAD_DAYS = 3
+
+
+def _room_wait_ready(page):
+    """等待跳转链完成（roombookings→trust→sso→uim esc-sso→回 roombookings）"""
+    stable = 0
+    filled_once = False
+    for i in range(40):
+        time.sleep(3)
+        try:
+            u = page.url
+        except Exception:
+            continue
+        host = _url_host(u)
+        if host == "uim.xjtlu.edu.cn" and "login" in u.lower():
+            if not filled_once and XJTLU_USERNAME and XJTLU_PASSWORD:
+                log(f"🔑 停在 uim 登录页，自动填入账密...")
+                filled_once = _room_uim_fill_login(page)
+            continue
+        if host == "roombookings.xjtlu.edu.cn":
+            stable += 1
+            if stable >= 2:
+                log(f"✅ 房间系统就绪: {u[:60]}")
+                return True
+        else:
+            stable = 0
+            if i % 4 == 0:
+                log(f"⏳ 跳转链中... URL: {u[:70]}")
+            # 卡在 trust/sso 超过 45 秒 → 重新触发一次跳转链
+            if i in (15, 30):
+                log(f"🔄 跳转链卡住，重新访问 {ROOM_URL}")
+                try:
+                    page.goto(ROOM_URL, wait_until="domcontentloaded", timeout=30000)
+                except Exception:
+                    pass
+    return False
+
+
+def _room_page_json(resp):
+    try:
+        return resp.json()
+    except Exception:
+        return {}
+
+
+def _room_slot_occupied(status):
+    """位标志：2=待生效 4=已生效 64=已签到 → 有效占用；128=已结束 16=已违约 不占"""
+    return bool(status & (2 | 4 | 64)) and not bool(status & 128)
+
+
+def _room_api_on_page(page, path, method="GET", data=None, timeout=20000):
+    """在浏览器 context 里调房间 API（过 aTrust 零信任网关）；返回 json dict"""
+    try:
+        body = json.dumps(data).encode() if data is not None else None
+        resp = page.request.fetch(
+            IC_API + path, method=method, data=body,
+            headers={"Content-Type": "application/json"} if body else None,
+            timeout=timeout)
+        return _room_page_json(resp)
+    except Exception as e:
+        return {"code": -1, "message": f"请求异常: {e}"}
+
+
+def _room_query_avail_raw(page, date_str):
+    """查 SIP 全楼层当天可用性，返回原始 data 数组（可能为 None）"""
+    resp = _room_api_on_page(
+        page, f"/reserve?sysKind=1&resvDates={date_str.replace('-', '')}&labIds={ROOM_SIP_LABS}")
+    if resp.get("code") != 0:
+        log(f"⚠️ 查房失败 {date_str}: {str(resp.get('message'))[:60]}")
+        return None
+    return resp.get("data") or []
+
+
+def _room_compact_avail(raw_data):
+    """原始 data → 精简缓存结构（云函数只负责展示）"""
+    out = []
+    for campus in raw_data or []:
+        if "SIP" not in (campus.get("campusName") or ""):
+            continue
+        for lab in campus.get("labInfos") or []:
+            rooms = []
+            for r in lab.get("roomInfos") or []:
+                ot = (r.get("openTimes") or [{}])[0]
+                booked = []
+                for rv in r.get("resvInfos") or []:
+                    if _room_slot_occupied(rv.get("resvStatus", 0)):
+                        try:
+                            booked.append([rv["resvBeginTime"][11:16], rv["resvEndTime"][11:16]])
+                        except Exception:
+                            pass
+                rooms.append({"id": r.get("devId"), "name": r.get("devName"),
+                              "os": ot.get("openStartTime", "09:00"),
+                              "oe": ot.get("openEndTime", "22:00"),
+                              "bk": booked})
+            if rooms:
+                out.append({"f": lab.get("labName"), "rooms": rooms})
+    return out
+
+
+def _room_compact_bookings(rows):
+    """resvInfo 响应 → 精简预约列表（uuid 供取消用；时间为北京时间）"""
+    out = []
+    for rv in rows or []:
+        try:
+            bt = datetime.fromtimestamp(rv["resvBeginTime"] / 1000, BJ_TZ).replace(tzinfo=None)
+            et = datetime.fromtimestamp(rv["resvEndTime"] / 1000, BJ_TZ).replace(tzinfo=None)
+        except Exception:
+            continue
+        dev = (rv.get("resvDevInfoList") or [{}])[0]
+        st = rv.get("resvStatus", 0)
+        tag = ("🟢 已生效" if st & 4 else "⏳ 待生效") if st & 70 else \
+              ("✅ 已结束" if st & 128 else ("⚠️ 已违约" if st & 16 else "进行中"))
+        wd = "一二三四五六日"[bt.weekday()]
+        out.append({
+            "uuid": rv.get("uuid"),
+            "name": dev.get("devName", "?"),
+            "when": f"{bt.strftime('%m月%d日')}（周{wd}）{bt.strftime('%H:%M')}-{et.strftime('%H:%M')}",
+            "tag": tag,
+        })
+    return out
+
+
+def _room_probe_accid(page, captured):
+    """尽力找 accId：捕获的 SPA 响应 → 候选端点。把探测结果打日志辅助排查。"""
+    acc_id = None
+    for path, body in captured.items():
+        acc_id = _find_accid(body)
+        if acc_id:
+            log(f"🆔 accId 来自 SPA 响应 {path}")
+            break
+    user_name = None
+    for path, body in captured.items():
+        if isinstance(body, dict):
+            d = body.get("data")
+            if isinstance(d, dict) and d.get("name"):
+                user_name = str(d["name"])
+                break
+    if not acc_id:
+        for ep in ("/authUser/getOwerUser", "/reserve/count", "/user/getUserInfo"):
+            j2 = _room_api_on_page(page, ep)
+            acc_id = _find_accid(j2)
+            log(f"🔍 accId 探测 {ep}: code={j2.get('code')} data={str(j2.get('data'))[:100]}")
+            if acc_id:
+                if not user_name and isinstance(j2.get("data"), dict):
+                    user_name = j2["data"].get("name")
+                break
+    return acc_id, user_name
+
+
+def _room_open_room_ctx(browser, main_context, captured_hook=None):
+    """开房间系统 context 并走完登录链；返回 (ctx, page) 或 (None, None)"""
+    ctx = browser.new_context(locale="zh-CN")  # 桌面 UA：IC 是 PC 系统
+    try:
+        ctx.add_cookies(main_context.cookies())
+        page = ctx.new_page()
+        if captured_hook:
+            page.on("response", captured_hook)
+        page.goto(ROOM_URL, wait_until="domcontentloaded", timeout=45000)
+        if not _room_wait_ready(page):
+            log("❌ 房间系统跳转链超时")
+            ctx.close()
+            return None, None
+        j = _room_api_on_page(page, "/roomMenu")
+        if j.get("code") != 0:
+            log(f"❌ 房间系统 API 未登录: {str(j.get('message'))[:60]}")
+            ctx.close()
+            return None, None
+        return ctx, page
+    except Exception as e:
+        log(f"⚠️ 房间系统 context 异常: {e}")
+        try:
+            ctx.close()
+        except Exception:
+            pass
+        return None, None
+
+
+def fetch_roombookings_session(browser, main_context, with_cache=True):
+    """登录房间预定系统：抓 session cookies + accId + 可用性/预约缓存
+
+    存入 state['room']：cookies / accId / name / updated / avail / bookings
+    云函数读缓存秒回查房/我的预约；订房/取消走 room-ops workflow（浏览器执行过 aTrust）。
     """
     captured = {}
 
@@ -1411,106 +1597,240 @@ def fetch_roombookings_session(browser, main_context):
         except Exception:
             pass
 
-    ctx = None
+    ctx, page = _room_open_room_ctx(browser, main_context, _capture)
+    if not page:
+        return None
     try:
-        ctx = browser.new_context(locale="zh-CN")  # 桌面 UA：IC 是 PC 系统
-        ctx.add_cookies(main_context.cookies())
-        page = ctx.new_page()
-        page.on("response", _capture)
-        log("🏛️ 登录图书馆房间预定系统...")
-        page.goto(ROOM_URL, wait_until="domcontentloaded", timeout=45000)
+        # 把 SPA 调过的接口打出来（一次性排查 accId 端点用）
+        for path, body in list(captured.items())[:15]:
+            log(f"📸 SPA 调用 {path}: {str(body)[:90]}")
 
-        stable = 0
-        filled_once = False
-        for i in range(40):
-            time.sleep(3)
-            try:
-                u = page.url
-            except Exception:
-                continue
-            host = _url_host(u)
-            if host == "uim.xjtlu.edu.cn" and "login" in u.lower():
-                if not filled_once and XJTLU_USERNAME and XJTLU_PASSWORD:
-                    log(f"🔑 停在 uim 登录页，自动填入账密...")
-                    filled_once = _room_uim_fill_login(page)
-                continue
-            if host == "roombookings.xjtlu.edu.cn":
-                stable += 1
-                if stable >= 2:
-                    log(f"✅ 房间系统就绪: {u[:60]}")
-                    break
-            else:
-                stable = 0
-                if i % 4 == 0:
-                    log(f"⏳ 跳转链中... URL: {u[:70]}")
-                # 卡在 trust/sso 超过 45 秒 → 重新触发一次跳转链
-                if i in (15, 30):
-                    log(f"🔄 跳转链卡住，重新访问 {ROOM_URL}")
-                    try:
-                        page.goto(ROOM_URL, wait_until="domcontentloaded", timeout=30000)
-                    except Exception:
-                        pass
-
-        # 验证 API 登录态（roomMenu 无需登录也可能返回？以 reserve/count 为准）
-        try:
-            resp = page.request.get(f"{IC_API}/roomMenu", timeout=20000)
-            data = resp.json()
-        except Exception as e:
-            log(f"⚠️ roomMenu 请求失败: {e}")
-            data = {}
-        if data.get("code") != 0:
-            log(f"❌ 房间系统 API 未登录: {str(data.get('message'))[:60]}")
-            return None
-
-        # 抓 roombookings/trust/sso 三个域的 session cookies
         all_cookies = ctx.cookies()
         keep_domains = ("roombookings", "trust.xjtlu", "sso.xjtlu")
         room_cookies = [c for c in all_cookies
                         if any(d in (c.get("domain") or "") for d in keep_domains)
-                        and c.get("name") not in ("lang", "language")]  # 语言 cookie 无用，省体积
-        # accId：先翻捕获的响应，再主动调 getOwerUser
-        acc_id = None
-        for body in captured.values():
-            acc_id = _find_accid(body)
-            if acc_id:
-                break
-        user_name = None
-        for path, body in captured.items():
-            if isinstance(body, dict):
-                d = body.get("data")
-                if isinstance(d, dict) and d.get("name"):
-                    user_name = str(d["name"])
-                    break
-        if not acc_id:
-            for ep in ("/authUser/getOwerUser", "/user/getUserInfo", "/authUser/getUser"):
-                try:
-                    r2 = page.request.get(IC_API + ep, timeout=15000)
-                    j2 = r2.json()
-                    acc_id = _find_accid(j2)
-                    if acc_id:
-                        log(f"🆔 accId 来自 {ep}")
-                        if not user_name and isinstance(j2.get("data"), dict):
-                            user_name = j2["data"].get("name")
-                        break
-                except Exception:
-                    continue
+                        and c.get("name") not in ("lang", "language")]
+        acc_id, user_name = _room_probe_accid(page, captured)
 
-        log(f"✅ 房间系统登录成功：{len(room_cookies)} 个 cookie，accId={'有' if acc_id else '未获取'}")
-        return {
+        session = {
             "cookies": room_cookies,
             "accId": acc_id or "",
             "name": user_name or "",
-            "updated": datetime.now().isoformat(timespec="seconds"),
+            "updated": _bjnow().isoformat(timespec="seconds"),
         }
+        if with_cache:
+            # 可用性缓存：今天 + 未来 3 天（预定窗口）
+            avail = {}
+            for d in range(ROOM_MAX_AHEAD_DAYS + 1):
+                ds = (_bjnow() + timedelta(days=d)).strftime("%Y-%m-%d")
+                raw = _room_query_avail_raw(page, ds)
+                if raw:
+                    avail[ds] = _room_compact_avail(raw)
+            session["avail"] = avail
+            # 我的预约缓存（近2天~未来14天）
+            begin = (_bjnow() - timedelta(days=2)).strftime("%Y-%m-%d")
+            end = (_bjnow() + timedelta(days=14)).strftime("%Y-%m-%d")
+            j = _room_api_on_page(
+                page, f"/reserve/resvInfo?beginDate={begin}&endDate={end}"
+                      f"&needStatus=8582&page=1&pageNum=20&orderKey=gmt_create")
+            session["bookings"] = _room_compact_bookings(j.get("data") or [])
+            log(f"📦 房间缓存：{len(avail)} 天可用性，{len(session['bookings'])} 条预约")
+        log(f"✅ 房间系统登录成功：{len(room_cookies)} 个 cookie，accId={'有' if acc_id else '未获取'}")
+        return session
     except Exception as e:
-        log(f"⚠️ 房间系统登录异常: {e}")
+        log(f"⚠️ 房间系统缓存构建异常: {e}")
         return None
     finally:
-        if ctx:
+        try:
+            ctx.close()
+        except Exception:
+            pass
+
+
+# ============ 房间操作模式（room-ops workflow 调用） ============
+
+def _room_find_dev_compact(raw_data, room_key):
+    """从原始可用性数据按房间号找房间，返回房间 dict"""
+    key = str(room_key).strip().lower().replace("room ", "").replace("room", "")
+    for campus in raw_data or []:
+        for lab in campus.get("labInfos") or []:
+            for r in lab.get("roomInfos") or []:
+                if key and key in (r.get("devName") or "").lower():
+                    return r
+    return None
+
+
+def _room_validate_booking(date_str, start, end):
+    """订房参数校验（北京时间），返回错误文本或 None"""
+    try:
+        d = datetime.strptime(date_str, "%Y-%m-%d")
+    except ValueError:
+        return f"❌ 日期格式不对：{date_str}"
+
+    def to_min(t):
+        h, m = t.split(":")
+        return int(h) * 60 + int(m)
+
+    try:
+        s_min, e_min = to_min(start), to_min(end)
+    except Exception:
+        return "❌ 时间格式应为 HH:MM，例如 14:00。"
+    now = _bjnow()
+    if d.date() < now.date():
+        return "❌ 不能预定过去的日期。"
+    if (d.date() - now.date()).days > ROOM_MAX_AHEAD_DAYS:
+        return f"❌ 最多只能提前 {ROOM_MAX_AHEAD_DAYS} 天预定。"
+    if e_min <= s_min:
+        return "❌ 结束时间要晚于开始时间。"
+    if e_min - s_min > 3 * 60:
+        return "❌ 每次最长 3 小时。"
+    if s_min < 9 * 60 or e_min > 22 * 60:
+        return "❌ 开放时间为 09:00-22:00。"
+    return None
+
+
+def _room_op_book(page, captured, op):
+    date = op.get("date", "")
+    start, end = op.get("start", ""), op.get("end", "")
+    room_key = str(op.get("room", "")).strip()
+    memo = op.get("memo") or "小组研讨"
+    err = _room_validate_booking(date, start, end)
+    if err:
+        return err
+    raw = _room_query_avail_raw(page, date)
+    if raw is None:
+        return "❌ 查询房间状态失败，稍后重试。"
+    dev = _room_find_dev_compact(raw, room_key)
+    if not dev:
+        return f"❌ 没找到房间「{room_key}」。"
+    # 冲突检查（权威：执行时刻的实时数据）
+    def to_min(t):
+        h, m = t.split(":")
+        return int(h) * 60 + int(m)
+    for rv in dev.get("resvInfos") or []:
+        if _room_slot_occupied(rv.get("resvStatus", 0)):
+            bs, be = rv["resvBeginTime"][11:16], rv["resvEndTime"][11:16]
+            if not (to_min(end) <= to_min(bs) or to_min(start) >= to_min(be)):
+                return (f"❌ {dev.get('devName')} 在 {start}-{end} 与已有预约（{bs}-{be}）冲突。")
+    # accId
+    acc_id, _ = _room_probe_accid(page, captured)
+    acc_id = acc_id or ""
+    payload = {
+        "appAccNo": acc_id,
+        "captcha": "",
+        "memberKind": 2,
+        "memo": memo,
+        "resvBeginTime": f"{date} {start}",
+        "resvDev": [dev.get("devId")],
+        "resvEndTime": f"{date} {end}",
+        "resvMember": [acc_id] if acc_id else [],
+        "resvProperty": 0,
+        "sysKind": 1,
+        "testName": memo,
+        "addServices": [],
+        "appUrl": "",
+        "resvKind": 2,
+    }
+    log(f"📤 订房 payload: {json.dumps(payload, ensure_ascii=False)[:200]}")
+    resp = _room_api_on_page(page, "/reserve", method="POST", data=payload, timeout=25000)
+    msg = str(resp.get("message", ""))
+    log(f"📥 订房响应: {str(resp)[:200]}")
+    if resp.get("code") == 0:
+        return (f"✅ 预定成功！\n\n🏛️ {dev.get('devName')}\n"
+                f"📅 {date} {start}-{end}")
+    return f"❌ 预定未成功：{msg or '未知错误'}"
+
+
+def _room_op_cancel(page, captured, op):
+    uuid = op.get("uuid", "")
+    if not uuid:
+        return "❌ 缺少预约标识（uuid）。"
+    resp = _room_api_on_page(page, "/reserve/delete", method="POST",
+                             data={"uuid": uuid}, timeout=25000)
+    log(f"📥 取消响应: {str(resp)[:150]}")
+    if resp.get("code") == 0:
+        return f"✅ 已取消预约{('：' + op['name']) if op.get('name') else ''}"
+    return f"❌ 取消失败：{resp.get('message', '未知错误')}"
+
+
+def _room_op_query(page, captured, op):
+    date = op.get("date") or _bjnow().strftime("%Y-%m-%d")
+    raw = _room_query_avail_raw(page, date)
+    if raw is None:
+        return "❌ 查询失败，稍后重试。"
+    # 用与云函数一致的 compact+展示逻辑
+    compact = _room_compact_avail(raw)
+    lines = []
+    for lab in compact:
+        lines.append(f"\n【{lab['f']}】")
+        for r in lab["rooms"]:
+            if r["bk"]:
+                b = sorted(r["bk"])
+                booked = "、".join(f"{s}-{e}" for s, e in b)
+                lines.append(f"🔴 {r['name']} 已约：{booked}")
+            else:
+                lines.append(f"🟢 {r['name']} 全天空闲（{r['os']}-{r['oe']}）")
+    head = (f"🏛️ SIP 图书馆研讨室 · {date}（实时）\n"
+            f"⏰ 开放 09:00-22:00，每次最长 3 小时，每天限 1 次")
+    return head + "\n" + "\n".join(lines)
+
+
+def run_room_op(op_json):
+    """执行云函数触发的房间操作（浏览器内完成，过 aTrust），结果直发飞书"""
+    try:
+        op = json.loads(op_json)
+    except Exception as e:
+        log(f"❌ ROOM_OP JSON 解析失败: {e}")
+        return
+    action = op.get("action", "")
+    log(f"🛠️ 房间操作: {action} {json.dumps(op, ensure_ascii=False)[:100]}")
+    captured = {}
+
+    def _capture(resp):
+        try:
+            if "/ic-web/" in resp.url:
+                path = resp.url.split("/ic-web/", 1)[1].split("?")[0]
+                captured[path] = resp.json()
+        except Exception:
+            pass
+
+    with sync_playwright() as p:
+        browser = p.chromium.launch(
+            headless=True,
+            args=["--no-sandbox", "--disable-blink-features=AutomationControlled"]
+        )
+        try:
+            iphone = p.devices["iPhone 13"]
+            context = browser.new_context(**iphone, locale="zh-CN")
+            page = context.new_page()
+            logged_in = cookie_login(context, page)
+            if not logged_in and XJTLU_USERNAME and XJTLU_PASSWORD:
+                logged_in = sso_login(page)
+            if not logged_in:
+                feishu_send("❌ 房间操作失败：西浦账号登录未成功，请稍后重试。")
+                return
+            ctx2, page2 = _room_open_room_ctx(browser, context, _capture)
+            if not page2:
+                feishu_send("❌ 房间系统登录未成功，请稍后重试。")
+                return
             try:
-                ctx.close()
-            except Exception:
-                pass
+                if action == "book":
+                    result = _room_op_book(page2, captured, op)
+                elif action == "cancel":
+                    result = _room_op_cancel(page2, captured, op)
+                elif action == "query":
+                    result = _room_op_query(page2, captured, op)
+                else:
+                    result = f"❌ 未知操作: {action}"
+            finally:
+                try:
+                    ctx2.close()
+                except Exception:
+                    pass
+            log(f"📨 操作结果: {result[:120]}")
+            feishu_send(result)
+        finally:
+            browser.close()
 
 
 def run():
@@ -1697,4 +2017,9 @@ def run():
 
 
 if __name__ == "__main__":
-    run()
+    # 房间操作模式：room-ops workflow 传入 ROOM_OP JSON（book/cancel/query）
+    _room_op_env = os.environ.get("ROOM_OP", "")
+    if _room_op_env:
+        run_room_op(_room_op_env)
+    else:
+        run()
