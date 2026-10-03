@@ -37,5 +37,6 @@ jobs:
           EBRIDGE_COOKIES: ${{ secrets.EBRIDGE_COOKIES }}
           FEISHU_APP_ID: ${{ secrets.FEISHU_APP_ID }}
           FEISHU_APP_SECRET: ${{ secrets.FEISHU_APP_SECRET }}
+          GH_PAT: ${{ secrets.GH_PAT }}
           ROOM_OP: ${{ github.event.inputs.op }}
         run: python xjtlu_monitor.py
