@@ -1821,108 +1821,127 @@ def _room_op_query(page, captured, op):
 
 
 def _room_op_probe(page, captured, op):
-    """安全探测订房 API v3（零副作用）：
-    1. JS 全量扫描：找订房 payload 构造（resvDev/memberKind:2/resvKind）和端点定义（reserve/update）
-    2. GET /reserve 加 sf_request_type=ajax 测试（修可用性查询路径）
-    3. POST /reserve/update 变体矩阵（全部倒置时间，必被拒）
-    4. 结束前验证「我的预约」为空
+    """安全探测订房 API v4（零副作用）：
+    1. JS 扫描：axios 封装（确认 params 传输方式 + sf_request_type 来源）+ 订房时间格式
+    2. 变体矩阵：memberKind=1（JS 实证单人=1）× 传输格式（JSON body / URL查询串 / 表单body）
+    3. 结束前验证「我的预约」为空
     """
     today = _bjnow().strftime("%Y-%m-%d")
     findings = []
 
-    # 1. accId
     acc_id, pid = _room_get_accid_from_storage(page)
     log(f"🆔 accId={acc_id!r} pid={pid!r}")
     findings.append(f"accId={acc_id}")
 
-    # 2. JS 全量扫描（订房 payload 构造 + 端点定义）
+    # 1. JS 扫描：axios 封装 + sf_request_type + 订房时间构造
     try:
         js_urls = page.evaluate(
             "() => performance.getEntriesByType('resource')"
             ".map(r => r.name).filter(u => u.endsWith('.js'))")
-        log(f"📜 已加载 JS {len(js_urls or [])} 个，扫描订房相关代码...")
+        log(f"📜 已加载 JS {len(js_urls or [])} 个")
         contexts = 0
         for src in (js_urls or []):
-            if contexts >= 14:
+            if contexts >= 10:
                 break
             try:
                 body = page.request.get(src, timeout=20000).text()
                 fname = src.split("/")[-1][:45]
-                for kw in ("reserve/update", "resvDev", "memberKind:2", "resvKind"):
-                    idx = 0
-                    for _ in range(2):
-                        idx = body.find(kw, idx)
-                        if idx < 0:
-                            break
-                        log(f"📜 {fname}「{kw}」: ...{body[max(0, idx - 160):idx + 300]}...")
+                for kw in ("sf_request_type", "axios", "paramsSerializer"):
+                    idx = body.find(kw)
+                    if idx >= 0:
+                        log(f"📜 {fname}「{kw}」: ...{body[max(0, idx - 200):idx + 350]}...")
                         contexts += 1
-                        idx += len(kw)
-                        if contexts >= 14:
-                            break
-                    if contexts >= 14:
-                        break
             except Exception:
                 continue
     except Exception as e:
         log(f"⚠️ JS 扫描失败: {e}")
 
-    # 3. GET /reserve 加 sf_request_type=ajax（修可用性路径）
-    ds = today.replace("-", "")
-    r = _room_api_on_page(
-        page, f"/reserve?sysKind=1&resvDates={ds}&labIds=3,4,5,1,7,9&sf_request_type=ajax")
-    log(f"📥 GET /reserve+sf: code={r.get('code')} msg={str(r.get('message'))[:40]} "
-        f"data={len(r.get('data') or []) if isinstance(r.get('data'), list) else r.get('data')}")
-    findings.append(f"GET+sf:{r.get('code')}")
+    # 2. 变体矩阵（全部倒置时间 15:00→14:00，服务器必拒，零副作用）
+    # JS 实证的研讨室订房 payload（chunk-52d28091）：memberKind 单人=1
+    payload = {
+        "sysKind": 1,
+        "appAccNo": int(acc_id) if str(acc_id).isdigit() else acc_id,
+        "memberKind": 1,
+        "resvBeginTime": f"{today} 15:00:00",
+        "resvEndTime": f"{today} 14:00:00",
+        "testName": "研讨",
+        "resvKind": 2,
+        "resvProperty": 0,
+        "appUrl": "",
+        "resvMember": [int(acc_id) if str(acc_id).isdigit() else acc_id],
+        "resvDev": [6],
+        "memo": "probe",
+        "captcha": "",
+        "addServices": [],
+    }
 
-    # 4. POST /reserve/update 变体矩阵（全部倒置时间 15:00→14:00，零副作用）
-    def mk(dev_objs, acc_num, seat_style, minimal):
-        acc = int(acc_id) if (acc_num and str(acc_id).isdigit()) else acc_id
-        p = {
-            "appAccNo": acc,
-            "captcha": "",
-            "memberKind": 1 if seat_style else 2,
-            "memo": "研讨",
-            "resvBeginTime": f"{today} 15:00:00",
-            "resvDev": [{"devId": 6}] if dev_objs else [6],
-            "resvEndTime": f"{today} 14:00:00",
-            "resvMember": [acc],
-            "resvProperty": 0,
-            "sysKind": 2 if seat_style else 1,
-            "testName": "研讨",
-            "addServices": [],
-            "appUrl": "",
-        }
-        if not seat_style:
-            p["resvKind"] = 2
-        if minimal:
-            for k in ("captcha", "memo", "testName", "addServices", "appUrl", "resvProperty"):
-                p.pop(k, None)
-        return p
+    def raw_post(path, raw_body, content_type):
+        try:
+            resp = page.request.fetch(
+                IC_API + path, method="POST", data=raw_body,
+                headers={"Content-Type": content_type}, timeout=25000)
+            return _room_page_json(resp)
+        except Exception as e:
+            return {"code": -99, "message": f"异常: {e}"}
 
-    variants = [
-        ("U1 dev=[6] acc数字 房间式", mk(False, True, False, False), True),
-        ("U2 dev=[{devId}] acc数字 房间式", mk(True, True, False, False), True),
-        ("U3 dev=[6] acc字符串 房间式", mk(False, False, False, False), True),
-        ("U4 座位式 sys2/mk1", mk(False, True, True, False), True),
-        ("U5 最小payload 房间式", mk(False, True, False, True), True),
-        ("U6 房间式 无sf", mk(False, True, False, False), False),
-    ]
+    # W1: JSON body + memberKind=1 + sf
+    r1 = _room_api_on_page(page, "/reserve/update?sf_request_type=ajax",
+                           method="POST", data=payload, timeout=25000)
+    log(f"📥 W1 JSONbody+mk1+sf: code={r1.get('code')} msg={str(r1.get('message'))[:70]}")
+    findings.append(f"W1:{str(r1.get('message'))[:25]}")
+
+    # W2: URL 查询串（axios params 方式）—— 数组用单值（Java 绑定）
+    import urllib.parse as _up
+    flat = []
+    for k, v in payload.items():
+        if isinstance(v, list):
+            for it in v:
+                flat.append((k, it))
+        else:
+            flat.append((k, v))
+    flat.append(("sf_request_type", "ajax"))
+    qs = _up.urlencode(flat)
+    r2 = raw_post("/reserve/update?" + qs, b"", "application/x-www-form-urlencoded")
+    log(f"📥 W2 URL查询串: code={r2.get('code')} msg={str(r2.get('message'))[:70]}")
+    findings.append(f"W2:{str(r2.get('message'))[:25]}")
+
+    # W3: 表单 body（x-www-form-urlencoded，axios 对 post params 有时转 form）
+    r3 = raw_post("/reserve/update?sf_request_type=ajax",
+                  qs.encode(), "application/x-www-form-urlencoded")
+    log(f"📥 W3 表单body: code={r3.get('code')} msg={str(r3.get('message'))[:70]}")
+    findings.append(f"W3:{str(r3.get('message'))[:25]}")
+
+    # W4: JSON body 不带 sf
+    r4 = _room_api_on_page(page, "/reserve/update", method="POST",
+                           data=payload, timeout=25000)
+    log(f"📥 W4 JSONbody无sf: code={r4.get('code')} msg={str(r4.get('message'))[:70]}")
+    findings.append(f"W4:{str(r4.get('message'))[:25]}")
+
+    # W5: 查询串数组用 [] 后缀（PHP 风格，部分 Java 也认）
+    flat5 = []
+    for k, v in payload.items():
+        if isinstance(v, list):
+            for it in v:
+                flat5.append((k + "[]", it))
+        else:
+            flat5.append((k, v))
+    flat5.append(("sf_request_type", "ajax"))
+    r5 = raw_post("/reserve/update?" + _up.urlencode(flat5), b"",
+                  "application/x-www-form-urlencoded")
+    log(f"📥 W5 URL查询串[]后缀: code={r5.get('code')} msg={str(r5.get('message'))[:70]}")
+    findings.append(f"W5:{str(r5.get('message'))[:25]}")
+
+    # 3. 若某变体通过参数校验 → 冲突时段验证（仍零副作用）
     winner = None
-    for name, payload, sf in variants:
-        q = "?sf_request_type=ajax" if sf else ""
-        rr = _room_api_on_page(page, "/reserve/update" + q, method="POST",
-                               data=payload, timeout=25000)
-        msg = str(rr.get("message", ""))
-        log(f"📥 {name}: code={rr.get('code')} msg={msg[:70]}")
-        findings.append(f"{name[:6]}:{msg[:25]}")
-        if "参数" not in msg:
-            winner = (name, payload, sf)
-            log(f"🎯 {name} 通过参数校验！")
+    for name, r in (("W1", r1), ("W2", r2), ("W3", r3), ("W4", r4), ("W5", r5)):
+        msg = str(r.get("message", ""))
+        if "参数" not in msg and r.get("code") not in (-99,):
+            winner = (name, r)
             break
-
-    # 5. 若通过参数校验 → 冲突时段验证（仍零副作用）
     if winner:
-        name, payload, sf = winner
+        name, r = winner
+        log(f"🎯 {name} 通过参数校验（msg={str(r.get('message'))[:60]}）！用冲突时段复核...")
+        # 冲突复核：找一个已占用时段
         raw = _room_query_avail_raw(page, today, captured)
         conflict = None
         if raw:
@@ -1946,28 +1965,52 @@ def _room_op_probe(page, captured, op):
                     h, m = t.split(":")
                     return int(h) * 60 + int(m)
                 s = to_min(rv["resvBeginTime"][11:16])
-                e = min(to_min(rv["resvBeginTime"][11:16]) + 30, to_min(rv["resvEndTime"][11:16]))
-                cs = f"{s // 60:02d}:{s % 60:02d}"
-                ce = f"{e // 60:02d}:{e % 60:02d}"
-                p2 = json.loads(json.dumps(payload))
-                if isinstance(payload.get("resvDev"), list) and isinstance(payload["resvDev"][0], dict):
-                    p2["resvDev"] = [{"devId": rm["devId"]}]
+                e = min(to_min(rv["resvBeginTime"][11:16]) + 30,
+                        to_min(rv["resvEndTime"][11:16]))
+                cs = f"{s // 60:02d}:{s % 60:02d}:00"
+                ce = f"{e // 60:02d}:{e % 60:02d}:00"
+                p2 = dict(payload)
+                p2["resvDev"] = [rm["devId"]]
+                p2["resvBeginTime"] = f"{today} {cs}"
+                p2["resvEndTime"] = f"{today} {ce}"
+                # 用胜出的传输方式
+                if name == "W1":
+                    r2f = _room_api_on_page(page, "/reserve/update?sf_request_type=ajax",
+                                            method="POST", data=p2, timeout=25000)
+                elif name in ("W2", "W5"):
+                    flat2 = []
+                    for k, v in p2.items():
+                        if isinstance(v, list):
+                            for it in v:
+                                flat2.append((k + ("[]" if name == "W5" else ""), it))
+                        else:
+                            flat2.append((k, v))
+                    flat2.append(("sf_request_type", "ajax"))
+                    r2f = raw_post("/reserve/update?" + _up.urlencode(flat2), b"",
+                                   "application/x-www-form-urlencoded")
+                elif name == "W3":
+                    flat3 = []
+                    for k, v in p2.items():
+                        if isinstance(v, list):
+                            for it in v:
+                                flat3.append((k, it))
+                        else:
+                            flat3.append((k, v))
+                    r2f = raw_post("/reserve/update?sf_request_type=ajax",
+                                   _up.urlencode(flat3).encode(),
+                                   "application/x-www-form-urlencoded")
                 else:
-                    p2["resvDev"] = [rm["devId"]]
-                p2["resvBeginTime"] = f"{today} {cs}:00"
-                p2["resvEndTime"] = f"{today} {ce}:00"
-                q = "?sf_request_type=ajax" if sf else ""
-                r2 = _room_api_on_page(page, "/reserve/update" + q, method="POST",
-                                       data=p2, timeout=25000)
-                log(f"📥 冲突验证({rm.get('devName')} {cs}-{ce}): code={r2.get('code')} "
-                    f"msg={str(r2.get('message'))[:90]}")
-                findings.append(f"冲突:{str(r2.get('message'))[:35]}")
+                    r2f = _room_api_on_page(page, "/reserve/update", method="POST",
+                                            data=p2, timeout=25000)
+                log(f"📥 冲突复核({rm.get('devName')}): code={r2f.get('code')} "
+                    f"msg={str(r2f.get('message'))[:90]}")
+                findings.append(f"冲突复核:{str(r2f.get('message'))[:40]}")
+                if r2f.get("code") == 0:
+                    log("🚨 意外成功！查 uuid 立即清理")
             except Exception as e:
-                log(f"⚠️ 冲突验证异常: {e}")
-        else:
-            log("📭 没有已占用房间可做冲突验证")
+                log(f"⚠️ 冲突复核异常: {e}")
 
-    # 6. 零副作用确认
+    # 4. 零副作用确认
     begin = (_bjnow() - timedelta(days=1)).strftime("%Y-%m-%d")
     end = (_bjnow() + timedelta(days=3)).strftime("%Y-%m-%d")
     j5 = _room_api_on_page(
@@ -1984,7 +2027,7 @@ def _room_op_probe(page, captured, op):
                 log(f"🧹 清理预约 {rv['uuid']}: {str(d)[:100]}")
     else:
         log("✅ 探测零副作用：没有创建任何预约")
-    return "🔬 probe v3 完成（零副作用）: " + "；".join(findings)
+    return "🔬 probe v4 完成（零副作用）: " + "；".join(findings)
 
 
 def run_room_op(op_json):
