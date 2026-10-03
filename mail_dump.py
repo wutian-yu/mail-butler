@@ -52,7 +52,7 @@ def main():
     print("✅ Outlook token 已获取", flush=True)
     url = ("https://outlook.office.com/api/v2.0/me/messages"
            "?$top=80&$select=Subject,ReceivedDateTime,From,Body"
-           "&$orderby=ReceivedDateTime DESC")
+           "&$orderby=" + urllib.parse.quote("ReceivedDateTime DESC"))
     req = urllib.request.Request(url, headers={
         "Authorization": "Bearer " + token, "Accept": "application/json",
         "Origin": ORIGIN, "User-Agent": UA})
