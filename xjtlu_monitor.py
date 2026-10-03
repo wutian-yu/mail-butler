@@ -1737,25 +1737,27 @@ def _room_validate_booking(date_str, start, end):
 
 def _room_search_member(page, keyword):
     """按统一账号搜同学 accNo（订房同伴用）。
-    GET /account/getMembers?key=<账号>&page=1&pageNum=10（probe v29 从 remoteMethod 源码定位）
-    返回 accNo（int/str）或 None"""
+    GET /account/getMembers?key=<完整账号>（probe v30 实证：精确匹配、大小写不敏感、前缀无结果）。
+    服务器对返回姓名掩码（"Guanchen* Wu(***…26)"），无法与原文比对 → 直接取第一行 accNo。
+    status/localstatus=2 表示该账号被停用（remoteMethod 的 disable 映射）。
+    返回 accNo 或 None"""
     try:
         key = str(keyword).strip()
         path = (f"/account/getMembers?key={urllib.parse.quote(key, safe='')}"
                 f"&page=1&pageNum=10")
         r = _room_api_on_page(page, path, timeout=15000)
         rows = r.get("data") or []
-        if r.get("code") == 0 and isinstance(rows, list):
-            for x in rows:
-                if not isinstance(x, dict):
-                    continue
-                if str(x.get("logonName") or "").upper() == key.upper():
-                    return x.get("accNo")
-            if rows:
-                x = rows[0]
-                log(f"👥 搜索无精确匹配，首个结果: {x.get('logonName')} accNo={x.get('accNo')}")
+        if r.get("code") == 0 and isinstance(rows, list) and rows:
+            x = rows[0]
+            if x.get("status") == 2 or x.get("localstatus") == 2:
+                log(f"⚠️ 同学 {key} 账号被停用(status={x.get('status')})，无法加入预定")
                 return None
-        log(f"⚠️ 搜索失败 key={key}: code={r.get('code')} msg={str(r.get('message'))[:60]}")
+            acc = x.get("accNo")
+            if acc:
+                log(f"👥 搜索命中: {x.get('logonName')} → accNo={acc}")
+                return acc
+        log(f"⚠️ 搜索无结果 key={key}: code={r.get('code')} "
+            f"rows={len(rows) if isinstance(rows, list) else 0}（需完整账号）")
     except Exception as e:
         log(f"⚠️ 搜索异常: {e}")
     return None
