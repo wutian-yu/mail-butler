@@ -1,0 +1,42 @@
+name: LM Scan
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  scan:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout 代码仓库
+        uses: actions/checkout@v4
+
+      - name: Clone 私有数据仓库
+        run: git clone https://x-access-token:${{ secrets.GH_PAT }}@github.com/wutian-yu/butler-data.git data
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Install Playwright
+        run: |
+          pip install playwright
+          playwright install chromium --with-deps
+
+      - name: Run LM Scan
+        env:
+          EBRIDGE_COOKIES: ${{ secrets.EBRIDGE_COOKIES }}
+          GH_PAT: ${{ secrets.GH_PAT }}
+          XJTLU_STATE_FILE: ${{ github.workspace }}/data/xjtlu_state.json
+        run: python lm_scan.py
+
+      - name: Push 数据仓库变更
+        run: |
+          cd data
+          git config user.name "LM Scan Bot"
+          git config user.email "bot@xjtlu.edu.cn"
+          git add lm_pages.json
+          git diff --cached --quiet || (git commit -m "lm pages scan" && git push)
