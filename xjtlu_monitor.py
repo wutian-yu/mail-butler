@@ -1821,11 +1821,11 @@ def _room_op_query(page, captured, op):
 
 
 def _room_op_probe(page, captured, op):
-    """安全探测订房 API v7（决定性测试）：
-    1. 用 SPA 自身 axios 实例（含拦截器）发订房请求（倒置时间，零副作用）
-    2. 拦截该请求看完整内容（真实URL含baseURL + 真实headers + 真实body格式）
-    3. 测 resvProperty=32（JS里发现的值）和 0 对照
-    4. 零副作用确认
+    """安全探测订房 API v8（终极分辨测试）：
+    用 SPA 自身 axios（含 token 拦截器）：
+    A. 冲突时段（时间格式有效但已被占）→ 若报"冲突"而非"参数错误"= payload 格式正确，倒置时间才是参数错误的原因
+    B. 真实空闲时段 → 若成功，立即查询 uuid 并删除（端到端验证，1秒内清理）
+    零残留确认。
     """
     today = _bjnow().strftime("%Y-%m-%d")
     findings = []
@@ -1834,82 +1834,33 @@ def _room_op_probe(page, captured, op):
     log(f"🆔 accId={acc_id!r} pid={pid!r}")
     findings.append(f"accId={acc_id}")
 
-    # 1. 拦截 /reserve/update 请求
-    intercepted = []
+    # 查实时可用性：找已占房间（A用）和空闲房间（B用）
+    raw = _room_query_avail_raw(page, today, captured)
+    conflict_room = occupied_slot = None
+    free_room = None
+    if raw:
+        for campus in raw:
+            for lab in campus.get("labInfos") or []:
+                for rm in lab.get("roomInfos") or []:
+                    occ = [rv for rv in (rm.get("resvInfos") or [])
+                           if _room_slot_occupied(rv.get("resvStatus", 0))]
+                    if occ and not conflict_room:
+                        conflict_room, occupied_slot = rm, occ[0]
+                    if not occ and not free_room:
+                        free_room = rm
+        log(f"📍 冲突房间: {conflict_room and conflict_room.get('devName')}；"
+            f"空闲房间: {free_room and free_room.get('devName')}")
+    else:
+        log("❌ 可用性查询失败，无法继续")
+        return "❌ probe v8: 可用性查询失败"
 
-    def _on_request(req):
-        try:
-            if "reserve/update" in req.url:
-                item = {"url": req.url, "method": req.method,
-                        "headers": dict(req.headers)}
-                try:
-                    item["post_data"] = req.post_data
-                except Exception:
-                    item["post_data"] = "(无法读取)"
-                intercepted.append(item)
-        except Exception:
-            pass
+    def to_min(t):
+        h, m = t.split(":")
+        return int(h) * 60 + int(m)
 
-    page.on("request", _on_request)
-
-    # 2. SPA 自身 axios 实测（纯字符串拼接，不用 f-string；JS侧10秒超时兜底）
-    js_code = (
-        "() => Promise.race(["
-        "new Promise((resolve) => {"
-        "try {"
-        "const el = document.querySelector('#app') || document.body.firstElementChild;"
-        "const vm = el && el.__vue__;"
-        "if (!vm) { resolve({stage: 'vue', error: 'no vue on ' + (el && el.tagName)}); return; }"
-        "const axios = vm.$axios || vm.$http;"
-        "if (!axios || !axios.post) { resolve({stage: 'axios', error: 'no $axios'}); return; }"
-        "const store = vm.$store;"
-        "if (!store || !store.state.userInfo) { resolve({stage: 'store', error: 'no userInfo'}); return; }"
-        "const accNo = store.state.userInfo.accNo;"
-        "const today = " + json.dumps(today) + ";"
-        "const mk = (rp) => ({"
-        "sysKind: 1,"
-        "appAccNo: accNo,"
-        "memberKind: 1,"
-        "resvBeginTime: today + ' 15:00:00',"
-        "resvEndTime: today + ' 14:00:00',"
-        "testName: '研讨',"
-        "resvKind: 2,"
-        "resvProperty: rp,"
-        "appUrl: '',"
-        "resvMember: [accNo],"
-        "resvDev: [6],"
-        "memo: 'probe',"
-        "captcha: '',"
-        "addServices: [],"
-        "});"
-        "axios.post('/reserve/update', mk(32))"
-        ".then(r => resolve({stage: 'rp32', status: r.status, code: r.data && r.data.code, message: r.data && r.data.message}))"
-        ".catch(e => resolve({stage: 'rp32', error: String(e).slice(0, 150)}));"
-        "} catch(e) { resolve({stage: 'outer', error: String(e).slice(0, 150)}); }"
-        "}),"
-        "new Promise((resolve) => setTimeout(() => resolve({stage: 'jstimeout'}), 10000))"
-        "])"
-    )
-    try:
-        result = page.evaluate(js_code)
-        log(f"📥 SPA axios(rp32): {json.dumps(result, ensure_ascii=False)[:300]}")
-        findings.append(f"rp32:{str(result.get('message', result.get('error', result.get('stage'))))[:30]}")
-    except Exception as e:
-        log(f"⚠️ SPA axios 执行失败: {e}")
-        findings.append("SPAaxios:执行失败")
-
-    time.sleep(2)
-
-    # 3. 若第一发发出去了 → 打印拦截内容 + 第二发 rp=0 对照
-    if intercepted:
-        it = intercepted[-1]
-        log("🔍 拦截到 SPA 请求:")
-        log(f"   URL: {it['url'][:250]}")
-        log(f"   Method: {it['method']}")
-        log(f"   Headers: {json.dumps(it['headers'], ensure_ascii=False)[:500]}")
-        log(f"   PostData: {str(it.get('post_data'))[:600]}")
-        findings.append("拦截✓")
-        js2 = (
+    # SPA axios 调用器（拦截器自动带 token/lan 头）
+    def spa_post(payload):
+        js = (
             "() => Promise.race(["
             "new Promise((resolve) => {"
             "try {"
@@ -1918,56 +1869,125 @@ def _room_op_probe(page, captured, op):
             "const axios = vm && vm.$axios;"
             "const store = vm && vm.$store;"
             "if (!axios || !store || !store.state.userInfo) { resolve({stage: 'noaxios'}); return; }"
-            "const accNo = store.state.userInfo.accNo;"
-            "const today = " + json.dumps(today) + ";"
-            "const p = {"
-            "sysKind: 1, appAccNo: accNo, memberKind: 1,"
-            "resvBeginTime: today + ' 15:00:00', resvEndTime: today + ' 14:00:00',"
-            "testName: '研讨', resvKind: 2, resvProperty: 0, appUrl: '',"
-            "resvMember: [accNo], resvDev: [6], memo: 'probe',"
-            "captcha: '', addServices: [],"
-            "};"
+            "const p = " + json.dumps(payload, ensure_ascii=False) + ";"
             "axios.post('/reserve/update', p)"
-            ".then(r => resolve({stage: 'rp0', code: r.data && r.data.code, message: r.data && r.data.message}))"
-            ".catch(e => resolve({stage: 'rp0', error: String(e).slice(0, 120)}));"
-            "} catch(e) { resolve({stage: 'outer', error: String(e).slice(0, 120)}); }"
+            ".then(r => resolve({ok: 1, status: r.status, code: r.data && r.data.code, message: r.data && r.data.message, data: r.data && r.data.data}))"
+            ".catch(e => resolve({ok: 0, error: String(e).slice(0, 150)}));"
+            "} catch(e) { resolve({ok: -1, error: String(e).slice(0, 150)}); }"
             "}),"
-            "new Promise((resolve) => setTimeout(() => resolve({stage: 'jstimeout2'}), 10000))"
+            "new Promise((resolve) => setTimeout(() => resolve({stage: 'jstimeout'}), 15000))"
             "])"
         )
         try:
-            r2 = page.evaluate(js2)
-            log(f"📥 SPA axios(rp0): {json.dumps(r2, ensure_ascii=False)[:250]}")
-            findings.append(f"rp0:{str(r2.get('message', r2.get('error', r2.get('stage'))))[:25]}")
+            return page.evaluate(js)
         except Exception as e:
-            log(f"⚠️ rp0 执行失败: {e}")
+            return {"ok": -2, "error": str(e)[:150]}
+
+    def mk_payload(dev_id, start, end, rp=32):
+        return {
+            "sysKind": 1,
+            "appAccNo": int(acc_id) if str(acc_id).isdigit() else acc_id,
+            "memberKind": 1,
+            "resvBeginTime": f"{today} {start}",
+            "resvEndTime": f"{today} {end}",
+            "testName": "研讨",
+            "resvKind": 2,
+            "resvProperty": rp,
+            "appUrl": "",
+            "resvMember": [int(acc_id) if str(acc_id).isdigit() else acc_id],
+            "resvDev": [dev_id],
+            "memo": "小组研讨",
+            "captcha": "",
+            "addServices": [],
+        }
+
+    # A. 冲突时段测试（零副作用：必然被拒，但时间格式有效）
+    if conflict_room and occupied_slot:
+        try:
+            s = occupied_slot["resvBeginTime"][11:19]
+            e = occupied_slot["resvEndTime"][11:19]
+            cs = f"{int(s[:2]):02d}:{int(s[3:5]):02d}:00"
+            mid_e = to_min(s[:5]) + 30
+            if mid_e > to_min(e[:5]):
+                mid_e = to_min(e[:5])
+            ce = f"{mid_e // 60:02d}:{mid_e % 60:02d}:00"
+            if to_min(cs[:5]) >= to_min(ce[:5]):
+                ce = f"{to_min(cs[:5]) + 20 // 60:02d}:{(to_min(cs[:5]) + 20) % 60:02d}:00"
+            pA = mk_payload(conflict_room["devId"], cs, ce)
+            rA = spa_post(pA)
+            log(f"📥 A 冲突测试({conflict_room.get('devName')} {cs}-{ce}): "
+                f"{json.dumps(rA, ensure_ascii=False)[:250]}")
+            findings.append(f"A冲突:{str(rA.get('message', rA.get('error', '')))[:35]}")
+        except Exception as e:
+            log(f"⚠️ A 测试异常: {e}")
     else:
-        log("📭 未拦截到 /reserve/update（SPA axios 没发出请求）")
+        log("📭 今天没有已占用房间，跳过 A 测试")
 
-    try:
-        page.remove_listener("request", _on_request)
-    except Exception:
-        pass
+    # B. 真实空闲时段端到端（成功→立即清理）
+    if free_room:
+        # 选 21:00-22:00（最不干扰的时段；房间开放到 22:00）
+        pB = mk_payload(free_room["devId"], "21:00:00", "22:00:00")
+        log(f"📤 B 端到端：{free_room.get('devName')} 今天 21:00-22:00（成功即删）")
+        rB = spa_post(pB)
+        log(f"📥 B 订房响应: {json.dumps(rB, ensure_ascii=False)[:300]}")
+        findings.append(f"B订房:{str(rB.get('message', rB.get('error', '')))[:35]}")
+        if rB.get("code") == 0:
+            log("🎯 订房成功！立即查 uuid 清理...")
+            time.sleep(1)
+            begin = (_bjnow() - timedelta(days=1)).strftime("%Y-%m-%d")
+            end = (_bjnow() + timedelta(days=3)).strftime("%Y-%m-%d")
+            j = _room_api_on_page(
+                page, f"/reserve/resvInfo?beginDate={begin}&endDate={end}"
+                      f"&needStatus=8582&page=1&pageNum=20&orderKey=gmt_create")
+            rows = j.get("data") or []
+            deleted = False
+            for rv in rows:
+                if rv.get("uuid"):
+                    d = _room_api_on_page(page, "/reserve/delete?sf_request_type=ajax",
+                                          method="POST", data={"uuid": rv["uuid"]},
+                                          timeout=25000)
+                    log(f"🧹 删除 {rv['uuid']}: {json.dumps(d, ensure_ascii=False)[:150]}")
+                    findings.append(f"清理:{str(d.get('message'))[:30]}")
+                    deleted = d.get("code") == 0
+            if not rows:
+                log("⚠️ 订房成功但 resvInfo 查不到？（可能 needStatus 过滤）")
+                # 复查 needStatus=262
+                j2 = _room_api_on_page(
+                    page, f"/reserve/resvInfo?beginDate={begin}&endDate={end}"
+                          f"&needStatus=262&page=1&pageNum=20&orderKey=gmt_create")
+                for rv in (j2.get("data") or []):
+                    if rv.get("uuid"):
+                        d = _room_api_on_page(page, "/reserve/delete?sf_request_type=ajax",
+                                              method="POST", data={"uuid": rv["uuid"]},
+                                              timeout=25000)
+                        log(f"🧹 删除(ns262) {rv['uuid']}: {str(d)[:120]}")
+                        deleted = deleted or d.get("code") == 0
+    else:
+        log("📭 今天没有全天空闲房间，跳过 B 测试")
 
-    # 4. 零副作用确认
+    # 零残留确认（两种状态过滤）
     begin = (_bjnow() - timedelta(days=1)).strftime("%Y-%m-%d")
     end = (_bjnow() + timedelta(days=3)).strftime("%Y-%m-%d")
-    j5 = _room_api_on_page(
-        page, f"/reserve/resvInfo?beginDate={begin}&endDate={end}"
-              f"&needStatus=8582&page=1&pageNum=20&orderKey=gmt_create")
-    rows = j5.get("data") or []
-    log(f"📥 我的预约数量（应为0）: {len(rows)}")
-    if rows:
-        for rv in rows:
-            if rv.get("uuid"):
-                d = _room_api_on_page(page, "/reserve/delete?sf_request_type=ajax",
-                                      method="POST", data={"uuid": rv["uuid"]},
-                                      timeout=25000)
-                log(f"🧹 清理 {rv['uuid']}: {str(d)[:100]}")
+    residue = []
+    for ns in ("8582", "262"):
+        j5 = _room_api_on_page(
+            page, f"/reserve/resvInfo?beginDate={begin}&endDate={end}"
+                  f"&needStatus={ns}&page=1&pageNum=20&orderKey=gmt_create")
+        for rv in (j5.get("data") or []):
+            if rv.get("uuid") and rv["uuid"] not in [x.get("uuid") for x in residue]:
+                residue.append(rv)
+    if residue:
+        log(f"🚨 检测到 {len(residue)} 条预约残留，全部清理：")
+        for rv in residue:
+            d = _room_api_on_page(page, "/reserve/delete?sf_request_type=ajax",
+                                  method="POST", data={"uuid": rv["uuid"]},
+                                  timeout=25000)
+            log(f"🧹 兜底 {rv['uuid']}: {str(d)[:120]}")
+        findings.append("有残留已清理⚠️")
     else:
-        log("✅ 零副作用：没有创建任何预约")
+        log("✅ 零残留：没有任何预约")
         findings.append("零残留✅")
-    return "🔬 probe v7 完成: " + "；".join(findings)
+    return "🔬 probe v8 完成: " + "；".join(findings)
 
 
 def run_room_op(op_json):
