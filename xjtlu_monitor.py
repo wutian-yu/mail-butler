@@ -1821,13 +1821,11 @@ def _room_op_query(page, captured, op):
 
 
 def _room_op_probe(page, captured, op):
-    """安全探测订房 API v5（决定性测试）：
-    1. reload 捕获 SPA 真实请求头（axios 拦截器加的头全在里面）
-    2. JS 扫描 interceptors（拦截器源码）
-    3. 用 SPA 同款请求头 + JS 实证 payload 复刻订房：
-       a. 先倒置时间（零副作用）→ 若错误不再是"参数错误"说明格式对了
-       b. 再真实空闲时段 → 若成功立即 cancel（端到端验证，1秒内清理）
-    4. 最终零副作用确认
+    """安全探测订房 API v6（决定性测试）：
+    1. 在浏览器里直接调用 SPA 的 axios 实例发订房请求（倒置时间，零副作用）
+    2. 拦截实际发出的网络请求看完整内容（URL + body + headers）
+    3. 扫描 chunk-52d28091 完整 JS 找 submit 函数的完整字段（含 clickNum 等）
+    4. 零副作用确认
     """
     today = _bjnow().strftime("%Y-%m-%d")
     findings = []
@@ -1836,60 +1834,111 @@ def _room_op_probe(page, captured, op):
     log(f"🆔 accId={acc_id!r} pid={pid!r}")
     findings.append(f"accId={acc_id}")
 
-    # 1. 捕获 SPA 真实请求头
-    spa_headers = {}
-    captured_reqs = []
+    # 1. 拦截 /reserve/update 请求看完整内容
+    intercepted = {}
 
     def _on_request(req):
         try:
-            if "/ic-web/" in req.url:
-                captured_reqs.append((req.url.split("/ic-web/", 1)[1][:60],
-                                      dict(req.headers), req.method))
+            if "/reserve/update" in req.url:
+                intercepted["url"] = req.url
+                intercepted["method"] = req.method
+                intercepted["headers"] = dict(req.headers)
+                try:
+                    intercepted["post_data"] = req.post_data
+                except Exception:
+                    intercepted["post_data"] = "(无法读取)"
         except Exception:
             pass
 
     page.on("request", _on_request)
+
+    # 2. 在浏览器里用 SPA 自己的 axios 实例发请求
+    js_code = f"""
+    () => new Promise((resolve) => {{
+        try {{
+            // 找 Vue 根实例
+            const el = document.querySelector('#app');
+            if (!el || !el.__vue__) {{ resolve({{error: 'no vue instance'}}); return; }}
+            const vm = el.__vue__;
+            const store = vm.$store;
+            const axios = vm.$axios || vm.$http;
+            if (!axios) {{ resolve({{error: 'no axios'}}); return; }}
+            const userInfo = store.state.userInfo;
+            const accNo = userInfo.accNo;
+
+            // JS 实证的研讨室订房 payload
+            const payload = {{
+                sysKind: 1,
+                appAccNo: accNo,
+                memberKind: 1,
+                resvBeginTime: "{today} 15:00:00",
+                resvEndTime: "{today} 14:00:00",
+                testName: "研讨",
+                resvKind: 2,
+                resvProperty: 0,
+                appUrl: "",
+                resvMember: [accNo],
+                resvDev: [6],
+                memo: "probe",
+                captcha: "",
+                addServices: [],
+            }};
+
+            // 用 SPA 的 axios 封装发请求
+            axios({{method: "post", url: "/reserve/update", params: payload}})
+                .then(r => resolve({{ok: true, code: r.code, message: r.message, data: r.data}}))
+                .catch(e => resolve({{ok: false, error: String(e)}}));
+        }} catch(e) {{ resolve({{error: String(e)}}); }}
+    }})
+    """
     try:
-        page.reload(wait_until="domcontentloaded", timeout=45000)
-        time.sleep(5)
+        result = page.evaluate(js_code, timeout=30000)
+        log(f"📥 SPA axios 响应: {json.dumps(result, ensure_ascii=False)[:300]}")
+        findings.append(f"SPAaxios:{str(result.get('message', result.get('error', '')))[:30]}")
     except Exception as e:
-        log(f"⚠️ reload: {e}")
+        log(f"⚠️ SPA axios 执行失败: {e}")
+        findings.append(f"SPAaxios:执行失败")
+
+    time.sleep(2)
     try:
         page.remove_listener("request", _on_request)
     except Exception:
         pass
-    if captured_reqs:
-        # 找一个 GET 的完整请求头做模板
-        get_hdr = next((h for u, h, m in captured_reqs if m == "GET"), captured_reqs[0][1])
-        spa_headers.update(get_hdr)
-        log(f"🔍 SPA 请求头模板: {json.dumps(get_hdr, ensure_ascii=False)[:500]}")
-        log(f"🔍 本次共捕获 {len(captured_reqs)} 个 ic-web 请求")
-    # reload 后确认还在 roombookings
-    if _url_host(page.url) != "roombookings.xjtlu.edu.cn":
-        log("🔄 reload 后跳转链重跑...")
-        if not _room_wait_ready(page):
-            return "❌ reload 后登录态丢失"
 
-    # 2. JS 扫描 interceptors
+    # 3. 打印拦截到的完整请求
+    if intercepted:
+        log(f"🔍 拦截到 SPA 请求:")
+        log(f"   URL: {str(intercepted.get('url'))[:200]}")
+        log(f"   Method: {intercepted.get('method')}")
+        log(f"   Headers: {json.dumps(intercepted.get('headers', {}), ensure_ascii=False)[:400]}")
+        log(f"   PostData: {str(intercepted.get('post_data'))[:500]}")
+    else:
+        log("📭 未拦截到 /reserve/update 请求（SPA axios 可能没真正发出）")
+
+    # 4. 扫描 chunk-52d28091 完整 JS（找 submit 函数完整定义 + clickNum 来源）
     try:
         js_urls = page.evaluate(
             "() => performance.getEntriesByType('resource')"
-            ".map(r => r.name).filter(u => u.endsWith('.js'))")
-        for src in (js_urls or []):
-            try:
-                body = page.request.get(src, timeout=20000).text()
-                idx = body.find("interceptors")
-                if idx >= 0:
-                    fname = src.split("/")[-1][:45]
-                    log(f"📜 {fname}「interceptors」: ...{body[max(0, idx - 100):idx + 450]}...")
-                    break
-            except Exception:
-                continue
+            ".map(r => r.name).filter(u => u.includes('chunk-52d28091'))")
+        if js_urls:
+            body = page.request.get(js_urls[0], timeout=20000).text()
+            # 找 submit/reserve/update 附近的完整代码
+            for kw in ("/reserve/update", "clickNum", "selectAccNoList", "submitForm"):
+                idx = 0
+                for _ in range(3):
+                    idx = body.find(kw, idx)
+                    if idx < 0:
+                        break
+                    log(f"📜 chunk-52d28091「{kw}」@{idx}: ...{body[max(0, idx - 200):idx + 400]}...")
+                    idx += len(kw)
+        else:
+            log("📜 chunk-52d28091 未找到")
     except Exception as e:
         log(f"⚠️ JS 扫描失败: {e}")
 
-    # 3a. 复刻订房：倒置时间 + SPA 同款请求头（零副作用）
-    payload = {
+    # 5. 用 SPA 实证的方式重试（如果有 clickNum 等新发现）
+    # 先用 Playwright request + JSON body 重新确认（加 clickNum）
+    payload2 = {
         "sysKind": 1,
         "appAccNo": int(acc_id) if str(acc_id).isdigit() else acc_id,
         "memberKind": 1,
@@ -1901,99 +1950,35 @@ def _room_op_probe(page, captured, op):
         "appUrl": "",
         "resvMember": [int(acc_id) if str(acc_id).isdigit() else acc_id],
         "resvDev": [6],
-        "memo": "probe",
+        "memo": "",
         "captcha": "",
         "addServices": [],
+        "clickNum": 1,
     }
-    # 构造 SPA 同款请求头（Cookie 由 context 自动带，其余复刻）
-    hdr = {"Content-Type": "application/json;charset=UTF-8"}
-    for k in ("X-Requested-With", "token", "Authorization", "Accept-Language", "uni-token"):
-        if k in spa_headers:
-            hdr[k] = spa_headers[k]
+    r5 = _room_api_on_page(page, "/reserve/update?sf_request_type=ajax",
+                           method="POST", data=payload2, timeout=25000)
+    log(f"📥 +clickNum: code={r5.get('code')} msg={str(r5.get('message'))[:80]}")
+    findings.append(f"+clickNum:{str(r5.get('message'))[:25]}")
 
-    def post_json(path, data):
-        try:
-            resp = page.request.fetch(IC_API + path, method="POST",
-                                      data=json.dumps(data).encode(),
-                                      headers=hdr, timeout=25000)
-            return _room_page_json(resp)
-        except Exception as e:
-            return {"code": -99, "message": f"异常: {e}"}
-
-    r_rev = post_json("/reserve/update?sf_request_type=ajax", payload)
-    log(f"📥 R1 倒置时间+SPA头: code={r_rev.get('code')} msg={str(r_rev.get('message'))[:80]}")
-    findings.append(f"R1倒置:{str(r_rev.get('message'))[:30]}")
-
-    # 3b. 真实空闲时段端到端模拟（成功→立即清理）
-    raw = _room_query_avail_raw(page, today, captured)
-    free_room = None
-    if raw:
-        for campus in raw:
-            for lab in campus.get("labInfos") or []:
-                for rm in lab.get("roomInfos") or []:
-                    if not [rv for rv in (rm.get("resvInfos") or [])
-                            if _room_slot_occupied(rv.get("resvStatus", 0))]:
-                        free_room = rm
-                        break
-                if free_room:
-                    break
-            if free_room:
-                break
-    if not free_room:
-        log("📭 今天没有全天空闲的房间，跳过端到端模拟")
-    else:
-        p2 = dict(payload)
-        p2["resvDev"] = [free_room.get("devId")]
-        p2["resvBeginTime"] = f"{today} 21:00:00"
-        p2["resvEndTime"] = f"{today} 22:00:00"
-        p2["memo"] = "研讨"
-        p2["testName"] = "小组讨论"
-        log(f"📤 R2 端到端模拟：{free_room.get('devName')} 今天 21:00-22:00（成功即删）")
-        r_book = post_json("/reserve/update?sf_request_type=ajax", p2)
-        log(f"📥 R2 订房响应: {json.dumps(r_book, ensure_ascii=False)[:250]}")
-        findings.append(f"R2订房:{str(r_book.get('message'))[:35]}")
-        if r_book.get("code") == 0:
-            log("🎯 订房成功！1秒内清理...")
-            time.sleep(1)
-            # 查 uuid 并删除
-            begin = (_bjnow() - timedelta(days=1)).strftime("%Y-%m-%d")
-            end = (_bjnow() + timedelta(days=3)).strftime("%Y-%m-%d")
-            j = _room_api_on_page(
-                page, f"/reserve/resvInfo?beginDate={begin}&endDate={end}"
-                      f"&needStatus=8582&page=1&pageNum=20&orderKey=gmt_create")
-            rows = j.get("data") or []
-            for rv in rows:
-                if rv.get("uuid"):
-                    d = _room_api_on_page(page, "/reserve/delete?sf_request_type=ajax",
-                                          method="POST", data={"uuid": rv["uuid"]},
-                                          timeout=25000)
-                    log(f"🧹 删除 {rv['uuid']}: {json.dumps(d, ensure_ascii=False)[:150]}")
-                    findings.append(f"清理:{str(d.get('message'))[:30]}")
-        else:
-            # 失败：把响应里所有字段打出来分析
-            log(f"📊 R2 失败详情: {json.dumps(r_book, ensure_ascii=False)[:300]}")
-
-    # 4. 零副作用最终确认（两种状态过滤都查）
-    cleaned = True
+    # 6. 零副作用确认
     begin = (_bjnow() - timedelta(days=1)).strftime("%Y-%m-%d")
     end = (_bjnow() + timedelta(days=3)).strftime("%Y-%m-%d")
-    for ns in ("8582", "262"):
-        j5 = _room_api_on_page(
-            page, f"/reserve/resvInfo?beginDate={begin}&endDate={end}"
-                  f"&needStatus={ns}&page=1&pageNum=20&orderKey=gmt_create")
-        rows = j5.get("data") or []
-        log(f"📥 我的预约(needStatus={ns}) 数量: {len(rows)}")
+    j5 = _room_api_on_page(
+        page, f"/reserve/resvInfo?beginDate={begin}&endDate={end}"
+              f"&needStatus=8582&page=1&pageNum=20&orderKey=gmt_create")
+    rows = j5.get("data") or []
+    log(f"📥 我的预约数量（应为0）: {len(rows)}")
+    if rows:
         for rv in rows:
             if rv.get("uuid"):
-                cleaned = False
                 d = _room_api_on_page(page, "/reserve/delete?sf_request_type=ajax",
                                       method="POST", data={"uuid": rv["uuid"]},
                                       timeout=25000)
-                log(f"🧹 兜底清理 {rv['uuid']}: {str(d)[:120]}")
-    if cleaned:
-        log("✅ 探测完成：当前没有任何预约残留")
+                log(f"🧹 清理 {rv['uuid']}: {str(d)[:100]}")
+    else:
+        log("✅ 零副作用：没有创建任何预约")
         findings.append("零残留✅")
-    return "🔬 probe v5 完成: " + "；".join(findings)
+    return "🔬 probe v6 完成: " + "；".join(findings)
 
 
 def run_room_op(op_json):
