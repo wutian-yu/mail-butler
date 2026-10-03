@@ -1385,7 +1385,10 @@ def run():
             if lm_events:
                 state["lm_events"] = {ev["uid"]: 1 for ev in lm_events}
             if fails <= 3 and last_fail_day != today:
-                msgs.append("⚠️ 西浦网站登录失败\n\n可能原因：Cookie过期或MFA验证。\n\n请在Mac上运行 export_cookies.py 重新导出Cookie并更新GitHub Secrets。\n\n为避免打扰，今日不再提醒。")
+                if XJTLU_USERNAME and XJTLU_PASSWORD:
+                    msgs.append("⚠️ 西浦网站登录失败\n\nCookie 已过期，系统已自动尝试账密登录但未成功。\n\n可能原因：SSO 密码已更改，或网络波动。\n\n请检查 GitHub Secrets 中的 XJTLU_USERNAME / XJTLU_PASSWORD 是否正确。\n\n为避免打扰，今日不再提醒。")
+                else:
+                    msgs.append("⚠️ 西浦网站登录失败\n\nCookie 已过期，且未配置账密自动登录。\n\n请在 GitHub Secrets 设置 XJTLU_USERNAME 和 XJTLU_PASSWORD 实现自动登录，或手动更新 EBRIDGE_COOKIES。\n\n为避免打扰，今日不再提醒。")
                 state["last_fail_notify"] = today
             if msgs:
                 feishu_send("\n\n".join(msgs))
