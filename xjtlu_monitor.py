@@ -1821,139 +1821,74 @@ def _room_op_query(page, captured, op):
 
 
 def _room_op_probe(page, captured, op):
-    """安全探测订房 API v11（情报收集 + captcha 假值测试）：
-    1. 读 Vuex store 的 sysConfig / userInfo / newResearch 完整状态
-    2. dump clickNum 上下文 2000 字符（看 submit 调用）
-    3. dump resvCode 上下文（captcha 要求）
-    4. 冲突时段 + 假 captcha="1234" 测试（零副作用）
+    """安全探测订房 API v12（纯情报：dump 完整 submit 方法代码）：
+    1. 找 chunk-52d28091 里的 handleSubmit:function / resvBeginTime:i / resvBeginTime:r
+    2. dump 完整方法体（含时间计算 + API 调用）
+    3. 分段打日志（避免截断）
     """
     today = _bjnow().strftime("%Y-%m-%d")
     findings = []
 
     acc_id, pid = _room_get_accid_from_storage(page)
-    log(f"🆔 accId={acc_id!r} pid={pid!r}")
+    log(f"🆔 accId={acc_id!r}")
     findings.append(f"accId={acc_id}")
 
-    # 1. 读 Vuex store 完整状态
-    try:
-        store_state = page.evaluate(
-            "() => {"
-            "const el = document.querySelector('#app') || document.body.firstElementChild;"
-            "const vm = el && el.__vue__;"
-            "if (!vm || !vm.$store) return {error: 'no store'};"
-            "const s = vm.$store.state;"
-            "return {"
-            "sysConfig: s.sysConfig,"
-            "userInfo: s.userInfo,"
-            "newResearch: s.newResearch,"
-            "config: s.config,"
-            "stateKeys: Object.keys(s),"
-            "};"
-            "}")
-        log(f"🔍 Vuex state keys: {json.dumps(store_state.get('stateKeys'), ensure_ascii=False)[:200]}")
-        log(f"🔍 sysConfig: {json.dumps(store_state.get('sysConfig'), ensure_ascii=False)[:500]}")
-        log(f"🔍 userInfo: {json.dumps(store_state.get('userInfo'), ensure_ascii=False)[:300]}")
-        log(f"🔍 newResearch: {json.dumps(store_state.get('newResearch'), ensure_ascii=False)[:500]}")
-        log(f"🔍 config: {json.dumps(store_state.get('config'), ensure_ascii=False)[:300]}")
-        findings.append(f"sysConfig:{json.dumps(store_state.get('sysConfig'), ensure_ascii=False)[:80]}")
-    except Exception as e:
-        log(f"⚠️ Vuex 读取失败: {e}")
-
-    # 2. dump chunk-52d28091 关键上下文
+    body = None
     try:
         js_urls = page.evaluate(
             "() => performance.getEntriesByType('resource')"
             ".map(r => r.name).filter(u => u.endsWith('.js') && u.includes('chunk-52d28091'))")
         if js_urls:
             body = page.request.get(js_urls[0], timeout=20000).text()
-            # clickNum 上下文（submit 调用）
-            idx = body.find("clickNum")
-            if idx >= 0:
-                log(f"📜 clickNum 上下文: ...{body[max(0, idx-200):idx+2000]}...")
-            # resvCode 上下文
-            idx2 = body.find("resvCode")
-            if idx2 >= 0:
-                log(f"📜 resvCode 上下文: ...{body[max(0, idx2-200):idx2+500]}...")
-            # 找 submitResv / handleSubmit / doSubmit 等方法名
-            for kw in ("submitResv", "handleSubmit", "doSubmit", "submitForm:", "saveResv",
-                       "confirmResv", "onSubmit", "handleResv", "doResv"):
-                idx3 = body.find(kw)
-                if idx3 >= 0:
-                    log(f"📜「{kw}」: ...{body[max(0, idx3-100):idx3+800]}...")
-                    break
+            log(f"📜 chunk-52d28091.js {len(body)} 字节")
     except Exception as e:
-        log(f"⚠️ JS 扫描失败: {e}")
+        log(f"⚠️ chunk 下载失败: {e}")
+        return "❌ probe v12: chunk 下载失败"
 
-    # 3. 冲突时段 + 假 captcha 测试
-    raw = _room_query_avail_raw(page, today, captured)
-    conflict_room = occupied_slot = None
-    if raw:
-        for campus in raw:
-            for lab in campus.get("labInfos") or []:
-                for rm in lab.get("roomInfos") or []:
-                    occ = [rv for rv in (rm.get("resvInfos") or [])
-                           if _room_slot_occupied(rv.get("resvStatus", 0))]
-                    if occ:
-                        conflict_room, occupied_slot = rm, occ[0]
-                        break
-                if conflict_room:
-                    break
-            if conflict_room:
+    if not body:
+        return "❌ probe v12: chunk 为空"
+
+    # 1. 找 handleSubmit:function（完整方法体，分段 dump）
+    idx = body.find("handleSubmit:function")
+    if idx >= 0:
+        seg = body[idx:idx + 9000]
+        for i in range(0, min(len(seg), 9000), 900):
+            log(f"📜 submit[{i//900}] {seg[i:i+900]}")
+        findings.append("handleSubmit已dump")
+    else:
+        log("📜 handleSubmit:function 未找到，试别的关键词")
+        for kw in ("resvBeginTime:i", "resvBeginTime:r", "selectAccNoList.length",
+                   "changeBeginTime:function", "laterTimeChange:function"):
+            j = body.find(kw)
+            if j >= 0:
+                log(f"📜「{kw}」@{j}: {body[max(0, j - 500):j + 3000][:3500]}")
+                findings.append(f"{kw[:15]}已dump")
                 break
 
-    if conflict_room:
-        s_slot = occupied_slot["resvBeginTime"]
-        e_slot = occupied_slot["resvEndTime"]
-        dev = conflict_room["devId"]
-        acc = int(acc_id) if str(acc_id).isdigit() else acc_id
+    # 2. resvBeginTime:i 的上下文（i/s 时间计算）
+    j = body.find("resvBeginTime:i")
+    if j >= 0:
+        log(f"📜「resvBeginTime:i」前文: {body[max(0, j - 2500):j][:2500]}")
+        log(f"📜「resvBeginTime:i」后文: {body[j:j + 2500][:2500]}")
+        findings.append("时间构造已dump")
 
-        def spa_post(payload):
-            js = (
-                "() => Promise.race(["
-                "new Promise((resolve) => {"
-                "try {"
-                "const el = document.querySelector('#app') || document.body.firstElementChild;"
-                "const vm = el && el.__vue__;"
-                "const axios = vm && vm.$axios;"
-                "if (!axios) { resolve({stage: 'noaxios'}); return; }"
-                "const p = " + json.dumps(payload, ensure_ascii=False) + ";"
-                "axios.post('/reserve/update', p)"
-                ".then(r => resolve({ok: 1, code: r.data && r.data.code, message: r.data && r.data.message}))"
-                ".catch(e => resolve({ok: 0, error: String(e).slice(0, 100)}));"
-                "} catch(e) { resolve({ok: -1, error: String(e).slice(0, 100)}); }"
-                "}),"
-                "new Promise((resolve) => setTimeout(() => resolve({stage: 'timeout'}), 15000))"
-                "])"
-            )
-            try:
-                return page.evaluate(js)
-            except Exception as e:
-                return {"ok": -2, "error": str(e)[:100]}
+    # 3. API 调用模式（Object(l["q"]) / Object(x["x"]) 等）
+    for kw in ('Object(l["q"])', 'Object(l["r"])', 'Object(l["p"])',
+               'Object(l["s"])', 'Object(l["t"])', 'Object(l["u"])',
+               'Object(l["v"])', 'Object(l["w"])', 'Object(l["x"])'):
+        j = body.find(kw)
+        if j >= 0:
+            log(f"📜 API调用「{kw}」: {body[max(0, j - 300):j + 500][:800]}")
+            findings.append(f"API调用{kw[9:12]}已dump")
 
-        base = {
-            "sysKind": 1, "appAccNo": acc, "memberKind": 1,
-            "resvBeginTime": s_slot, "resvEndTime": e_slot,
-            "testName": "研讨", "resvKind": 2, "resvProperty": 32, "appUrl": "",
-            "resvMember": [acc], "resvDev": [dev], "memo": "小组研讨",
-            "captcha": "", "addServices": [],
-        }
-        # C1: 假 captcha
-        p_c1 = dict(base)
-        p_c1["captcha"] = "1234"
-        r_c1 = spa_post(p_c1)
-        log(f"📥 C1 假captcha: code={r_c1.get('code')} msg={str(r_c1.get('message', r_c1.get('error', '')))[:80]}")
-        findings.append(f"C1captcha:{str(r_c1.get('message', ''))[:30]}")
-        # C2: resvProperty=0 + 假captcha
-        p_c2 = dict(base)
-        p_c2["captcha"] = "1234"
-        p_c2["resvProperty"] = 0
-        r_c2 = spa_post(p_c2)
-        log(f"📥 C2 rp0+假captcha: code={r_c2.get('code')} msg={str(r_c2.get('message', r_c2.get('error', '')))[:80]}")
-        findings.append(f"C2rp0cap:{str(r_c2.get('message', ''))[:30]}")
-    else:
-        log("📭 无冲突房间")
+    # 4. Vue 组件里的 methods 列表（找 submit 相关方法名）
+    for kw in ("methods:{", "handleSubmit", "submitResv", "doResv", "handleResv",
+               "saveResv", "confirmResv", "onSubmit", "submitForm"):
+        j = body.find(kw)
+        if j >= 0:
+            log(f"📜「{kw}」@{j}: {body[j:j + 400][:400]}")
 
-    # 4. 零残留
+    # 零残留
     begin = (_bjnow() - timedelta(days=1)).strftime("%Y-%m-%d")
     end = (_bjnow() + timedelta(days=3)).strftime("%Y-%m-%d")
     j5 = _room_api_on_page(
@@ -1970,7 +1905,7 @@ def _room_op_probe(page, captured, op):
     else:
         log("✅ 零残留")
         findings.append("零残留✅")
-    return "🔬 probe v11 完成: " + "；".join(findings)
+    return "🔬 probe v12 完成: " + "；".join(findings)
 
 
 def run_room_op(op_json):
