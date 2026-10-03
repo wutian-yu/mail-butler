@@ -1821,70 +1821,78 @@ def _room_op_query(page, captured, op):
 
 
 def _room_op_probe(page, captured, op):
-    """安全探测 v23（全量 JS 扫描找成员搜索 API）：
-    v22 结论：房间 minUser=2 是硬规则，单人/重复自己都不行，订房必须 2 个不同 accNo。
-    本轮目标：找到 SPA 订房弹窗"添加成员"用的搜索接口（若有，用户报同学姓名/学号即可自动查 accNo）。
-    纯只读探测（GET + JS 下载），零副作用。
-    1. 收集全部已加载 JS chunk，提取所有 API 端点（此前只扫了一个 API 模块）
-    2. dump selectAccNoList（订房弹窗成员选择）全部上下文
-    3. dump orderpeople（订后邀请成员弹窗）上下文 + judgLimit/orderPeopleChange 源码
-    4. 专项筛选 user/member/search 类端点"""
+    """安全探测 v24（成员搜索 API 定位与实测）：
+    v23 发现：订房弹窗有 remote-method 成员搜索（响应映射 {accNo, logonName, disable}），
+    候选端点 /login/user。本轮：
+    1. dump remoteMethod 完整源码（确认调哪个 API、传什么参数）
+    2. dump /login/user 在 chunk-common 的函数定义（method/params）
+    3. 实测搜索：用用户自己的 logonName/姓名/accNo 搜（预期命中 92604，纯只读）
+    4. dump /sysConfig/public（验证码开关等公共配置）
+    全程只读，零副作用。"""
     findings = []
     acc_id, pid = _room_get_accid_from_storage(page)
-    log(f"🆔 accId={acc_id!r}")
+    log(f"🆔 accId={acc_id!r} pid={pid!r}")
     findings.append(f"accId={acc_id}")
 
-    # 1) 全部已加载 JS chunk
     js_urls = page.evaluate(
-        "() => performance.getEntriesByType('resource')"
-        ".map(r => r.name).filter(u => u.endsWith('.js') && u.includes('/static/') === false)")
-    if not js_urls:
-        js_urls = page.evaluate(
-            "() => Array.from(document.scripts).map(s => s.src).filter(Boolean)")
+        "() => performance.getEntriesByType('resource').map(r => r.name)"
+        ".filter(u => u.endsWith('.js'))")
     log(f"📦 已加载 {len(js_urls)} 个JS")
-    findings.append(f"JS={len(js_urls)}")
 
-    all_apis = {}
-    sel_ctx, order_ctx = [], []
+    remote_src = ""
+    login_user_ctx = ""
     for u in js_urls:
         try:
             body = page.request.get(u, timeout=25000).text()
-        except Exception as e:
-            log(f"⚠️ 下载失败 {u.split('/')[-1]}: {str(e)[:60]}")
+        except Exception:
             continue
-        short = u.split("/")[-1][:28]
-        for m in re.finditer(r'url:"(/[^"]{2,60})"', body):
-            all_apis.setdefault(m.group(1), short)
-        for m in re.finditer(r"selectAccNoList", body):
-            s = max(0, m.start() - 200)
-            e2 = min(len(body), m.start() + 300)
-            sel_ctx.append((short, body[s:e2]))
-        for m in re.finditer(r"orderpeople", body):
-            s = max(0, m.start() - 150)
-            e2 = min(len(body), m.start() + 300)
-            order_ctx.append((short, body[s:e2]))
+        short = u.split("/")[-1][:24]
+        if not remote_src:
+            j = body.find("remoteMethod:function")
+            if j >= 0:
+                remote_src = body[j:j + 1000]
+                log(f"📜 remoteMethod@{short}: {remote_src[:1000]}")
+                findings.append("remoteMethod✓")
+        if not login_user_ctx:
+            j = body.find('"/login/user"')
+            if j < 0:
+                j = body.find("url:\"/login/user\"")
+            if j >= 0:
+                login_user_ctx = body[max(0, j - 350):j + 250]
+                log(f"📜 /login/user定义@{short}: {login_user_ctx[:600]}")
 
-    log(f"📜 全部API端点({len(all_apis)}):")
-    for api in sorted(all_apis):
-        log(f"   {api}  (@{all_apis[api]})")
-    findings.append(f"API={len(all_apis)}")
+    # 2) 实测搜索端点（只读）：用自己的信息搜，预期返回 92604
+    if pid:
+        tries = [
+            ("GET", f"/login/user?keyword={pid}", None),
+            ("GET", f"/login/user?logonName={pid}", None),
+            ("GET", f"/login/user?name=Guancheng", None),
+            ("GET", "/login/user", None),
+            ("POST", "/login/user?sf_request_type=ajax", {"keyword": pid}),
+        ]
+        import time as _t
+        for i, (m, path, data) in enumerate(tries):
+            if i:
+                _t.sleep(2)
+            r = _room_api_on_page(page, path, method=m, data=data, timeout=15000)
+            snippet = json.dumps(r, ensure_ascii=False, default=str)[:300]
+            log(f"📥 {m} {path[:60]}: {snippet}")
+            if r.get("code") == 0 and r.get("data"):
+                d = r["data"]
+                rows = d if isinstance(d, list) else d.get("list") or d.get("records") or [d]
+                hit = [x for x in rows if isinstance(x, dict) and (
+                    str(x.get("accNo")) == str(acc_id) or pid in str(x.get("logonName") or ""))]
+                if hit:
+                    log(f"🎯 命中自己: {json.dumps(hit[0], ensure_ascii=False, default=str)[:250]}")
+                    findings.append(f"搜索OK@{path.split('?')[1].split('=')[0] if '?' in path else '无参'}")
+                    break
+            findings.append(f"试{i + 1}:{str(r.get('message', ''))[:16]}")
 
-    # 2) 专项：user/member/search 类端点
-    cand = [a for a in sorted(all_apis)
-            if any(k in a.lower() for k in ("user", "member", "search", "friend", "stu", "accno"))]
-    log(f"🔍 候选搜索端点({len(cand)}): {', '.join(cand) if cand else '无'}")
-    findings.append(f"候选={len(cand)}")
+    # 3) /sysConfig/public（公共配置：验证码、限流等）
+    r = _room_api_on_page(page, "/sysConfig/public", timeout=15000)
+    log(f"📜 sysConfig/public: {json.dumps(r, ensure_ascii=False, default=str)[:500]}")
 
-    # 3) selectAccNoList 上下文（弹窗模板+方法）
-    for i, (short, ctx) in enumerate(sel_ctx[:10]):
-        log(f"📜 selectAccNoList[{i}]@{short}: {ctx[:450]}")
-    findings.append(f"selCtx={len(sel_ctx)}")
-
-    # 4) orderpeople 上下文（订后邀请弹窗）+ 关键函数源码
-    for i, (short, ctx) in enumerate(order_ctx[:6]):
-        log(f"📜 orderpeople[{i}]@{short}: {ctx[:450]}")
-
-    # 5) 零残留
+    # 4) 零残留
     begin = (_bjnow() - timedelta(days=1)).strftime("%Y-%m-%d")
     end = (_bjnow() + timedelta(days=3)).strftime("%Y-%m-%d")
     j5 = _room_api_on_page(
@@ -1902,7 +1910,7 @@ def _room_op_probe(page, captured, op):
     else:
         log("✅ 零残留")
         findings.append("零残留✅")
-    return "🔬 probe v23 完成: " + "；".join(findings)
+    return "🔬 probe v24 完成: " + "；".join(findings)
 
 
 def run_room_op(op_json):
