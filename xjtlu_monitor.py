@@ -855,8 +855,8 @@ def check_ams_changes(ams_new, state, is_first_run):
         # 2. 总出勤率下降
         new_overall = new_att.get("overall")
         if (old_overall and new_overall
-                and isinstance(new_overall, (int, float))
-                and float(new_overall) < float(old_overall)):
+                and isinstance(new_overall, (int, float, str))
+                and float(str(new_overall)) < float(str(old_overall))):
             has_absence_note = any("缺勤" in n for n in notes)
             if not has_absence_note:
                 notes.append(f"📉 总出勤率变化：{old_overall}% → {new_overall}%")
@@ -1256,7 +1256,7 @@ def format_notification(source, items):
         for item in normal[:5]:
             lines.append(f"  • {item['text'][:60]}")
         if len(normal) > 5:
-            lines.append(f"  • ...等 {len(normal)} 条")
+            lines.append(f"  • ...等 {len(normal) - 5} 条")
 
     return "\n".join(lines)
 
@@ -1453,7 +1453,8 @@ def run():
             ams_notes, ams_state = check_ams_changes(ams, state, is_first_run)
             notifications.extend(ams_notes)
             state["ams"] = ams_state
-            log(f"🏫 AMS: 出勤率 {ams_state['attendance']['overall'] if ams_state['attendance'] else '?'}%"
+            att = ams_state.get('attendance') or {}
+            log(f"🏫 AMS: 出勤率 {att.get('overall', '?')}%"
                 f"，课节 {len(ams_state['sessions'])} 个，提醒 {len(ams_notes)} 条")
         else:
             log("📭 AMS 数据未获取（登录或接口异常），跳过")
