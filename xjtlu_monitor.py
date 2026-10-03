@@ -1821,10 +1821,10 @@ def _room_op_query(page, captured, op):
 
 
 def _room_op_probe(page, captured, op):
-    """安全探测订房 API v9（深度 JS 解析 + 修正重试）：
-    1. dump chunk-52d28091 的 resvKind 上下文 2500 字符（看 r/s 时间计算 + submit 调用）
-    2. dump changeBeginTime 函数定义
-    3. 用发现的时间格式/结构重试冲突时段测试（零副作用）
+    """安全探测订房 API v10（修正版）：
+    1. chunk-52d28091 限定 .js 后缀下载，dump resvKind 上下文（r/s 时间构造 + submit 调用）
+    2. 变体矩阵全跑（不因误报提前 break），大小写不敏感判断
+    3. 零残留确认
     """
     today = _bjnow().strftime("%Y-%m-%d")
     findings = []
@@ -1833,48 +1833,49 @@ def _room_op_probe(page, captured, op):
     log(f"🆔 accId={acc_id!r} pid={pid!r}")
     findings.append(f"accId={acc_id}")
 
+    # 1. 拿 chunk-52d28091.js（限定 js 后缀，排除 css）
     chunk_body = None
-    # 1. 拿到 chunk-52d28091
     try:
         js_urls = page.evaluate(
             "() => performance.getEntriesByType('resource')"
-            ".map(r => r.name).filter(u => u.includes('chunk-52d28091'))")
+            ".map(r => r.name).filter(u => u.endsWith('.js') && u.includes('chunk-52d28091'))")
         if js_urls:
             resp = page.request.get(js_urls[0], timeout=20000)
             chunk_body = resp.text()
-            log(f"📜 chunk-52d28091 大小 {len(chunk_body)}，前100: {chunk_body[:100]}")
+            log(f"📜 chunk-52d28091.js 大小 {len(chunk_body)}，前80: {chunk_body[:80]}")
         else:
-            log("📜 chunk-52d28091 不在 performance entries")
+            log("📜 chunk-52d28091.js 不在 entries（列出全部 js 名看看）")
+            all_js = page.evaluate(
+                "() => performance.getEntriesByType('resource')"
+                ".map(r => r.name).filter(u => u.endsWith('.js')).map(u => u.split('/').pop())")
+            log(f"📜 全部 JS: {json.dumps(all_js[:50], ensure_ascii=False)[:600]}")
     except Exception as e:
         log(f"⚠️ chunk 下载失败: {e}")
 
-    if chunk_body and len(chunk_body) > 500:
-        # 2. dump resvKind 上下文（flow-2 payload 构造 + submit 调用）
+    if chunk_body and len(chunk_body) > 1000 and "function" in chunk_body[:2000]:
+        # resvKind 上下文（完整 payload 构造 + submit 调用）
         idx = chunk_body.find("resvKind")
-        while idx >= 0:
-            snippet = chunk_body[max(0, idx - 900):idx + 1600]
+        tries = 0
+        while idx >= 0 and tries < 5:
+            snippet = chunk_body[max(0, idx - 900):idx + 200]
             if "appAccNo" in snippet:
-                log(f"📜 resvKind 上下文（前段）: ...{chunk_body[max(0, idx-900):idx+100]}...")
-                log(f"📜 resvKind 上下文（后段）: ...{chunk_body[idx:idx+1600]}...")
+                log(f"📜 resvKind 前文: ...{chunk_body[max(0, idx-900):idx+50]}...")
+                log(f"📜 resvKind 后文: ...{chunk_body[idx:idx+1700]}...")
                 break
             idx = chunk_body.find("resvKind", idx + 8)
-
-        # 3. changeBeginTime 函数定义
-        idx2 = chunk_body.find("changeBeginTime:")
+            tries += 1
+        # changeBeginTime
+        idx2 = chunk_body.find("changeBeginTime")
         if idx2 >= 0:
-            log(f"📜 changeBeginTime: ...{chunk_body[idx2:idx2+500]}...")
+            log(f"📜 changeBeginTime 上下文: ...{chunk_body[max(0, idx2-300):idx2+600]}...")
+        # submit 调用（找 Object(xxx) 模式）
+        for kw in (".submit(", "handleSubmit", "subResv", "submitForm("):
+            idx3 = chunk_body.find(kw)
+            if idx3 >= 0:
+                log(f"📜「{kw}」上下文: ...{chunk_body[max(0, idx3-150):idx3+400]}...")
+                break
 
-        # 4. 时间变量 r/s 的计算（找 resvBeginTime 前面的赋值）
-        idx3 = chunk_body.find("resvBeginTime:r")
-        if idx3 >= 0:
-            log(f"📜 r/s 构造前文: ...{chunk_body[max(0, idx3-1200):idx3+50]}...")
-        else:
-            # 也可能写作 resvBeginTime: i 或别的变量名——找 changeBeginTime 附近的 moment 操作
-            idx4 = chunk_body.find("$moment(i)")
-            if idx4 >= 0:
-                log(f"📜 moment(i) 上下文: ...{chunk_body[max(0, idx4-600):idx4+200]}...")
-
-    # 5. 冲突时段测试矩阵（零副作用）：用可能的时间格式变体重试
+    # 2. 冲突时段变体矩阵（全跑，不 break）
     raw = _room_query_avail_raw(page, today, captured)
     conflict_room = occupied_slot = None
     if raw:
@@ -1891,10 +1892,10 @@ def _room_op_probe(page, captured, op):
             if conflict_room:
                 break
     if not conflict_room:
-        log("📭 无冲突房间，跳过测试矩阵")
-        return "🔬 probe v9 完成: " + "；".join(findings)
+        log("📭 无冲突房间")
+        return "🔬 probe v10 完成: " + "；".join(findings)
 
-    s_slot = occupied_slot["resvBeginTime"]  # "2026-10-03 12:00:00"
+    s_slot = occupied_slot["resvBeginTime"]   # "2026-10-03 12:00:00"
     e_slot = occupied_slot["resvEndTime"]
     dev = conflict_room["devId"]
 
@@ -1931,24 +1932,34 @@ def _room_op_probe(page, captured, op):
             "captcha": "", "addServices": [],
         }
 
-    # 变体矩阵（全部冲突时段 → 必被拒，但若报"冲突"而非"参数错误"=格式对了）
+    def is_param_err(msg):
+        m = str(msg).lower()
+        return "参数" in m or "parameter" in m
+
     variants = [
-        ("V1 斜杠时间", base(s_slot.replace("-", "/"), e_slot.replace("-", "/"))),
-        ("V2 数组body", [base(s_slot, e_slot)]),
-        ("V3 斜杠+数组", [base(s_slot.replace("-", "/"), e_slot.replace("-", "/"))]),
-        ("V4 ISO时间", base(s_slot.replace(" ", "T"), e_slot.replace(" ", "T"))),
-        ("V5 无秒", base(s_slot[:-3], e_slot[:-3])),
+        ("V1 原样带秒", base(s_slot, e_slot)),
+        ("V2 斜杠时间", base(s_slot.replace("-", "/"), e_slot.replace("-", "/"))),
+        ("V3 数组body", [base(s_slot, e_slot)]),
+        ("V4 斜杠+数组", [base(s_slot.replace("-", "/"), e_slot.replace("-", "/"))]),
+        ("V5 rp0原样", base(s_slot, e_slot, rp=0)),
+        ("V6 ISO时间", base(s_slot.replace(" ", "T"), e_slot.replace(" ", "T"))),
+        ("V7 无秒无毫秒", base(s_slot[:-3], e_slot[:-3])),
+        ("V8 无testName无memo", {k: v for k, v in base(s_slot, e_slot).items()
+                                  if k not in ("testName", "memo", "appUrl", "addServices", "captcha")}),
     ]
+    winner = None
     for name, p in variants:
         r = spa_post(p)
         msg = str(r.get("message", r.get("error", "")))
-        log(f"📥 {name}: code={r.get('code')} msg={msg[:60]}")
-        findings.append(f"{name[:2]}:{msg[:25]}")
-        if "参数" not in msg and "Parameter" not in msg:
-            log(f"🎯 {name} 通过了参数校验！")
-            break
+        log(f"📥 {name}: code={r.get('code')} msg={msg[:70]}")
+        findings.append(f"{name[:2]}:{msg[:20]}")
+        if not is_param_err(msg):
+            winner = (name, p)
+            log(f"🎯 {name} 通过参数校验（真）！")
+    if not winner:
+        log("📭 全部变体仍是参数错误 → 问题在更深字段，看 📜 JS 上下文分析")
 
-    # 零残留确认
+    # 3. 零残留确认
     begin = (_bjnow() - timedelta(days=1)).strftime("%Y-%m-%d")
     end = (_bjnow() + timedelta(days=3)).strftime("%Y-%m-%d")
     j5 = _room_api_on_page(
@@ -1966,7 +1977,7 @@ def _room_op_probe(page, captured, op):
     else:
         log("✅ 零残留")
         findings.append("零残留✅")
-    return "🔬 probe v9 完成: " + "；".join(findings)
+    return "🔬 probe v10 完成: " + "；".join(findings)
 
 
 def run_room_op(op_json):
