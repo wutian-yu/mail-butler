@@ -324,6 +324,12 @@ HELP_TEXT = (
     "「改假条 新原因」修改假条正文\n"
     "「取消请假」放弃进行中假条\n"
     "「撤回请假」撤回已提交申请\n\n"
+    "🏛️ 图书馆研讨室\n"
+    "「查房 [日期] [楼层]」查空闲房间\n"
+    "「订房 房间号 日期 时段」预定房间\n"
+    "「我的预约」查我的预定\n"
+    "「取消预定 N」取消第N个\n"
+    "（也可自然语言：「明天下午帮我订个研讨室」）\n\n"
     "💡 也可以直接跟我聊天～"
 )
 
@@ -1339,6 +1345,316 @@ def cmd_leave_revoke(chat_id):
         feishu_send(chat_id, f"❌ 撤回异常：{e}")
 
 
+# ============ 图书馆房间预定系统（Information Commons） ============
+ROOM_WEB = "https://roombookings.xjtlu.edu.cn"
+ROOM_BASE = ROOM_WEB + "/ic-web"
+# SIP 校区楼层 → labId（roomMenu 实测：7F=1、8F=7、10F=9，并非字面数字）
+ROOM_FLOOR_IDS = {"3f": 3, "4f": 4, "5f": 5, "7f": 1, "8f": 7, "10f": 9}
+ROOM_SIP_LABS = "3,4,5,1,7,9"
+ROOM_OPEN = "09:00"          # 默认开放开始（各房间 openTimes 可能不同）
+ROOM_CLOSE = "22:00"
+ROOM_MAX_HOURS = 3           # 学生每次最长 3 小时
+ROOM_MAX_AHEAD_DAYS = 3      # 只能提前 3 天内预定
+
+
+def _room_state():
+    """读 butler-data 的 xjtlu_state.json，返回 (room 快照, sha)"""
+    try:
+        data, sha = gh_read_json("xjtlu_state.json")
+        return data.get("room") or {}, sha
+    except Exception as e:
+        log(f"room state 读取失败: {e}")
+        return {}, ""
+
+
+def _room_headers(room):
+    cookies = room.get("cookies") or []
+    cookie_str = "; ".join(f"{c.get('name')}={c.get('value')}"
+                           for c in cookies if c.get("name") and c.get("value"))
+    return {
+        "Cookie": cookie_str,
+        "Referer": ROOM_WEB + "/",
+        "Origin": ROOM_WEB,
+        "User-Agent": ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+                       "(KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"),
+        "Accept": "application/json, text/plain, */*",
+        "X-Requested-With": "XMLHttpRequest",
+    }
+
+
+def _room_api(path, method="GET", data=None, timeout=25):
+    """调房间系统 API。返回 dict；未登录/网络异常时返回 {'code': -1, 'message': ...}"""
+    room, _ = _room_state()
+    if not (room.get("cookies")):
+        return {"code": -1, "message": "房间系统 session 未就绪（监控每 30 分钟自动刷新，稍后再试）"}
+    headers = _room_headers(room)
+    body = None
+    if data is not None:
+        body = json.dumps(data).encode()
+        headers["Content-Type"] = "application/json"
+    req = urllib.request.Request(ROOM_BASE + path, data=body, method=method)
+    for k, v in headers.items():
+        req.add_header(k, v)
+    try:
+        with urllib.request.urlopen(req, timeout=timeout) as r:
+            raw = r.read().decode()
+            return json.loads(raw) if raw else {}
+    except Exception as e:
+        log(f"❌ room API {path} 失败: {e}")
+        return {"code": -1, "message": f"网络异常: {e}"}
+
+
+def _room_slot_occupied(status):
+    """位标志：2=待生效 4=已生效 64=已签到 → 有效占用；128=已结束 16=已违约 不占"""
+    return bool(status & (2 | 4 | 64)) and not bool(status & 128)
+
+
+def _room_free_slots(booked, open_start="09:00", open_end="22:00"):
+    """ booked=[(s,e)...] 分钟制 → 返回空闲区间列表 [(s,e)...] """
+    def to_min(t):
+        h, m = t.split(":")
+        return int(h) * 60 + int(m)
+
+    def to_str(v):
+        return f"{v // 60:02d}:{v % 60:02d}"
+
+    booked_min = sorted((to_min(s), to_min(e)) for s, e in booked if to_min(e) > to_min(s))
+    free, cur = [], to_min(open_start)
+    for s, e in booked_min:
+        if s > cur:
+            free.append((cur, s))
+        cur = max(cur, e)
+    if cur < to_min(open_end):
+        free.append((cur, to_min(open_end)))
+    return [(to_str(s), to_str(e)) for s, e in free]
+
+
+def _room_query_avail(date_str, floor=None):
+    """查 SIP 校区指定日期的房间可用情况。
+    返回 (格式化文本, 原始 data)；floor 形如 '5F'，None 查全部楼层。"""
+    lab = ROOM_FLOOR_IDS.get((floor or "").lower().replace("楼", "").strip())
+    labs = str(lab) if lab else ROOM_SIP_LABS
+    resp = _room_api(f"/reserve?sysKind=1&resvDates={date_str.replace('-', '')}&labIds={labs}")
+    if resp.get("code") != 0:
+        return f"❌ 查询失败：{resp.get('message', '未知错误')}", None
+    data = resp.get("data") or []
+    lines = []
+    for campus in data:
+        if "SIP" not in (campus.get("campusName") or ""):
+            continue
+        for lab_info in campus.get("labInfos") or []:
+            rooms = lab_info.get("roomInfos") or []
+            if not rooms:
+                continue
+            lines.append(f"\n【{lab_info.get('labName')}】")
+            for r in rooms:
+                name = r.get("devName") or "?"
+                ot = (r.get("openTimes") or [{}])[0]
+                o_s, o_e = ot.get("openStartTime", ROOM_OPEN), ot.get("openEndTime", ROOM_CLOSE)
+                booked = []
+                for rv in r.get("resvInfos") or []:
+                    if _room_slot_occupied(rv.get("resvStatus", 0)):
+                        booked.append((rv["resvBeginTime"][11:16], rv["resvEndTime"][11:16]))
+                free = _room_free_slots(booked, o_s, o_e)
+                if not free:
+                    lines.append(f"🔴 {name}（{o_s}-{o_e}）今日已约满")
+                else:
+                    slots = "、".join(f"{s}-{e}" for s, e in free)
+                    lines.append(f"🟢 {name} 空闲：{slots}")
+    if not lines:
+        return "📭 该日期没有可查询的房间（可能超出可预定范围）。", None
+    head = f"🏛️ SIP 图书馆研讨室 · {date_str}\n⏰ 开放 {ROOM_OPEN}-{ROOM_CLOSE}，每次最长 {ROOM_MAX_HOURS} 小时，每天限 1 次，最多提前 {ROOM_MAX_AHEAD_DAYS} 天"
+    return head + "\n" + "\n".join(lines), data
+
+
+def _room_parse_date(text, now=None):
+    """解析订房日期：今天/明天/后天/周X/10月4号/10-04/2026-10-04，默认今天"""
+    now = now or datetime.now()
+    date = parse_leave_date(text, now)
+    return date or now.strftime("%Y-%m-%d")
+
+
+def _room_find_dev(data, room_key):
+    """从可用性 data 里按房间号/名字找房间，返回房间 dict；找不到返回 None"""
+    if not data:
+        return None
+    key = str(room_key).strip().lower().replace("room ", "").replace("room", "")
+    for campus in data:
+        for lab_info in campus.get("labInfos") or []:
+            for r in lab_info.get("roomInfos") or []:
+                name = (r.get("devName") or "").lower()
+                if key and key in name:
+                    return r
+    return None
+
+
+def _room_do_book(date_str, start, end, room_key, memo=""):
+    """核心订房：先查冲突再提交。返回结果文本。"""
+    now = datetime.now()
+    # 规则校验
+    try:
+        d = datetime.strptime(date_str, "%Y-%m-%d")
+    except ValueError:
+        return f"❌ 日期格式不对：{date_str}"
+    if d.date() < now.date():
+        return "❌ 不能预定过去的日期。"
+    if (d.date() - now.date()).days > ROOM_MAX_AHEAD_DAYS:
+        return f"❌ 最多只能提前 {ROOM_MAX_AHEAD_DAYS} 天预定（{date_str} 超出范围）。"
+
+    def to_min(t):
+        h, m = t.split(":")
+        return int(h) * 60 + int(m)
+
+    try:
+        s_min, e_min = to_min(start), to_min(end)
+    except Exception:
+        return "❌ 时间格式应为 HH:MM，例如 14:00。"
+    if e_min <= s_min:
+        return "❌ 结束时间要晚于开始时间。"
+    if e_min - s_min > ROOM_MAX_HOURS * 60:
+        return f"❌ 每次最长 {ROOM_MAX_HOURS} 小时。"
+    if s_min < to_min(ROOM_OPEN) or e_min > to_min(ROOM_CLOSE):
+        return f"❌ 开放时间为 {ROOM_OPEN}-{ROOM_CLOSE}。"
+
+    room, _ = _room_state()
+    acc_id = str(room.get("accId") or "")
+    # 查当天该房间状态（顺带拿 devId；floor 未知就全查）
+    _, data = _room_query_avail(date_str)
+    dev = _room_find_dev(data, room_key)
+    if not dev:
+        return f"❌ 没找到房间「{room_key}」。发「查房 {date_str}」看看正确的房间名。"
+    # 冲突检查
+    for rv in dev.get("resvInfos") or []:
+        if _room_slot_occupied(rv.get("resvStatus", 0)):
+            bs, be = rv["resvBeginTime"][11:16], rv["resvEndTime"][11:16]
+            if not (e_min <= to_min(bs) or s_min >= to_min(be)):
+                return f"❌ {dev.get('devName')} 在 {start}-{end} 与已有预约（{bs}-{be}）冲突。\n\n发「查房 {date_str}」看空闲时段。"
+    payload = {
+        "appAccNo": acc_id,
+        "captcha": "",
+        "memberKind": 2,
+        "memo": memo or "小组研讨",
+        "resvBeginTime": f"{date_str} {start}",
+        "resvDev": [dev.get("devId")],
+        "resvEndTime": f"{date_str} {end}",
+        "resvMember": [acc_id] if acc_id else [],
+        "resvProperty": 0,
+        "sysKind": 1,
+        "testName": memo or "小组研讨",
+        "addServices": [],
+        "appUrl": "",
+        "resvKind": 2,
+    }
+    resp = _room_api("/reserve", method="POST", data=payload)
+    msg = str(resp.get("message", ""))
+    if resp.get("code") == 0:
+        return (f"✅ 预定成功！\n\n🏛️ {dev.get('devName')}\n"
+                f"📅 {date_str} {start}-{end}\n{('📝 ' + memo) if memo else ''}")
+    # 失败：把官方 message 原样给用户（人数不足/超次数/已约满等规则提示）
+    return f"❌ 预定未成功：{msg or '未知错误'}"
+
+
+def _room_my_bookings():
+    """查我的预约（近 2 天 ~ 未来 14 天）。返回 (格式化文本, bookings 列表)"""
+    now = datetime.now()
+    begin = (now - timedelta(days=2)).strftime("%Y-%m-%d")
+    end = (now + timedelta(days=14)).strftime("%Y-%m-%d")
+    resp = _room_api(f"/reserve/resvInfo?beginDate={begin}&endDate={end}"
+                     f"&needStatus=8582&page=1&pageNum=20&orderKey=gmt_create")
+    if resp.get("code") != 0:
+        return f"❌ 查询失败：{resp.get('message', '未知错误')}", []
+    rows = resp.get("data") or []
+    if not rows:
+        return "📭 目前没有任何研讨室预约。", []
+    lines = []
+    for i, rv in enumerate(rows, 1):
+        try:
+            bt = datetime.fromtimestamp(rv["resvBeginTime"] / 1000)
+            et = datetime.fromtimestamp(rv["resvEndTime"] / 1000)
+        except Exception:
+            continue
+        dev = (rv.get("resvDevInfoList") or [{}])[0]
+        name = dev.get("devName", "?")
+        st = rv.get("resvStatus", 0)
+        tag = ("🟢 已生效" if st & 4 else "⏳ 待生效") if st & 70 else \
+              ("✅ 已结束" if st & 128 else ("⚠️ 已违约" if st & 16 else f"状态{st}"))
+        wd = "一二三四五六日"[bt.weekday()]
+        lines.append(f"{i}. {name}\n   {bt.strftime('%m月%d日')}（周{wd}）{bt.strftime('%H:%M')}"
+                     f"-{et.strftime('%H:%M')} · {tag}")
+    return "📋 我的研讨室预约：\n\n" + "\n".join(lines), rows
+
+
+def _room_do_cancel(index):
+    """取消第 index 个预约（从 1 开始）。返回结果文本。"""
+    text, rows = _room_my_bookings()
+    if not rows:
+        return text
+    try:
+        idx = int(index)
+    except (TypeError, ValueError):
+        return "❌ 请指定序号，例如「取消预定 1」。先发「我的预约」看列表。"
+    if idx < 1 or idx > len(rows):
+        return f"❌ 序号超出范围（1~{len(rows)}）。先发「我的预约」看列表。"
+    target = rows[idx - 1]
+    uuid = target.get("uuid")
+    if not uuid:
+        return "❌ 该预约缺少标识，无法取消。"
+    resp = _room_api("/reserve/delete", method="POST", data={"uuid": uuid})
+    if resp.get("code") == 0:
+        dev = (target.get("resvDevInfoList") or [{}])[0]
+        try:
+            bt = datetime.fromtimestamp(target["resvBeginTime"] / 1000)
+        except Exception:
+            bt = None
+        when = bt.strftime("%m月%d日 %H:%M") if bt else ""
+        return f"✅ 已取消：{dev.get('devName', '')} {when}"
+    return f"❌ 取消失败：{resp.get('message', '未知错误')}"
+
+
+def cmd_room_query(chat_id, text):
+    """「查房」/「查房 明天」/「查房 10月4号 5F」"""
+    rest = re.sub(r"^查房(间)?", "", text.strip()).strip()
+    date = _room_parse_date(rest)
+    m = re.search(r"(\d{1,2}\s*[fF楼])", rest)
+    floor = (m.group(1).replace(" ", "").replace("楼", "f") if m else "")
+    floor = re.sub(r"^(\d{1,2})[fF]$", r"\1f", floor)
+    result, _ = _room_query_avail(date, floor)
+    feishu_send_action(chat_id, "🏛️ 研讨室查询", result, color="blue")
+
+
+def cmd_room_book(chat_id, text):
+    """「订房 543 明天 14:00-17:00」/「订房 Room 445 10-05 9:00-12:00 用途:刷题」"""
+    rest = re.sub(r"^订(房|个房|房间|研讨室)", "", text.strip()).strip()
+    m = re.search(r"(\d{1,2}:\d{2})\s*[-~到至]\s*(\d{1,2}:\d{2})", rest)
+    if not m:
+        feishu_send(chat_id, "用法：「订房 房间号 日期 时间段」\n例如「订房 543 明天 14:00-17:00」\n\n先用「查房」看空闲房间。")
+        return
+    start, end = m.group(1), m.group(2)
+    date = _room_parse_date(rest)
+    m2 = re.search(r"(?:房间|房|room)\s*[:：]?\s*(\d{2,4})", rest.lower()) or re.search(r"(\d{3,4})(?!\s*[:\-])", rest)
+    room_key = m2.group(1) if m2 else ""
+    if not room_key:
+        feishu_send(chat_id, "没识别到房间号。用法：「订房 543 明天 14:00-17:00」")
+        return
+    mm = re.search(r"(?:用途|备注|事项)\s*[:：]?\s*(\S+)", rest)
+    memo = mm.group(1) if mm else ""
+    result = _room_do_book(date, start, end, room_key, memo)
+    color = "green" if result.startswith("✅") else "red"
+    feishu_send_action(chat_id, "🏛️ 研讨室预定", result, color=color)
+
+
+def cmd_room_list(chat_id):
+    text, _ = _room_my_bookings()
+    feishu_send_action(chat_id, "📋 我的预约", text, color="blue")
+
+
+def cmd_room_cancel(chat_id, text):
+    rest = re.sub(r"^取消(预定|预约|订房)", "", text.strip()).strip()
+    result = _room_do_cancel(rest or "1")
+    color = "green" if result.startswith("✅") else "red"
+    feishu_send_action(chat_id, "🗑️ 取消预约", result, color=color)
+
+
 def cmd_del_calendar(chat_id, text):
     """删除 Outlook 日历事件
     「删日历」→ 列出
@@ -1607,6 +1923,19 @@ def process_command(text, chat_id):
         _save_leave_pending(pending)
         feishu_send(chat_id, f"✏️ 假条已重写（类型：{lt}）：\n\n{pending['leaveReason']}\n\n"
                              "发证明照片即可提交；「取消请假」放弃。")
+        return
+    # 图书馆房间预定（固定命令；自然语言走 LLM Function Calling）
+    if t.startswith("查房") or t.startswith("房间查询"):
+        cmd_room_query(chat_id, text)
+        return
+    if t.startswith("订房") or t.startswith("订个房") or t.startswith("订研讨室"):
+        cmd_room_book(chat_id, text)
+        return
+    if t in ("我的预定", "我的预约", "预定列表", "预约列表", "我的房间"):
+        cmd_room_list(chat_id)
+        return
+    if t.startswith("取消预定") or t.startswith("取消预约") or t.startswith("取消订房"):
+        cmd_room_cancel(chat_id, text)
         return
     # 智能签到：纯数字码 / 扫码URL（上课时间自动识别，误触保护：无课时纯数字走聊天）
     if ams_try_auto_sign(t, chat_id):
@@ -1976,6 +2305,17 @@ def gather_context(include_outlook=True):
             ctx_parts.append("AMS 考勤状态：\n" + "\n".join(lines))
     except Exception:
         pass
+    # 注入房间预定系统 session 状态（不做 API 调用，轻量）
+    try:
+        room_state, _ = gh_read_json("xjtlu_state.json")
+        room = (room_state or {}).get("room") or {}
+        if room.get("cookies"):
+            upd = (room.get("updated") or "")[:16].replace("T", " ")
+            ctx_parts.append(f"图书馆房间预定系统：已登录（session 更新于 {upd}），可用工具查房/订房/取消。")
+        else:
+            ctx_parts.append("图书馆房间预定系统：session 未就绪，订房功能暂不可用。")
+    except Exception:
+        pass
     return "\n\n".join(ctx_parts) if ctx_parts else "当前没有待确认活动，日历也是空的。"
 
 
@@ -1998,7 +2338,15 @@ SYSTEM_PROMPT = (
     "5. **AMS 考勤系统**：系统自动登录 AMS（ams.xjtlu.edu.cn），监控出勤率、课节签到状态。"
     "支持远程签到（发「签到 码」）和出勤率查询（发「出勤」）。\n"
     "6. **请假申请**：用户发「请假 日期 原因」，系统自动查当天课节、生成英文假条、"
-    "用户发证明照片后自动提交到 AMS 的 Authorized Absence 系统。\n\n"
+    "用户发证明照片后自动提交到 AMS 的 Authorized Absence 系统。\n"
+    "7. **图书馆研讨室预定**：系统已登录房间预定系统（roombookings.xjtlu.edu.cn），"
+    "可以查空闲研讨室、预定、取消预定。SIP 校区楼层 3F/4F/5F/7F/8F/10F，"
+    "开放 09:00-22:00，每次最长 3 小时、每天限 1 次、最多提前 3 天预定。\n\n"
+    "## 工具调用（Function Calling）\n"
+    "你可以在回复中调用工具（tools 参数），系统会执行并把结果回传给你，"
+    "你再根据结果组织最终回复。用户想查房/订房/取消预定/查作业/查出勤/查日历时，"
+    "直接调用对应工具，不要凭空编造房间空闲情况或作业信息。"
+    "订房前先用 check_room_availability 确认该房间在目标时段空闲。\n\n"
     "## 关于 Cookie 的真相\n"
     "系统已经在用用户的 SSO Cookie 自动登录西浦系统。Cookie 会过期（通常数周），"
     "过期后需要用户从浏览器重新导出。如果用户说监控失效了，可能是 Cookie 过期，"
@@ -2029,8 +2377,161 @@ SYSTEM_PROMPT = (
     "3. 闲聊/问问题不需要 [ACTION] 标记\n"
     "4. 回复正文控制在 2-3 句话，简洁有温度\n"
     "5. 用中文回复，可以用少量 emoji\n"
-    "6. 不要过度谦虚说我做不到——先想想系统是否已经能做到，不确定时说我帮你查一下"
+    "6. 不要过度谦虚说我做不到——先想想系统是否已经能做到，不确定时说我帮你查一下\n"
+    "7. 能用工具就优先用工具（房间查询/预定/取消、作业、出勤、日历），工具结果才是真实数据\n"
+    "8. 只有用户明确表达要预定/取消时才调用订房/取消工具，不要擅自预定"
 )
+
+
+# ============ LLM Function Calling 工具 ============
+TOOLS_DEF = [
+    {
+        "type": "function",
+        "function": {
+            "name": "check_room_availability",
+            "description": "查询图书馆（SIP校区）研讨室在指定日期的空闲情况，返回各楼层房间和空闲时段。用户问'有没有空房'、'查房间'、'明天有什么研讨室'时调用。",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "date": {"type": "string", "description": "查询日期，格式 YYYY-MM-DD"},
+                    "floor": {"type": "string", "description": "可选楼层，如 '5F'、'3F'；不传查全部楼层"},
+                },
+                "required": ["date"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "book_room",
+            "description": "预定图书馆研讨室。仅在用户明确要求预定时调用；调用前建议先查空闲。每次最长3小时、每天限1次、最多提前3天。",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "date": {"type": "string", "description": "预定日期 YYYY-MM-DD"},
+                    "start_time": {"type": "string", "description": "开始时间 HH:MM（如 14:00）"},
+                    "end_time": {"type": "string", "description": "结束时间 HH:MM"},
+                    "room": {"type": "string", "description": "房间号，如 '543'、'Room 543'、'1014'"},
+                    "memo": {"type": "string", "description": "用途备注，可选，如'小组讨论'"},
+                },
+                "required": ["date", "start_time", "end_time", "room"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "list_my_room_bookings",
+            "description": "查看用户当前的研讨室预约列表（含序号、房间、时间、状态）。用户问'我的预约'、'我订了什么房'时调用。",
+            "parameters": {"type": "object", "properties": {}},
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "cancel_room_booking",
+            "description": "取消用户的研讨室预约。仅在用户明确要求取消时调用。",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "index": {"type": "integer", "description": "要取消的预约序号（先调 list_my_room_bookings 获取）"},
+                },
+                "required": ["index"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "query_homework",
+            "description": "查询 LearningMall 近期作业/测验截止时间列表。用户问作业、DDL、截止时间时调用。",
+            "parameters": {"type": "object", "properties": {}},
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "query_attendance",
+            "description": "查询 AMS 考勤出勤率统计。用户问出勤、考勤、缺勤时调用。",
+            "parameters": {"type": "object", "properties": {}},
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "query_calendar",
+            "description": "查询用户 Outlook 日历日程。用户问今天/明天有什么安排、日程时调用。",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "days": {"type": "integer", "description": "查询未来天数，默认 3"},
+                },
+            },
+        },
+    },
+]
+
+
+def execute_tool(name, args_raw, chat_id):
+    """执行 LLM 的工具调用，返回结果文本（回传给 LLM 组织回复）"""
+    try:
+        args = json.loads(args_raw) if args_raw else {}
+    except Exception:
+        args = {}
+    log(f"🛠️ 工具调用: {name}({json.dumps(args, ensure_ascii=False)[:120]})")
+    try:
+        if name == "check_room_availability":
+            text, _ = _room_query_avail(str(args.get("date") or datetime.now().strftime("%Y-%m-%d")),
+                                        args.get("floor") or None)
+            return text
+        if name == "book_room":
+            return _room_do_book(str(args.get("date") or ""), str(args.get("start_time") or ""),
+                                 str(args.get("end_time") or ""), str(args.get("room") or ""),
+                                 str(args.get("memo") or ""))
+        if name == "list_my_room_bookings":
+            text, _ = _room_my_bookings()
+            return text
+        if name == "cancel_room_booking":
+            return _room_do_cancel(args.get("index") or 1)
+        if name == "query_homework":
+            try:
+                events = fetch_lm_assignments(days_ahead=14)
+                return format_homework(events)
+            except Exception as e:
+                return f"作业查询失败: {e}"
+        if name == "query_attendance":
+            ams, _, _ = _ams_state()
+            att = ams.get("attendance") or {}
+            if not att:
+                return "出勤数据暂未同步（监控每30分钟更新）。"
+            sess = ams.get("sessions") or []
+            absent = [s for s in sess if s.get("status") == 3]
+            lines = [f"总体出勤率 {att.get('overall', '?')}%"]
+            if absent:
+                lines.append("缺勤课节：" + "；".join(
+                    f"{s.get('course', '?')} {s.get('time', '')[:16]}" for s in absent[:5]))
+            return "\n".join(lines)
+        if name == "query_calendar":
+            days = int(args.get("days") or 3)
+            try:
+                events = outlook_events()
+            except Exception as e:
+                return f"日历读取失败: {e}"
+            now = datetime.now()
+            horizon = now + timedelta(days=max(1, days))
+            rows = []
+            for ev in events:
+                try:
+                    s = datetime.strptime(ev.get("start", "")[:19], "%Y-%m-%dT%H:%M:%S")
+                except Exception:
+                    continue
+                if now - timedelta(hours=12) <= s <= horizon:
+                    rows.append(f"{s.strftime('%m-%d %H:%M')} {ev.get('subject', '')}")
+            return "\n".join(rows) if rows else f"未来{days}天没有日程安排。"
+        return f"未知工具: {name}"
+    except Exception as e:
+        log(f"❌ 工具执行异常 {name}: {e}")
+        return f"工具执行出错: {e}"
 
 
 def call_llm_chat(user_text, chat_id):
@@ -2056,17 +2557,48 @@ def call_llm_chat(user_text, chat_id):
             messages.append({"role": msg["role"], "content": msg["content"]})
         messages.append({"role": "user", "content": f"当前上下文：\n{context}\n\n用户消息：{user_text}"})
 
-        resp = _http("https://api.deepseek.com/v1/chat/completions",
-                     method="POST",
-                     headers={"Authorization": f"Bearer {DEEPSEEK_API_KEY}"},
-                     data={
-                         "model": "deepseek-chat",
-                         "messages": messages,
-                         "max_tokens": 600,
-                         "temperature": 0.7
-                     },
-                     timeout=15)
-        reply = resp.get("choices", [{}])[0].get("message", {}).get("content", "")
+        # 是否带 tools：含房间/作业/出勤/日程意图时才启用（降低无关请求的成本）
+        tool_intent = any(kw in user_text for kw in (
+            "房", "研讨", "预定", "预约", "订", "room", "book",
+            "作业", "ddl", "截止", "homework", "出勤", "考勤", "缺勤", "attendance",
+            "日历", "日程", "安排", "calendar", "schedule", "今天", "明天", "这周", "计划"))
+
+        def _call_ds(msgs, use_tools):
+            payload = {
+                "model": "deepseek-chat",
+                "messages": msgs,
+                "max_tokens": 600,
+                "temperature": 0.7,
+            }
+            if use_tools:
+                payload["tools"] = TOOLS_DEF
+            return _http("https://api.deepseek.com/v1/chat/completions",
+                         method="POST",
+                         headers={"Authorization": f"Bearer {DEEPSEEK_API_KEY}"},
+                         data=payload,
+                         timeout=20)
+
+        resp = _call_ds(messages, tool_intent)
+        msg = (resp.get("choices") or [{}])[0].get("message") or {}
+        reply = msg.get("content", "") or ""
+        tool_calls = msg.get("tool_calls") or []
+
+        # Function Calling 循环：执行工具 → 结果回传 → 再生成（最多 2 轮）
+        rounds = 0
+        while tool_calls and rounds < 2:
+            rounds += 1
+            messages.append(msg)  # assistant 带 tool_calls 的原消息
+            for tc in tool_calls:
+                fn = tc.get("function") or {}
+                result = execute_tool(fn.get("name", ""), fn.get("arguments", "{}"), chat_id)
+                log(f"🛠️ 工具结果: {str(result)[:100]}")
+                messages.append({"role": "tool", "tool_call_id": tc.get("id", ""),
+                                 "content": str(result)[:3500]})
+            resp = _call_ds(messages, True)
+            msg = (resp.get("choices") or [{}])[0].get("message") or {}
+            reply = msg.get("content", "") or ""
+            tool_calls = msg.get("tool_calls") or []
+
         log(f"🤖 LLM回复: {reply[:80]}")
         # 提取 [ACTION:xxx] 标记
         action = None
