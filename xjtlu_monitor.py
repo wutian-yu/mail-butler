@@ -1388,6 +1388,13 @@ def _find_accid(obj):
     return None
 
 
+def _url_host(u):
+    try:
+        return urllib.parse.urlparse(u).netloc
+    except Exception:
+        return ""
+
+
 def fetch_roombookings_session(browser, main_context):
     """登录房间预定系统，抓 API session cookies + accId，存入 state['room']
 
@@ -1421,12 +1428,13 @@ def fetch_roombookings_session(browser, main_context):
                 u = page.url
             except Exception:
                 continue
-            if "uim.xjtlu.edu.cn" in u and "login" in u.lower():
+            host = _url_host(u)
+            if host == "uim.xjtlu.edu.cn" and "login" in u.lower():
                 if not filled_once and XJTLU_USERNAME and XJTLU_PASSWORD:
                     log(f"🔑 停在 uim 登录页，自动填入账密...")
                     filled_once = _room_uim_fill_login(page)
                 continue
-            if "roombookings" in u:
+            if host == "roombookings.xjtlu.edu.cn":
                 stable += 1
                 if stable >= 2:
                     log(f"✅ 房间系统就绪: {u[:60]}")
