@@ -1821,140 +1821,70 @@ def _room_op_query(page, captured, op):
 
 
 def _room_op_probe(page, captured, op):
-    """安全探测订房 API v22（memberKind=1 单人流 · sysKind=1 限流版）：
-    v21 结论：sysKind=2 子系统未启用；连发请求触发限流 → 本版只测 sk1，请求间隔 8s。
-    R1 mk1+sk1+rp0（单人关键测试）/ R2 mk2+sk1+自己×2 / R3 mk1+sk1+rp32
-    所有订房测试打在已占用时段 → 必被拒绝 → 零副作用。"""
-    today = _bjnow().strftime("%Y-%m-%d")
-    ds = today.replace("-", "")
+    """安全探测 v23（全量 JS 扫描找成员搜索 API）：
+    v22 结论：房间 minUser=2 是硬规则，单人/重复自己都不行，订房必须 2 个不同 accNo。
+    本轮目标：找到 SPA 订房弹窗"添加成员"用的搜索接口（若有，用户报同学姓名/学号即可自动查 accNo）。
+    纯只读探测（GET + JS 下载），零副作用。
+    1. 收集全部已加载 JS chunk，提取所有 API 端点（此前只扫了一个 API 模块）
+    2. dump selectAccNoList（订房弹窗成员选择）全部上下文
+    3. dump orderpeople（订后邀请成员弹窗）上下文 + judgLimit/orderPeopleChange 源码
+    4. 专项筛选 user/member/search 类端点"""
     findings = []
-
     acc_id, pid = _room_get_accid_from_storage(page)
     log(f"🆔 accId={acc_id!r}")
     findings.append(f"accId={acc_id}")
-    acc = int(acc_id) if str(acc_id).isdigit() else acc_id
 
-    # 0) sysConfig / 路由（resvCode 验证码开关、resvthemefix、spaceListType）
-    try:
-        cfg = page.evaluate(
-            "() => { try { const el = document.querySelector('#app') || document.body.firstElementChild;"
-            "const vm = el && el.__vue__; if (!vm) return null;"
-            "const s = (vm.$store && vm.$store.state) || {};"
-            "return { sysConfig: s.sysConfig || null, route: vm.$route ? {path: vm.$route.path, params: vm.$route.params} : null };"
-            "} catch(e) { return 'ERR ' + String(e).slice(0, 60); } }")
-        log(f"📜 sysConfig/route: {json.dumps(cfg, ensure_ascii=False, default=str)[:700]}")
-        if isinstance(cfg, dict) and isinstance(cfg.get("sysConfig"), dict):
-            sc = cfg["sysConfig"]
-            findings.append(f"resvCode={sc.get('resvCode')},themefix={sc.get('resvthemefix')}")
-    except Exception as e:
-        log(f"⚠️ sysConfig dump 失败: {e}")
+    # 1) 全部已加载 JS chunk
+    js_urls = page.evaluate(
+        "() => performance.getEntriesByType('resource')"
+        ".map(r => r.name).filter(u => u.endsWith('.js') && u.includes('/static/') === false)")
+    if not js_urls:
+        js_urls = page.evaluate(
+            "() => Array.from(document.scripts).map(s => s.src).filter(Boolean)")
+    log(f"📦 已加载 {len(js_urls)} 个JS")
+    findings.append(f"JS={len(js_urls)}")
 
-    # 1) 楼层 labId 映射（周视图 getReserve 需要）
-    r0 = _room_api_on_page(page, f"/roomDevice/roomInfos?resvDate={ds}")
-    labs = 0
-    if r0.get("code") == 0 and r0.get("data"):
-        for campus in r0["data"]:
-            for lab in campus.get("labInfos") or []:
-                labs += 1
-                log(f"🏛️ labId={lab.get('labId')} labName={lab.get('labName')}")
-    findings.append(f"labIds={labs}")
-
-    # 2) 找一个已占用时段（冲突 → 必被拒 → 零副作用）
-    raw = _room_query_avail_raw(page, today, captured)
-    conflict_room = occupied_slot = None
-    if raw:
-        for campus in raw:
-            for lab in campus.get("labInfos") or []:
-                for rm in lab.get("roomInfos") or []:
-                    occ = [rv for rv in (rm.get("resvInfos") or [])
-                           if _room_slot_occupied(rv.get("resvStatus", 0))]
-                    if occ:
-                        conflict_room, occupied_slot = rm, occ[0]
-                        break
-                if conflict_room:
-                    break
-            if conflict_room:
-                break
-
-    def spa_post(payload, url="/reserve", as_params=False):
-        """SPA axios 提交。as_params=False: JSON body（v20 实证 /reserve 接受）；
-        True: 参数全部拼进 URL 查询串（SPA 原生 params:n 传输，数组重复键）"""
-        head = (
-            "() => Promise.race(["
-            "new Promise((resolve) => {"
-            "try {"
-            "const el = document.querySelector('#app') || document.body.firstElementChild;"
-            "const vm = el && el.__vue__;"
-            "const axios = vm && vm.$axios;"
-            "if (!axios) { resolve({stage: 'noaxios'}); return; }"
-        )
-        tail = (
-            ".then(r => resolve({ok: 1, code: r.data && r.data.code, message: r.data && r.data.message}))"
-            ".catch(e => resolve({ok: 0, error: String(e).slice(0, 100)}));"
-            "} catch(e) { resolve({ok: -1, error: String(e).slice(0, 100)}); }"
-            "}),"
-            "new Promise((resolve) => setTimeout(() => resolve({stage: 'timeout'}), 15000))"
-            "])"
-        )
-        if as_params:
-            parts = []
-            for k, v in payload.items():
-                if isinstance(v, (list, tuple)):
-                    if not v:
-                        continue
-                    for x in v:
-                        parts.append(k + "=" + urllib.parse.quote(str(x), safe=""))
-                elif v is None:
-                    continue
-                else:
-                    parts.append(k + "=" + urllib.parse.quote(str(v), safe=""))
-            full = url + ("&" if "?" in url else "?") + "&".join(parts)
-            js = head + "axios.post(" + json.dumps(full) + ", null)" + tail
-        else:
-            js = (head + "const p = " + json.dumps(payload, ensure_ascii=False) + ";"
-                  + "axios.post(" + json.dumps(url) + ", p)" + tail)
+    all_apis = {}
+    sel_ctx, order_ctx = [], []
+    for u in js_urls:
         try:
-            return page.evaluate(js)
+            body = page.request.get(u, timeout=25000).text()
         except Exception as e:
-            return {"ok": -2, "error": str(e)[:100]}
+            log(f"⚠️ 下载失败 {u.split('/')[-1]}: {str(e)[:60]}")
+            continue
+        short = u.split("/")[-1][:28]
+        for m in re.finditer(r'url:"(/[^"]{2,60})"', body):
+            all_apis.setdefault(m.group(1), short)
+        for m in re.finditer(r"selectAccNoList", body):
+            s = max(0, m.start() - 200)
+            e2 = min(len(body), m.start() + 300)
+            sel_ctx.append((short, body[s:e2]))
+        for m in re.finditer(r"orderpeople", body):
+            s = max(0, m.start() - 150)
+            e2 = min(len(body), m.start() + 300)
+            order_ctx.append((short, body[s:e2]))
 
-    if conflict_room:
-        s = occupied_slot["resvBeginTime"]
-        e_t = occupied_slot["resvEndTime"]
-        dev = conflict_room["devId"]
-        log(f"🎯 冲突房: devId={dev} {conflict_room.get('devName')} {s}~{e_t}")
-        base = {
-            "appAccNo": acc,
-            "captcha": "",
-            "memo": "小组研讨",
-            "resvBeginTime": s,
-            "resvDev": [dev],
-            "resvEndTime": e_t,
-            "testName": "小组研讨",
-            "addServices": [],
-            "appUrl": "",
-            "resvKind": 2,
-        }
-        # v21 教训：sk2 未启用；连发会触发限流(Frequent requests) → 只测 sk1 + 8s 间隔
-        tests = [
-            ("R1", "mk1单人", dict(base, memberKind=1, sysKind=1, resvProperty=0, resvMember=[acc]),
-             "/reserve", False),
-            ("R2", "mk2双自己", dict(base, memberKind=2, sysKind=1, resvProperty=0, resvMember=[acc, acc]),
-             "/reserve", False),
-            ("R3", "mk1rp32", dict(base, memberKind=1, sysKind=1, resvProperty=32, resvMember=[acc]),
-             "/reserve", False),
-        ]
-        import time as _t
-        for tid, desc, pl, url, as_p in tests:
-            _t.sleep(8)  # 限流保护
-            r = spa_post(pl, url, as_params=as_p)
-            msg = str(r.get("message", r.get("error", "")))[:70]
-            log(f"📥 {tid}({desc}): code={r.get('code')} msg={msg}")
-            findings.append(f"{tid}:{str(r.get('message', ''))[:24]}")
-    else:
-        findings.append("无冲突时段,跳过订房测试")
+    log(f"📜 全部API端点({len(all_apis)}):")
+    for api in sorted(all_apis):
+        log(f"   {api}  (@{all_apis[api]})")
+    findings.append(f"API={len(all_apis)}")
 
-    # 3) 零残留
+    # 2) 专项：user/member/search 类端点
+    cand = [a for a in sorted(all_apis)
+            if any(k in a.lower() for k in ("user", "member", "search", "friend", "stu", "accno"))]
+    log(f"🔍 候选搜索端点({len(cand)}): {', '.join(cand) if cand else '无'}")
+    findings.append(f"候选={len(cand)}")
+
+    # 3) selectAccNoList 上下文（弹窗模板+方法）
+    for i, (short, ctx) in enumerate(sel_ctx[:10]):
+        log(f"📜 selectAccNoList[{i}]@{short}: {ctx[:450]}")
+    findings.append(f"selCtx={len(sel_ctx)}")
+
+    # 4) orderpeople 上下文（订后邀请弹窗）+ 关键函数源码
+    for i, (short, ctx) in enumerate(order_ctx[:6]):
+        log(f"📜 orderpeople[{i}]@{short}: {ctx[:450]}")
+
+    # 5) 零残留
     begin = (_bjnow() - timedelta(days=1)).strftime("%Y-%m-%d")
     end = (_bjnow() + timedelta(days=3)).strftime("%Y-%m-%d")
     j5 = _room_api_on_page(
@@ -1972,7 +1902,7 @@ def _room_op_probe(page, captured, op):
     else:
         log("✅ 零残留")
         findings.append("零残留✅")
-    return "🔬 probe v21 完成: " + "；".join(findings)
+    return "🔬 probe v23 完成: " + "；".join(findings)
 
 
 def run_room_op(op_json):
