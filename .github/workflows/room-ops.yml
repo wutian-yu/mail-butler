@@ -1,0 +1,41 @@
+name: Room Ops
+
+# 房间操作：云函数触发，浏览器内执行（过 aTrust 零信任网关）
+# inputs.op = JSON，例如：
+#   {"action":"book","date":"2026-10-04","start":"14:00","end":"17:00","room":"543","memo":"小组研讨"}
+#   {"action":"cancel","uuid":"xxx","name":"Room 543"}
+#   {"action":"query","date":"2026-10-04"}
+on:
+  workflow_dispatch:
+    inputs:
+      op:
+        description: 'Room operation JSON'
+        required: true
+
+jobs:
+  op:
+    runs-on: ubuntu-latest
+    timeout-minutes: 12
+    steps:
+      - name: Checkout 代码仓库
+        uses: actions/checkout@v4
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Install Playwright
+        run: |
+          pip install playwright
+          playwright install chromium --with-deps
+
+      - name: Run Room Op
+        env:
+          XJTLU_USERNAME: ${{ secrets.XJTLU_USERNAME }}
+          XJTLU_PASSWORD: ${{ secrets.XJTLU_PASSWORD }}
+          EBRIDGE_COOKIES: ${{ secrets.EBRIDGE_COOKIES }}
+          FEISHU_APP_ID: ${{ secrets.FEISHU_APP_ID }}
+          FEISHU_APP_SECRET: ${{ secrets.FEISHU_APP_SECRET }}
+          ROOM_OP: ${{ github.event.inputs.op }}
+        run: python xjtlu_monitor.py
