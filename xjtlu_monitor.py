@@ -1821,10 +1821,11 @@ def _room_op_query(page, captured, op):
 
 
 def _room_op_probe(page, captured, op):
-    """安全探测订房 API v10（修正版）：
-    1. chunk-52d28091 限定 .js 后缀下载，dump resvKind 上下文（r/s 时间构造 + submit 调用）
-    2. 变体矩阵全跑（不因误报提前 break），大小写不敏感判断
-    3. 零残留确认
+    """安全探测订房 API v11（情报收集 + captcha 假值测试）：
+    1. 读 Vuex store 的 sysConfig / userInfo / newResearch 完整状态
+    2. dump clickNum 上下文 2000 字符（看 submit 调用）
+    3. dump resvCode 上下文（captcha 要求）
+    4. 冲突时段 + 假 captcha="1234" 测试（零副作用）
     """
     today = _bjnow().strftime("%Y-%m-%d")
     findings = []
@@ -1833,49 +1834,57 @@ def _room_op_probe(page, captured, op):
     log(f"🆔 accId={acc_id!r} pid={pid!r}")
     findings.append(f"accId={acc_id}")
 
-    # 1. 拿 chunk-52d28091.js（限定 js 后缀，排除 css）
-    chunk_body = None
+    # 1. 读 Vuex store 完整状态
+    try:
+        store_state = page.evaluate(
+            "() => {"
+            "const el = document.querySelector('#app') || document.body.firstElementChild;"
+            "const vm = el && el.__vue__;"
+            "if (!vm || !vm.$store) return {error: 'no store'};"
+            "const s = vm.$store.state;"
+            "return {"
+            "sysConfig: s.sysConfig,"
+            "userInfo: s.userInfo,"
+            "newResearch: s.newResearch,"
+            "config: s.config,"
+            "stateKeys: Object.keys(s),"
+            "};"
+            "}")
+        log(f"🔍 Vuex state keys: {json.dumps(store_state.get('stateKeys'), ensure_ascii=False)[:200]}")
+        log(f"🔍 sysConfig: {json.dumps(store_state.get('sysConfig'), ensure_ascii=False)[:500]}")
+        log(f"🔍 userInfo: {json.dumps(store_state.get('userInfo'), ensure_ascii=False)[:300]}")
+        log(f"🔍 newResearch: {json.dumps(store_state.get('newResearch'), ensure_ascii=False)[:500]}")
+        log(f"🔍 config: {json.dumps(store_state.get('config'), ensure_ascii=False)[:300]}")
+        findings.append(f"sysConfig:{json.dumps(store_state.get('sysConfig'), ensure_ascii=False)[:80]}")
+    except Exception as e:
+        log(f"⚠️ Vuex 读取失败: {e}")
+
+    # 2. dump chunk-52d28091 关键上下文
     try:
         js_urls = page.evaluate(
             "() => performance.getEntriesByType('resource')"
             ".map(r => r.name).filter(u => u.endsWith('.js') && u.includes('chunk-52d28091'))")
         if js_urls:
-            resp = page.request.get(js_urls[0], timeout=20000)
-            chunk_body = resp.text()
-            log(f"📜 chunk-52d28091.js 大小 {len(chunk_body)}，前80: {chunk_body[:80]}")
-        else:
-            log("📜 chunk-52d28091.js 不在 entries（列出全部 js 名看看）")
-            all_js = page.evaluate(
-                "() => performance.getEntriesByType('resource')"
-                ".map(r => r.name).filter(u => u.endsWith('.js')).map(u => u.split('/').pop())")
-            log(f"📜 全部 JS: {json.dumps(all_js[:50], ensure_ascii=False)[:600]}")
+            body = page.request.get(js_urls[0], timeout=20000).text()
+            # clickNum 上下文（submit 调用）
+            idx = body.find("clickNum")
+            if idx >= 0:
+                log(f"📜 clickNum 上下文: ...{body[max(0, idx-200):idx+2000]}...")
+            # resvCode 上下文
+            idx2 = body.find("resvCode")
+            if idx2 >= 0:
+                log(f"📜 resvCode 上下文: ...{body[max(0, idx2-200):idx2+500]}...")
+            # 找 submitResv / handleSubmit / doSubmit 等方法名
+            for kw in ("submitResv", "handleSubmit", "doSubmit", "submitForm:", "saveResv",
+                       "confirmResv", "onSubmit", "handleResv", "doResv"):
+                idx3 = body.find(kw)
+                if idx3 >= 0:
+                    log(f"📜「{kw}」: ...{body[max(0, idx3-100):idx3+800]}...")
+                    break
     except Exception as e:
-        log(f"⚠️ chunk 下载失败: {e}")
+        log(f"⚠️ JS 扫描失败: {e}")
 
-    if chunk_body and len(chunk_body) > 1000 and "function" in chunk_body[:2000]:
-        # resvKind 上下文（完整 payload 构造 + submit 调用）
-        idx = chunk_body.find("resvKind")
-        tries = 0
-        while idx >= 0 and tries < 5:
-            snippet = chunk_body[max(0, idx - 900):idx + 200]
-            if "appAccNo" in snippet:
-                log(f"📜 resvKind 前文: ...{chunk_body[max(0, idx-900):idx+50]}...")
-                log(f"📜 resvKind 后文: ...{chunk_body[idx:idx+1700]}...")
-                break
-            idx = chunk_body.find("resvKind", idx + 8)
-            tries += 1
-        # changeBeginTime
-        idx2 = chunk_body.find("changeBeginTime")
-        if idx2 >= 0:
-            log(f"📜 changeBeginTime 上下文: ...{chunk_body[max(0, idx2-300):idx2+600]}...")
-        # submit 调用（找 Object(xxx) 模式）
-        for kw in (".submit(", "handleSubmit", "subResv", "submitForm("):
-            idx3 = chunk_body.find(kw)
-            if idx3 >= 0:
-                log(f"📜「{kw}」上下文: ...{chunk_body[max(0, idx3-150):idx3+400]}...")
-                break
-
-    # 2. 冲突时段变体矩阵（全跑，不 break）
+    # 3. 冲突时段 + 假 captcha 测试
     raw = _room_query_avail_raw(page, today, captured)
     conflict_room = occupied_slot = None
     if raw:
@@ -1891,75 +1900,60 @@ def _room_op_probe(page, captured, op):
                     break
             if conflict_room:
                 break
-    if not conflict_room:
-        log("📭 无冲突房间")
-        return "🔬 probe v10 完成: " + "；".join(findings)
 
-    s_slot = occupied_slot["resvBeginTime"]   # "2026-10-03 12:00:00"
-    e_slot = occupied_slot["resvEndTime"]
-    dev = conflict_room["devId"]
-
-    def spa_post(payload):
-        js = (
-            "() => Promise.race(["
-            "new Promise((resolve) => {"
-            "try {"
-            "const el = document.querySelector('#app') || document.body.firstElementChild;"
-            "const vm = el && el.__vue__;"
-            "const axios = vm && vm.$axios;"
-            "if (!axios) { resolve({stage: 'noaxios'}); return; }"
-            "const p = " + json.dumps(payload, ensure_ascii=False) + ";"
-            "axios.post('/reserve/update', p)"
-            ".then(r => resolve({ok: 1, code: r.data && r.data.code, message: r.data && r.data.message}))"
-            ".catch(e => resolve({ok: 0, error: String(e).slice(0, 100)}));"
-            "} catch(e) { resolve({ok: -1, error: String(e).slice(0, 100)}); }"
-            "}),"
-            "new Promise((resolve) => setTimeout(() => resolve({stage: 'timeout'}), 15000))"
-            "])"
-        )
-        try:
-            return page.evaluate(js)
-        except Exception as e:
-            return {"ok": -2, "error": str(e)[:100]}
-
-    def base(t_start, t_end, rp=32):
+    if conflict_room:
+        s_slot = occupied_slot["resvBeginTime"]
+        e_slot = occupied_slot["resvEndTime"]
+        dev = conflict_room["devId"]
         acc = int(acc_id) if str(acc_id).isdigit() else acc_id
-        return {
+
+        def spa_post(payload):
+            js = (
+                "() => Promise.race(["
+                "new Promise((resolve) => {"
+                "try {"
+                "const el = document.querySelector('#app') || document.body.firstElementChild;"
+                "const vm = el && el.__vue__;"
+                "const axios = vm && vm.$axios;"
+                "if (!axios) { resolve({stage: 'noaxios'}); return; }"
+                "const p = " + json.dumps(payload, ensure_ascii=False) + ";"
+                "axios.post('/reserve/update', p)"
+                ".then(r => resolve({ok: 1, code: r.data && r.data.code, message: r.data && r.data.message}))"
+                ".catch(e => resolve({ok: 0, error: String(e).slice(0, 100)}));"
+                "} catch(e) { resolve({ok: -1, error: String(e).slice(0, 100)}); }"
+                "}),"
+                "new Promise((resolve) => setTimeout(() => resolve({stage: 'timeout'}), 15000))"
+                "])"
+            )
+            try:
+                return page.evaluate(js)
+            except Exception as e:
+                return {"ok": -2, "error": str(e)[:100]}
+
+        base = {
             "sysKind": 1, "appAccNo": acc, "memberKind": 1,
-            "resvBeginTime": t_start, "resvEndTime": t_end,
-            "testName": "研讨", "resvKind": 2, "resvProperty": rp, "appUrl": "",
+            "resvBeginTime": s_slot, "resvEndTime": e_slot,
+            "testName": "研讨", "resvKind": 2, "resvProperty": 32, "appUrl": "",
             "resvMember": [acc], "resvDev": [dev], "memo": "小组研讨",
             "captcha": "", "addServices": [],
         }
+        # C1: 假 captcha
+        p_c1 = dict(base)
+        p_c1["captcha"] = "1234"
+        r_c1 = spa_post(p_c1)
+        log(f"📥 C1 假captcha: code={r_c1.get('code')} msg={str(r_c1.get('message', r_c1.get('error', '')))[:80]}")
+        findings.append(f"C1captcha:{str(r_c1.get('message', ''))[:30]}")
+        # C2: resvProperty=0 + 假captcha
+        p_c2 = dict(base)
+        p_c2["captcha"] = "1234"
+        p_c2["resvProperty"] = 0
+        r_c2 = spa_post(p_c2)
+        log(f"📥 C2 rp0+假captcha: code={r_c2.get('code')} msg={str(r_c2.get('message', r_c2.get('error', '')))[:80]}")
+        findings.append(f"C2rp0cap:{str(r_c2.get('message', ''))[:30]}")
+    else:
+        log("📭 无冲突房间")
 
-    def is_param_err(msg):
-        m = str(msg).lower()
-        return "参数" in m or "parameter" in m
-
-    variants = [
-        ("V1 原样带秒", base(s_slot, e_slot)),
-        ("V2 斜杠时间", base(s_slot.replace("-", "/"), e_slot.replace("-", "/"))),
-        ("V3 数组body", [base(s_slot, e_slot)]),
-        ("V4 斜杠+数组", [base(s_slot.replace("-", "/"), e_slot.replace("-", "/"))]),
-        ("V5 rp0原样", base(s_slot, e_slot, rp=0)),
-        ("V6 ISO时间", base(s_slot.replace(" ", "T"), e_slot.replace(" ", "T"))),
-        ("V7 无秒无毫秒", base(s_slot[:-3], e_slot[:-3])),
-        ("V8 无testName无memo", {k: v for k, v in base(s_slot, e_slot).items()
-                                  if k not in ("testName", "memo", "appUrl", "addServices", "captcha")}),
-    ]
-    winner = None
-    for name, p in variants:
-        r = spa_post(p)
-        msg = str(r.get("message", r.get("error", "")))
-        log(f"📥 {name}: code={r.get('code')} msg={msg[:70]}")
-        findings.append(f"{name[:2]}:{msg[:20]}")
-        if not is_param_err(msg):
-            winner = (name, p)
-            log(f"🎯 {name} 通过参数校验（真）！")
-    if not winner:
-        log("📭 全部变体仍是参数错误 → 问题在更深字段，看 📜 JS 上下文分析")
-
-    # 3. 零残留确认
+    # 4. 零残留
     begin = (_bjnow() - timedelta(days=1)).strftime("%Y-%m-%d")
     end = (_bjnow() + timedelta(days=3)).strftime("%Y-%m-%d")
     j5 = _room_api_on_page(
@@ -1967,7 +1961,6 @@ def _room_op_probe(page, captured, op):
               f"&needStatus=8582&page=1&pageNum=20&orderKey=gmt_create")
     rows = j5.get("data") or []
     if rows:
-        log(f"🚨 {len(rows)} 条预约残留，清理：")
         for rv in rows:
             if rv.get("uuid"):
                 d = _room_api_on_page(page, "/reserve/delete?sf_request_type=ajax",
@@ -1977,7 +1970,7 @@ def _room_op_probe(page, captured, op):
     else:
         log("✅ 零残留")
         findings.append("零残留✅")
-    return "🔬 probe v10 完成: " + "；".join(findings)
+    return "🔬 probe v11 完成: " + "；".join(findings)
 
 
 def run_room_op(op_json):
