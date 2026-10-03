@@ -1555,12 +1555,19 @@ def cmd_leave_revoke(chat_id, arg=""):
         feishu_send(chat_id, f"❌ 撤回异常：{e}")
 
 
+# 同一轮询周期内缓存 revoke_check 的 odd，供 _check_leave_approval 复用（避免重复读 GitHub）
+_REVOKE_CHECK_ODD_CACHE = ""
+
+
 def _check_pending_revoke(chat_id):
     """轮询兜底：验证之前挂起的撤回是否真正生效，生效则发完成通知"""
+    global _REVOKE_CHECK_ODD_CACHE
+    _REVOKE_CHECK_ODD_CACHE = ""
     try:
         rc, sha = gh_read_json("revoke_check.json")
         if not (isinstance(rc, dict) and rc.get("odd")):
             return
+        _REVOKE_CHECK_ODD_CACHE = str(rc.get("odd") or "")
         if _revoke_actually_done(rc.get("odd"), rc.get("date")):
             _mark_leave_status(rc.get("odd"), 2)   # 同步快照，防审批监控误报
             gh_write_json("revoke_check.json", {}, sha, "revoke done")
@@ -1570,9 +1577,10 @@ def _check_pending_revoke(chat_id):
                 f"撤回记录保留作历史，不会再生效。", color="green")
     except urllib.error.HTTPError as e:
         if getattr(e, "code", None) != 404:
-            pass  # 404=无挂起撤回，静默
-    except Exception:
-        pass
+            log(f"⚠️ _check_pending_revoke 读取异常（非404）: code={getattr(e,'code',None)}")
+        # 404=无挂起撤回，静默
+    except Exception as e:
+        log(f"⚠️ _check_pending_revoke 异常: {e}")
 
 
 def _mark_leave_status(odd, status):
@@ -1594,12 +1602,17 @@ def _mark_leave_status(odd, status):
         pass
 
 
+# 内存级审批快照缓存：防止 GitHub 写入失败时下一轮重复通知（同一 SCF 实例生命周期内有效）
+_LEAVE_APPROVAL_CACHE = {}
+
+
 def _check_leave_approval(chat_id):
     """轮询：监控 AMS 请假审批结果（兑现提交成功卡片里「审批结果会提醒」的承诺）
     快照对比 leave_status.json（odd→status）：status 从 1（待审批）变为其他值 →
     调 detail 拿审批细节（statusName/通过数/审批意见）发提醒卡片。
     新申请入库只记快照不提醒（提交成功卡片已通知过）；
-    撤回造成的 1→2 由 _mark_leave_status 同步快照 + revoke_check 排除双重防误报。"""
+    撤回造成的 1→2 由 _mark_leave_status 同步快照 + revoke_check 排除双重防误报。
+    内存缓存 _LEAVE_APPROVAL_CACHE 兜底：GitHub 写入失败时仍能阻止下一轮重复通知。"""
     ams, _, _ = _ams_state()
     token = ams.get("token", "")
     if not token:
@@ -1613,6 +1626,8 @@ def _check_leave_approval(chat_id):
         if getattr(e, "code", None) != 404:
             return  # 网络/限流等异常：下轮再查，不写快照
     known = snap.get("apps") or {}
+    # 合并内存缓存（GitHub 写入失败时兜底去重）
+    known = {**known, **_LEAVE_APPROVAL_CACHE}
     try:
         resp = _http(f"{AMS_URL}/xjtlu/stuapi/xjtlu-leave/getLeaveList?pageNum=1&pageSize=20",
                      headers={"x-token": token}, timeout=15)
@@ -1622,12 +1637,8 @@ def _check_leave_approval(chat_id):
     except Exception:
         return
     # 排除正在撤回验证中的申请（避免把撤回误报为审批结果）
-    pending_odd = ""
-    try:
-        rc, _ = gh_read_json("revoke_check.json")
-        pending_odd = str((rc or {}).get("odd") or "")
-    except Exception:
-        pass
+    # 复用 _check_pending_revoke 已读取的结果（同一轮询周期内先于本函数执行）
+    pending_odd = _REVOKE_CHECK_ODD_CACHE
     dirty, notices = False, []
     for r in rows:
         odd = str(r.get("leaveOdd") or "")
@@ -1644,12 +1655,13 @@ def _check_leave_approval(chat_id):
         if old == 1 and st != 1 and odd != pending_odd:
             notices.append(r)
         known[odd] = st
+        _LEAVE_APPROVAL_CACHE[odd] = st   # 内存缓存先行（GitHub 写失败时兜底）
         dirty = True
     if dirty:
         try:
             gh_write_json("leave_status.json", {"apps": known}, sha, "leave status snapshot")
-        except Exception:
-            pass  # 写失败下轮重对比；重复提醒的风险远低于漏提醒
+        except Exception as e:
+            log(f"⚠️ leave_status 快照写入失败（内存缓存已更新，下轮兜底）: {e}")
     for r in notices:
         odd = r.get("leaveOdd")
         try:
@@ -2662,10 +2674,11 @@ def gather_context(include_outlook=True):
             ctx_parts.append(f"LearningMall 近期作业/测验（共{len(lm_events)}项）：\n" + "\n".join(lines))
     except Exception:
         pass
-    # 注入 AMS 出勤数据
+    # 注入 AMS 出勤数据 + 房间预定状态（同一份 xjtlu_state.json，只读一次）
+    _xjtlu_state = None
     try:
-        ams_state, _ = gh_read_json("xjtlu_state.json")
-        ams = (ams_state or {}).get("ams") or {}
+        _xjtlu_state, _ = gh_read_json("xjtlu_state.json")
+        ams = (_xjtlu_state or {}).get("ams") or {}
         att = ams.get("attendance") or {}
         if att.get("overall") is not None:
             lines = [f"总出勤率：{att.get('overall')}%"
@@ -2684,10 +2697,9 @@ def gather_context(include_outlook=True):
             ctx_parts.append("AMS 考勤状态：\n" + "\n".join(lines))
     except Exception:
         pass
-    # 注入房间预定系统 session 状态（不做 API 调用，轻量）
+    # 注入房间预定系统 session 状态（复用上面已读的 _xjtlu_state，不再重复读 GitHub）
     try:
-        room_state, _ = gh_read_json("xjtlu_state.json")
-        room = (room_state or {}).get("room") or {}
+        room = (_xjtlu_state or {}).get("room") or {}
         if room.get("cookies"):
             upd = (room.get("updated") or "")[:16].replace("T", " ")
             ctx_parts.append(f"图书馆房间预定系统：已登录（session 更新于 {upd}），可用工具查房/订房/取消。")
@@ -2708,7 +2720,7 @@ def gather_context(include_outlook=True):
                 f"- 日期：{lp.get('startDate', '?')} ~ {lp.get('endDate', '?')}\n"
                 f"- 类型：{lp.get('leaveType', '?')}\n"
                 f"- 原因：{lp.get('leaveReason', '?')}\n"
-                f"- 涉及课节：{mods}"
+                f"- 涉及课节：{mod_desc}"
             )
     except Exception:
         pass
@@ -3232,7 +3244,7 @@ def _maybe_notify_no_pending_image(chat_id):
             msg = "📷 图片已收到（当前无进行中的请假申请）"
         else:
             msg = ("🤔 收到图片，但当前没有进行中的请假申请。\n\n"
-                   "\n\n⬇️ 直接复制发送：\n【请假 10-05 左腿受伤需静养】\n\n收到预览后发证明照片 → 自动提交。")
+                   "⬇️ 直接复制发送：\n【请假 10-05 左腿受伤需静养】\n\n收到预览后发证明照片 → 自动提交。")
         _LAST_IMAGE_HINT["ts"] = now
         feishu_send(chat_id, msg)
     except Exception:
