@@ -15,6 +15,7 @@ import os
 import re
 import time
 import hashlib
+import base64
 import urllib.request
 import urllib.parse
 import html as html_mod
@@ -1734,14 +1735,112 @@ def _room_validate_booking(date_str, start, end):
     return None
 
 
+def _room_search_member(page, keyword):
+    """按统一账号搜同学 accNo（订房同伴用）。
+    GET /account/getMembers?key=<账号>&page=1&pageNum=10（probe v29 从 remoteMethod 源码定位）
+    返回 accNo（int/str）或 None"""
+    try:
+        key = str(keyword).strip()
+        path = (f"/account/getMembers?key={urllib.parse.quote(key, safe='')}"
+                f"&page=1&pageNum=10")
+        r = _room_api_on_page(page, path, timeout=15000)
+        rows = r.get("data") or []
+        if r.get("code") == 0 and isinstance(rows, list):
+            for x in rows:
+                if not isinstance(x, dict):
+                    continue
+                if str(x.get("logonName") or "").upper() == key.upper():
+                    return x.get("accNo")
+            if rows:
+                x = rows[0]
+                log(f"👥 搜索无精确匹配，首个结果: {x.get('logonName')} accNo={x.get('accNo')}")
+                return None
+        log(f"⚠️ 搜索失败 key={key}: code={r.get('code')} msg={str(r.get('message'))[:60]}")
+    except Exception as e:
+        log(f"⚠️ 搜索异常: {e}")
+    return None
+
+
+def _room_spa_axios(page, url, payload):
+    """用 SPA 自己的 axios 发 POST（拦截器自动带 token 头，与真实用户请求一致）"""
+    js = (
+        "() => Promise.race(["
+        "new Promise((resolve) => {"
+        "try {"
+        "const el = document.querySelector('#app') || document.body.firstElementChild;"
+        "const vm = el && el.__vue__;"
+        "const axios = vm && vm.$axios;"
+        "if (!axios) { resolve({stage: 'noaxios'}); return; }"
+        "const p = " + json.dumps(payload, ensure_ascii=False) + ";"
+        "axios.post(" + json.dumps(url) + ", p)"
+        ".then(r => resolve({ok: 1, code: r.data && r.data.code, message: r.data && r.data.message}))"
+        ".catch(e => resolve({ok: 0, error: String(e).slice(0, 100)}));"
+        "} catch(e) { resolve({ok: -1, error: String(e).slice(0, 100)}); }"
+        "}),"
+        "new Promise((resolve) => setTimeout(() => resolve({stage: 'timeout'}), 20000))"
+        "])"
+    )
+    try:
+        return page.evaluate(js)
+    except Exception as e:
+        return {"ok": -2, "error": str(e)[:100]}
+
+
+def _butler_update_room_cache(page, date_str=None):
+    """订房/取消成功后，把最新预约列表（+当天可用性）写回 butler-data，
+    让飞书端「我的预约/查房」立即同步（不用等 30 分钟定时任务）。
+    用 GH_PAT 走 Contents API（room-ops.yml 已注入 GH_PAT）。"""
+    pat = os.environ.get("GH_PAT", "")
+    if not pat:
+        return
+    try:
+        req = urllib.request.Request(
+            "https://api.github.com/repos/wutian-yu/butler-data/contents/xjtlu_state.json",
+            headers={"Authorization": f"Bearer {pat}", "Accept": "application/vnd.github+json"})
+        with urllib.request.urlopen(req, timeout=20000) as r:
+            meta = json.load(r)
+        state = json.loads(base64.b64decode(meta["content"]).decode())
+        room = state.setdefault("room", {})
+        begin = (_bjnow() - timedelta(days=1)).strftime("%Y-%m-%d")
+        end = (_bjnow() + timedelta(days=3)).strftime("%Y-%m-%d")
+        j = _room_api_on_page(
+            page, f"/reserve/resvInfo?beginDate={begin}&endDate={end}"
+                  f"&needStatus=8582&page=1&pageNum=20&orderKey=gmt_create")
+        rows = j.get("data") or []
+        room["bookings"] = _room_compact_bookings(rows)
+        if date_str:
+            raw = _room_query_avail_raw(page, date_str)
+            if raw is not None:
+                compact = _room_compact_avail(raw)
+                (room.setdefault("avail", {}))[date_str] = compact
+        body = json.dumps({
+            "message": f"room ops refresh {date_str or ''}".strip(),
+            "content": base64.b64encode(
+                json.dumps(state, ensure_ascii=False).encode()).decode(),
+            "sha": meta["sha"],
+        }).encode()
+        req = urllib.request.Request(
+            "https://api.github.com/repos/wutian-yu/butler-data/contents/xjtlu_state.json",
+            data=body, method="PUT",
+            headers={"Authorization": f"Bearer {pat}", "Accept": "application/vnd.github+json"})
+        with urllib.request.urlopen(req, timeout=20000) as r:
+            log(f"✅ butler-data 缓存已刷新 ({date_str or 'bookings'})")
+    except Exception as e:
+        log(f"⚠️ butler-data 刷新失败（不影响操作结果）: {str(e)[:120]}")
+
+
 def _room_op_book(page, captured, op):
     date = op.get("date", "")
     start, end = op.get("start", ""), op.get("end", "")
     room_key = str(op.get("room", "")).strip()
     memo = op.get("memo") or "小组研讨"
+    partner = str(op.get("partner", "")).strip()
     err = _room_validate_booking(date, start, end)
     if err:
         return err
+    if not partner:
+        return ("❌ 研讨室要求至少 2 人预定。请先在飞书发「设同伴 同学邮箱前缀」"
+                "（如 设同伴 TOM.SMITH25），或订房时带上「同伴 XXX」。")
     raw = _room_query_avail_raw(page, date, captured)
     if raw is None:
         return "❌ 查询房间状态失败，稍后重试。"
@@ -1758,17 +1857,29 @@ def _room_op_book(page, captured, op):
             if not (to_min(end) <= to_min(bs) or to_min(start) >= to_min(be)):
                 return (f"❌ {dev.get('devName')} 在 {start}-{end} 与已有预约（{bs}-{be}）冲突。")
     # accId
-    acc_id, _ = _room_probe_accid(page, captured)
+    acc_id, _ = _room_get_accid_from_storage(page)
+    if not acc_id:
+        acc_id, _ = _room_probe_accid(page, captured)
     acc_id = acc_id or ""
+    # 同伴 accNo：数字 = 直接给 accNo；否则按统一账号搜索
+    if partner.isdigit():
+        partner_acc = int(partner)
+    else:
+        partner_acc = _room_search_member(page, partner)
+        if not partner_acc:
+            return (f"❌ 没找到同学「{partner}」。请确认是同学学生邮箱 @ 前面那段"
+                    "（如 TOM.SMITH25），且拼写正确。")
+    if str(partner_acc) == str(acc_id):
+        return "❌ 同伴不能是你自己，请换一位同学。"
     payload = {
         "appAccNo": acc_id,
         "captcha": "",
         "memberKind": 2,
         "memo": memo,
-        "resvBeginTime": f"{date} {start}",
+        "resvBeginTime": f"{date} {start}:00",
         "resvDev": [dev.get("devId")],
-        "resvEndTime": f"{date} {end}",
-        "resvMember": [acc_id] if acc_id else [],
+        "resvEndTime": f"{date} {end}:00",
+        "resvMember": [acc_id, partner_acc],
         "resvProperty": 0,
         "sysKind": 1,
         "testName": memo,
@@ -1777,12 +1888,19 @@ def _room_op_book(page, captured, op):
         "resvKind": 2,
     }
     log(f"📤 订房 payload: {json.dumps(payload, ensure_ascii=False)[:200]}")
-    resp = _room_api_on_page(page, "/reserve", method="POST", data=payload, timeout=25000)
-    msg = str(resp.get("message", ""))
+    resp = _room_spa_axios(page, "/reserve", payload)
+    msg = str(resp.get("message", resp.get("error", "")))
     log(f"📥 订房响应: {str(resp)[:200]}")
     if resp.get("code") == 0:
+        _butler_update_room_cache(page, date)
         return (f"✅ 预定成功！\n\n🏛️ {dev.get('devName')}\n"
-                f"📅 {date} {start}-{end}")
+                f"📅 {date} {start}-{end}\n👥 已带上同伴（2人）")
+    if "number of people" in msg:
+        return "❌ 人数不满足（研讨室需 2-10 人），请检查同伴账号。"
+    if "does not exist" in msg:
+        return f"❌ 同伴账号「{partner}」不存在或无法加入，请确认拼写。"
+    if "Frequent" in msg:
+        return "❌ 操作太频繁（服务器限流），请 1 分钟后再试。"
     return f"❌ 预定未成功：{msg or '未知错误'}"
 
 
@@ -1790,10 +1908,11 @@ def _room_op_cancel(page, captured, op):
     uuid = op.get("uuid", "")
     if not uuid:
         return "❌ 缺少预约标识（uuid）。"
-    resp = _room_api_on_page(page, "/reserve/delete", method="POST",
-                             data={"uuid": uuid}, timeout=25000)
+    resp = _room_api_on_page(page, "/reserve/delete?sf_request_type=ajax",
+                             method="POST", data={"uuid": uuid}, timeout=25000)
     log(f"📥 取消响应: {str(resp)[:150]}")
     if resp.get("code") == 0:
+        _butler_update_room_cache(page)
         return f"✅ 已取消预约{('：' + op['name']) if op.get('name') else ''}"
     return f"❌ 取消失败：{resp.get('message', '未知错误')}"
 
@@ -1821,128 +1940,36 @@ def _room_op_query(page, captured, op):
 
 
 def _room_op_probe(page, captured, op):
-    """安全探测 v29（chunk 源文件分析 + 自适应实测，一轮闭环定位搜索 API）：
-    v28 教训：webpack 运行时消费模块工厂，页内注册表已没有目标模块。
-    本轮在 Python 端下载 chunk 文件（含完整工厂）做静态分析：
-    1. 找含 remoteMethod 的 chunk → 定位 be=n("模块ID")（就近匹配）
-    2. 全 chunk 找该模块工厂 → 导出映射(c→内部名) + 全部 url/method
-    3. 对找到的 URL 自适应实测（URL参数 & JSON body 两种），命中自己 92604 即成功
-    全程只读（搜索是 GET 语义），零副作用。"""
+    """安全探测 v30（成员搜索接口最终验证）：
+    v29 已定位：GET /account/getMembers?key=...&page=1&pageNum=10（remoteMethod 真身）。
+    本轮验证三个关键行为（决定 _room_search_member 的实现细节）：
+    1. 精确 key=GUANCHENG.WU26 → 应命中 accNo=92604
+    2. 部分 key=GUANCHENG → 是否支持前缀
+    3. 小写 key=guancheng.wu26 → 是否大小写敏感
+    并直接跑 _room_search_member 正式实现。全程只读，零副作用。"""
     findings = []
     acc_id, pid = _room_get_accid_from_storage(page)
     log(f"🆔 accId={acc_id!r} pid={pid!r}")
     findings.append(f"accId={acc_id}")
 
-    js_urls = page.evaluate(
-        "() => performance.getEntriesByType('resource').map(r => r.name)"
-        ".filter(u => u.endsWith('.js'))")
-    bodies = {}
-    for u in js_urls:
-        try:
-            bodies[u.split("/")[-1][:30]] = page.request.get(u, timeout=25000).text()
-        except Exception:
-            pass
-    log(f"📦 下载 {len(bodies)} 个chunk")
-    findings.append(f"chunks={len(bodies)}")
+    import time as _t
+    variants = [("精确", str(pid)), ("前缀", str(pid).split(".")[0]),
+                ("小写", str(pid).lower())]
+    for label, key in variants:
+        _t.sleep(2)
+        path = (f"/account/getMembers?key={urllib.parse.quote(key, safe='')}"
+                f"&page=1&pageNum=10")
+        r = _room_api_on_page(page, path, timeout=15000)
+        rows = r.get("data") or []
+        hit = [x for x in rows if isinstance(x, dict) and str(x.get("accNo")) == str(acc_id)]
+        log(f"📥 [{label}] key={key}: code={r.get('code')} count={r.get('count')} "
+            f"rows={json.dumps(rows, ensure_ascii=False, default=str)[:280]}")
+        findings.append(f"{label}:{'命中✓' if hit else (f'{len(rows)}行' if r.get('code') == 0 else str(r.get('message', ''))[:18])}")
 
-    # 1) 找含 remoteMethod 的 chunk 和 be=n("...")（就近向前匹配）
-    rm_chunk, be_mod = None, None
-    for name, body in bodies.items():
-        j = body.find("remoteMethod:function")
-        if j >= 0:
-            rm_chunk = name
-            seg = body[max(0, j - 30000):j]
-            m = re.findall(r'be=n\("([^"]+)"\)', seg)
-            be_mod = m[-1] if m else None
-            log(f"📜 remoteMethod@{name} be候选={m[-3:] if m else '无'} → be_mod={be_mod}")
-            break
-    if not rm_chunk:
-        findings.append("无remoteMethod")
-        return "🔬 probe v29 完成: " + "；".join(findings)
-    findings.append(f"beMod={be_mod}")
-
-    # 2) 全 chunk 找该模块工厂 → 导出映射 + urls
-    found_url = None
-    if be_mod:
-        for name, bd in bodies.items():
-            j = bd.find('"' + be_mod + '":function')
-            if j < 0:
-                j = bd.find(be_mod + ':function')
-            if j < 0:
-                continue
-            seg2 = bd[j:j + 50000]
-            exps = re.findall(r'\.d\(t,"([a-z])"\s*,\s*(?:function|\(function)\(\)\{return ([\w$]+)\}\)', seg2)
-            urls = re.findall(r'url:\s*"([^"]+)"', seg2)
-            methods = re.findall(r'method:\s*"(get|post|put|delete)"', seg2)
-            log(f"📜 be模块@{name}: 导出={exps} urls={urls} methods={methods}")
-            findings.append(f"urls={urls[:4]}")
-            # be["c"] 的 URL：导出映射里 c→X，X 的函数体里第一个 url
-            c_name = next((x for a, x in exps if a == "c"), None)
-            if c_name and urls:
-                found_url = urls[0]  # 简化：API 模块通常一个函数一个 url，按序对应
-                # 尝试更精确：找 c_name 函数体里的 url
-                fj = seg2.find("function " + c_name)
-                if fj < 0:
-                    fj = seg2.find(c_name + "=function")
-                if fj >= 0:
-                    m2 = re.search(r'url:\s*"([^"]+)"', seg2[fj:fj + 2500])
-                    if m2:
-                        found_url = m2.group(1)
-            log(f"📜 c导出名={c_name} → 定位URL={found_url}")
-            break
-
-    def spa_req(url, json_body=None):
-        if json_body is not None:
-            mid = ("const p = " + json.dumps(json_body, ensure_ascii=False)
-                   + "; axios.post(url, p)")
-        else:
-            mid = "axios.post(url, null)"
-        js = (
-            "() => Promise.race(["
-            "new Promise((resolve) => {"
-            "try {"
-            "const el = document.querySelector('#app') || document.body.firstElementChild;"
-            "const vm = el && el.__vue__;"
-            "const axios = vm && vm.$axios;"
-            "if (!axios) { resolve({stage: 'noaxios'}); return; }"
-            "const url = " + json.dumps(url) + ";"
-            + mid +
-            ".then(r => resolve({ok: 1, code: r.data && r.data.code, message: r.data && r.data.message,"
-            " count: r.data && r.data.count, data: r.data && r.data.data}))"
-            ".catch(e => resolve({ok: 0, error: String(e).slice(0, 100)}));"
-            "} catch(e) { resolve({ok: -1, error: String(e).slice(0, 100)}); }"
-            "}),"
-            "new Promise((resolve) => setTimeout(() => resolve({stage: 'timeout'}), 15000))"
-            "])"
-        )
-        try:
-            return page.evaluate(js)
-        except Exception as e:
-            return {"ok": -2, "error": str(e)[:100]}
-
-    # 3) 自适应实测
-    if found_url:
-        import time as _t
-        import urllib.parse as up
-        k = up.quote(str(pid), safe="")
-        variants = [
-            ("URL参数", found_url + f"?key={k}&page=1&pageNum=10", None),
-            ("JSONbody", found_url, {"key": pid, "page": 1, "pageNum": 10}),
-        ]
-        for label, url_, body_ in variants:
-            _t.sleep(3)
-            r = spa_req(url_, body_)
-            rows = r.get("data") or []
-            log(f"📥 [{label}] {url_[:70]}: code={r.get('code')} count={r.get('count')} "
-                f"msg={str(r.get('message', r.get('error', '')))[:40]} rows={json.dumps(rows, ensure_ascii=False, default=str)[:300]}")
-            if r.get("code") == 0:
-                hit = [x for x in rows if isinstance(x, dict) and str(x.get("accNo")) == str(acc_id)]
-                findings.append(f"{label}:OK{'命中✓' if hit else ''}")
-                if hit:
-                    log(f"🎯 命中: {json.dumps(hit[0], ensure_ascii=False, default=str)[:250]}")
-                    break
-            else:
-                findings.append(f"{label}:{str(r.get('message', ''))[:18]}")
+    # 正式实现回归测试
+    found = _room_search_member(page, pid)
+    log(f"👥 _room_search_member({pid}) → {found}")
+    findings.append(f"helper:{'✓' if str(found) == str(acc_id) else str(found)}")
 
     # 零残留
     begin = (_bjnow() - timedelta(days=1)).strftime("%Y-%m-%d")
@@ -1962,7 +1989,7 @@ def _room_op_probe(page, captured, op):
     else:
         log("✅ 零残留")
         findings.append("零残留✅")
-    return "🔬 probe v29 完成: " + "；".join(findings)
+    return "🔬 probe v30 完成: " + "；".join(findings)
 
 
 def run_room_op(op_json):
