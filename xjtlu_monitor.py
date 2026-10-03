@@ -1942,36 +1942,40 @@ def _room_op_query(page, captured, op):
 
 
 def _room_op_probe(page, captured, op):
-    """安全探测 v30（成员搜索接口最终验证）：
-    v29 已定位：GET /account/getMembers?key=...&page=1&pageNum=10（remoteMethod 真身）。
-    本轮验证三个关键行为（决定 _room_search_member 的实现细节）：
-    1. 精确 key=GUANCHENG.WU26 → 应命中 accNo=92604
-    2. 部分 key=GUANCHENG → 是否支持前缀
-    3. 小写 key=guancheng.wu26 → 是否大小写敏感
-    并直接跑 _room_search_member 正式实现。全程只读，零副作用。"""
+    """安全探测 v31（拼音转账号方案前置验证）：
+    用户提议：群里发中文名 → 转拼音按西浦规则排（名.姓+入学年）→ 搜索加同伴。
+    本轮验证 /account/getMembers 的匹配语义，决定转换精度要求：
+    1. key=GUANCHENG.WU26（基线，已知✓）
+    2. key=GUANCHENG.WU（无年份后缀）→ 是否命中？
+    3. key=GUANCHENG.WU27（错误年份）→ 确认精确性
+    4. key=吴冠呈（中文真名）→ 是否支持？
+    5. key=Guancheng Wu（拼音全名带空格）→ 是否支持？
+    6. key=Guancheng.Wu26@student.xjtlu.edu.cn（完整邮箱）→ 是否支持？
+    全程只读，零副作用。"""
     findings = []
     acc_id, pid = _room_get_accid_from_storage(page)
     log(f"🆔 accId={acc_id!r} pid={pid!r}")
     findings.append(f"accId={acc_id}")
 
     import time as _t
-    variants = [("精确", str(pid)), ("前缀", str(pid).split(".")[0]),
-                ("小写", str(pid).lower())]
-    for label, key in variants:
-        _t.sleep(2)
-        path = (f"/account/getMembers?key={urllib.parse.quote(key, safe='')}"
-                f"&page=1&pageNum=10")
+    import urllib.parse as up
+    tests = [
+        ("基线", "GUANCHENG.WU26"),
+        ("无后缀", "GUANCHENG.WU"),
+        ("错年份", "GUANCHENG.WU27"),
+        ("中文真名", "吴冠呈"),
+        ("拼音空格名", "Guancheng Wu"),
+        ("完整邮箱", "Guancheng.Wu26@student.xjtlu.edu.cn"),
+    ]
+    for label, key in tests:
+        _t.sleep(1.5)
+        path = f"/account/getMembers?key={up.quote(key, safe='@.')}&page=1&pageNum=10"
         r = _room_api_on_page(page, path, timeout=15000)
         rows = r.get("data") or []
         hit = [x for x in rows if isinstance(x, dict) and str(x.get("accNo")) == str(acc_id)]
-        log(f"📥 [{label}] key={key}: code={r.get('code')} count={r.get('count')} "
-            f"rows={json.dumps(rows, ensure_ascii=False, default=str)[:280]}")
-        findings.append(f"{label}:{'命中✓' if hit else (f'{len(rows)}行' if r.get('code') == 0 else str(r.get('message', ''))[:18])}")
-
-    # 正式实现回归测试
-    found = _room_search_member(page, pid)
-    log(f"👥 _room_search_member({pid}) → {found}")
-    findings.append(f"helper:{'✓' if str(found) == str(acc_id) else str(found)}")
+        log(f"📥 [{label}] key={key!r}: code={r.get('code')} rows={len(rows)} "
+            f"{('🎯命中✓' if hit else '')} {json.dumps(rows, ensure_ascii=False, default=str)[:200]}")
+        findings.append(f"{label}:{'✓' if hit else ('0行' if r.get('code') == 0 else str(r.get('message', ''))[:14])}")
 
     # 零残留
     begin = (_bjnow() - timedelta(days=1)).strftime("%Y-%m-%d")
@@ -1991,7 +1995,7 @@ def _room_op_probe(page, captured, op):
     else:
         log("✅ 零残留")
         findings.append("零残留✅")
-    return "🔬 probe v30 完成: " + "；".join(findings)
+    return "🔬 probe v31 完成: " + "；".join(findings)
 
 
 def run_room_op(op_json):
