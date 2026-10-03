@@ -1821,10 +1821,9 @@ def _room_op_query(page, captured, op):
 
 
 def _room_op_probe(page, captured, op):
-    """安全探测订房 API v13（找研讨室真实 sysKind）：
-    1. 读 Vuex 的 navSpaceMenu / navSeatMenu（kindId 就是订房的 sysKind）
-    2. dump sysKind 赋值来源
-    3. 用真实 sysKind 测冲突时段（零副作用）
+    """安全探测订房 API v14（关键组合测试 + 组件级捕获）：
+    1. sysKind=2（路由实证）+ 真实空闲时段 → 若成功立即取消（端到端）
+    2. 若失败 → monkey-patch axios 捕获 handleSubmit 构造的真实 payload（不联网）
     """
     today = _bjnow().strftime("%Y-%m-%d")
     findings = []
@@ -1833,141 +1832,198 @@ def _room_op_probe(page, captured, op):
     log(f"🆔 accId={acc_id!r}")
     findings.append(f"accId={acc_id}")
 
-    # 1. 读 Vuex 的导航菜单（含 kindId）
-    try:
-        menus = page.evaluate(
-            "() => {"
-            "const el = document.querySelector('#app') || document.body.firstElementChild;"
-            "const vm = el && el.__vue__;"
-            "if (!vm || !vm.$store) return {error: 'no store'};"
-            "const s = vm.$store.state;"
-            "return {"
-            "navSpaceMenu: s.navSpaceMenu,"
-            "navSeatMenu: s.navSeatMenu,"
-            "navreadroomMenu: s.navreadroomMenu,"
-            "};"
-            "}")
-        log(f"🔍 navSpaceMenu: {json.dumps(menus.get('navSpaceMenu'), ensure_ascii=False)[:800]}")
-        log(f"🔍 navSeatMenu: {json.dumps(menus.get('navSeatMenu'), ensure_ascii=False)[:300]}")
-        log(f"🔍 navreadroomMenu: {json.dumps(menus.get('navreadroomMenu'), ensure_ascii=False)[:300]}")
-        findings.append(f"space菜单:{json.dumps(menus.get('navSpaceMenu'), ensure_ascii=False)[:100]}")
-    except Exception as e:
-        log(f"⚠️ 菜单读取失败: {e}")
-
-    # 2. dump chunk-52d28091 的 sysKind 赋值来源
-    body = None
-    try:
-        js_urls = page.evaluate(
-            "() => performance.getEntriesByType('resource')"
-            ".map(r => r.name).filter(u => u.endsWith('.js') && u.includes('chunk-52d28091'))")
-        if js_urls:
-            body = page.request.get(js_urls[0], timeout=20000).text()
-    except Exception as e:
-        log(f"⚠️ chunk 下载失败: {e}")
-
-    if body:
-        # sysKind 的来源（props/computed/route）
-        for kw in ("sysKind:", "sysKind=", "kindId"):
-            idx = 0
-            count = 0
-            while count < 4:
-                idx = body.find(kw, idx)
-                if idx < 0:
-                    break
-                # 只打带上下文的
-                ctx = body[max(0, idx - 100):idx + 200]
-                if "props" in ctx or "route" in ctx or "data" in ctx or "=" in ctx[:110]:
-                    log(f"📜「{kw}」@{idx}: ...{ctx[:300]}...")
-                    count += 1
-                idx += len(kw)
-
-    # 3. 用候选 sysKind 测冲突时段（零副作用）
     raw = _room_query_avail_raw(page, today, captured)
-    conflict_room = occupied_slot = None
+    free_room = None
+    free_window = None
     if raw:
         for campus in raw:
             for lab in campus.get("labInfos") or []:
                 for rm in lab.get("roomInfos") or []:
                     occ = [rv for rv in (rm.get("resvInfos") or [])
                            if _room_slot_occupied(rv.get("resvStatus", 0))]
-                    if occ:
-                        conflict_room, occupied_slot = rm, occ[0]
+                    if not occ:
+                        free_room = rm
+                        # 取开放时间窗
+                        ot = (rm.get("openTimes") or [{}])[0]
+                        free_window = (ot.get("openStartTime", "09:00"),
+                                       ot.get("openEndTime", "22:00"))
                         break
-                if conflict_room:
+                if free_room:
                     break
-            if conflict_room:
+            if free_room:
                 break
 
-    if conflict_room:
-        s_slot = occupied_slot["resvBeginTime"]
-        e_slot = occupied_slot["resvEndTime"]
-        dev = conflict_room["devId"]
-        acc = int(acc_id) if str(acc_id).isdigit() else acc_id
+    if not free_room:
+        log("❌ 没有全天空闲房间")
+        return "❌ probe v14: 无空闲房间"
 
-        def spa_post(payload):
-            js = (
-                "() => Promise.race(["
-                "new Promise((resolve) => {"
-                "try {"
-                "const el = document.querySelector('#app') || document.body.firstElementChild;"
-                "const vm = el && el.__vue__;"
-                "const axios = vm && vm.$axios;"
-                "if (!axios) { resolve({stage: 'noaxios'}); return; }"
-                "const p = " + json.dumps(payload, ensure_ascii=False) + ";"
-                "axios.post('/reserve/update', p)"
-                ".then(r => resolve({ok: 1, code: r.data && r.data.code, message: r.data && r.data.message}))"
-                ".catch(e => resolve({ok: 0, error: String(e).slice(0, 100)}));"
-                "} catch(e) { resolve({ok: -1, error: String(e).slice(0, 100)}); }"
-                "}),"
-                "new Promise((resolve) => setTimeout(() => resolve({stage: 'timeout'}), 15000))"
-                "])"
-            )
-            try:
-                return page.evaluate(js)
-            except Exception as e:
-                return {"ok": -2, "error": str(e)[:100]}
+    dev = free_room["devId"]
+    log(f"📍 空闲房间: {free_room.get('devName')} devId={dev} 窗口 {free_window}")
 
-        def mk(sk):
-            return {
-                "sysKind": sk, "appAccNo": acc, "memberKind": 1,
-                "resvBeginTime": s_slot, "resvEndTime": e_slot,
-                "testName": "研讨", "resvKind": 2, "resvProperty": 32,
-                "appUrl": "", "resvMember": [acc], "resvDev": [dev],
-                "memo": "小组研讨", "captcha": "", "addServices": [],
-            }
+    def to_min(t):
+        h, m = t.split(":")
+        return int(h) * 60 + int(m)
 
-        def is_param_err(msg):
-            m = str(msg).lower()
-            return "参数" in m or "parameter" in m
+    # 选 21:00-22:00（在开放窗口内；若窗口早于此则用窗口后半段）
+    s_m, e_m = to_min(free_window[0]), to_min(free_window[1])
+    bs, be = 21 * 60, 22 * 60
+    if e_m < be:
+        be = e_m
+        bs = max(be - 60, s_m)
+    t_start = f"{today} {bs // 60:02d}:{bs % 60:02d}:00"
+    t_end = f"{today} {be // 60:02d}:{be % 60:02d}:00"
 
-        # sysKind 候选：1（旧值）、2（座位用）、3、4、8（sysInfo 里见过）、16（活动）
-        for sk in (1, 2, 3, 4, 8, 16):
-            r = spa_post(mk(sk))
-            msg = str(r.get("message", r.get("error", "")))
-            log(f"📥 sysKind={sk}: code={r.get('code')} msg={msg[:60]}")
-            findings.append(f"sk{sk}:{msg[:20]}")
-            if not is_param_err(msg):
-                log(f"🎯 sysKind={sk} 通过参数校验！")
-                break
+    def spa_post(payload):
+        js = (
+            "() => Promise.race(["
+            "new Promise((resolve) => {"
+            "try {"
+            "const el = document.querySelector('#app') || document.body.firstElementChild;"
+            "const vm = el && el.__vue__;"
+            "const axios = vm && vm.$axios;"
+            "if (!axios) { resolve({stage: 'noaxios'}); return; }"
+            "const p = " + json.dumps(payload, ensure_ascii=False) + ";"
+            "axios.post('/reserve/update', p)"
+            ".then(r => resolve({ok: 1, code: r.data && r.data.code, message: r.data && r.data.message}))"
+            ".catch(e => resolve({ok: 0, error: String(e).slice(0, 100)}));"
+            "} catch(e) { resolve({ok: -1, error: String(e).slice(0, 100)}); }"
+            "}),"
+            "new Promise((resolve) => setTimeout(() => resolve({stage: 'timeout'}), 15000))"
+            "])"
+        )
+        try:
+            return page.evaluate(js)
+        except Exception as e:
+            return {"ok": -2, "error": str(e)[:100]}
 
-    # 零残留
-    begin = (_bjnow() - timedelta(days=1)).strftime("%Y-%m-%d")
-    end = (_bjnow() + timedelta(days=3)).strftime("%Y-%m-%d")
-    j5 = _room_api_on_page(
-        page, f"/reserve/resvInfo?beginDate={begin}&endDate={end}"
-              f"&needStatus=8582&page=1&pageNum=20&orderKey=gmt_create")
-    rows = j5.get("data") or []
-    if rows:
-        for rv in rows:
+    acc = int(acc_id) if str(acc_id).isdigit() else acc_id
+
+    # 1. sysKind=2 + 真实空闲时段（端到端，成功即删）
+    p1 = {
+        "sysKind": 2, "appAccNo": acc, "memberKind": 1,
+        "resvBeginTime": t_start, "resvEndTime": t_end,
+        "testName": "小组研讨", "resvKind": 2, "resvProperty": 32,
+        "appUrl": "", "resvMember": [acc], "resvDev": [dev],
+        "memo": "小组研讨", "captcha": "", "addServices": [],
+    }
+    log(f"📤 T1 sysKind=2 + 空闲时段 {t_start[11:]}-{t_end[11:]}（成功即删）")
+    r1 = spa_post(p1)
+    log(f"📥 T1 响应: {json.dumps(r1, ensure_ascii=False)[:250]}")
+    findings.append(f"T1sk2:{str(r1.get('message', r1.get('error', '')))[:35]}")
+
+    booked = r1.get("code") == 0
+    if booked:
+        log("🎯 sysKind=2 + 空闲时段订房成功！立即清理...")
+        time.sleep(1)
+        begin = (_bjnow() - timedelta(days=1)).strftime("%Y-%m-%d")
+        end = (_bjnow() + timedelta(days=3)).strftime("%Y-%m-%d")
+        j = _room_api_on_page(
+            page, f"/reserve/resvInfo?beginDate={begin}&endDate={end}"
+                  f"&needStatus=8582&page=1&pageNum=20&orderKey=gmt_create")
+        for rv in (j.get("data") or []):
             if rv.get("uuid"):
                 d = _room_api_on_page(page, "/reserve/delete?sf_request_type=ajax",
                                       method="POST", data={"uuid": rv["uuid"]},
                                       timeout=25000)
-                log(f"🧹 {rv['uuid']}: {str(d)[:100]}")
+                log(f"🧹 删除 {rv['uuid']}: {json.dumps(d, ensure_ascii=False)[:150]}")
+                findings.append(f"清理:{str(d.get('message'))[:30]}")
     else:
-        log("✅ 零残留")
-        findings.append("零残留✅")
-    return "🔬 probe v13 完成: " + "；".join(findings)
+        # 2. 失败 → 组件级捕获：monkey-patch axios.post（不联网）
+        log("📬 T1 失败，开始组件级捕获（不联网）...")
+        # 先导航到空间页让组件挂载
+        try:
+            nav = page.evaluate(
+                "() => {"
+                "const el = document.querySelector('#app') || document.body.firstElementChild;"
+                "const vm = el && el.__vue__;"
+                "if (vm && vm.$router) { vm.$router.push('/ic/researchSpace/2/5/5'); return 'pushed'; }"
+                "return 'no router';"
+                "}")
+            log(f"🔀 路由跳转: {nav}")
+            time.sleep(5)
+        except Exception as e:
+            log(f"⚠️ 路由失败: {e}")
+
+        capture_js = (
+            "() => {"
+            "const el = document.querySelector('#app') || document.body.firstElementChild;"
+            "const vm = el && el.__vue__;"
+            "if (!vm) return {error: 'no vm'};"
+            "const axios = vm.$axios;"
+            "if (!axios || !axios.post) return {error: 'no axios'};"
+            "window.__origPost = axios.post.bind(axios);"
+            "axios.post = function(url, data) {"
+            "window.__captured = {url: url, data: data};"
+            "return Promise.resolve({data: {code: 0, message: 'captured', data: null}});"
+            "};"
+            "let found = null;"
+            "const walk = (comp) => {"
+            "if (!comp) return;"
+            "if (comp.$options && comp.$options.methods && comp.$options.methods.handleSubmit) { found = comp; return; }"
+            "(comp.$children || []).forEach(walk);"
+            "};"
+            "walk(vm);"
+            "if (!found) return {error: 'no handleSubmit component mounted'};"
+            "const info = {"
+            "name: found.$options.name,"
+            "sysKind: found.sysKind,"
+            "activeSpace: found.activeSpace,"
+            "formData: found.formData,"
+            "selectAccNoList: found.selectAccNoList,"
+            "sysConfig: found.sysConfig,"
+            "hasFormRef: !!(found.$refs && found.$refs.formRef),"
+            "};"
+            "if (found.$refs && found.$refs.formRef) {"
+            "found.$refs.formRef.validate = function(cb) { cb(true); return true; };"
+            "}"
+            "try { found.selectAccNoList = [" + json.dumps(str(acc_id)) + "].map(Number); } catch(e) {}"
+            "try { found.formData = found.formData || {}; } catch(e) {}"
+            "try { found.activeSpace = " + json.dumps({"devId": dev, "minUser": 1}) + "; } catch(e) {}"
+            "try {"
+            "found.formData.title = '小组研讨';"
+            "found.formData.memo = '小组研讨';"
+            "found.formData.appUrl = '';"
+            "found.formData.captcha = '';"
+            "found.formData.startDate = " + json.dumps(f"{today} 21:00:00") + ";"
+            "found.formData.endDate = " + json.dumps(f"{today} 22:00:00") + ";"
+            "found.formData.startTime = '21:00';"
+            "found.formData.endTime = '22:00';"
+            "} catch(e) {}"
+            "try { found.selectedServices = []; } catch(e) {}"
+            "try { found.submitLoading = false; } catch(e) {}"
+            "if (!found.sysConfig) { try { found.sysConfig = {resvCode: '0'}; } catch(e) {} }"
+            "try { found.handleSubmit(); } catch(e) { return {error: 'handleSubmit: ' + String(e).slice(0, 200), info: info}; }"
+            "return {ok: 1, info: info, captured: window.__captured};"
+            "}"
+        )
+        try:
+            cap = page.evaluate(capture_js)
+            log(f"📸 组件捕获: {json.dumps(cap, ensure_ascii=False)[:800]}")
+            findings.append(f"捕获:{'✓' if cap and cap.get('captured') else str(cap.get('error', ''))[:40]}")
+        except Exception as e:
+            log(f"⚠️ 组件捕获失败: {e}")
+        # 恢复 axios.post
+        try:
+            page.evaluate("() => { if (window.__origPost) { document.querySelector('#app').__vue__.$axios.post = window.__origPost; } }")
+        except Exception:
+            pass
+
+    # 零残留
+    begin = (_bjnow() - timedelta(days=1)).strftime("%Y-%m-%d")
+    end = (_bjnow() + timedelta(days=3)).strftime("%Y-%m-%d")
+    for ns in ("8582", "262"):
+        j5 = _room_api_on_page(
+            page, f"/reserve/resvInfo?beginDate={begin}&endDate={end}"
+                  f"&needStatus={ns}&page=1&pageNum=20&orderKey=gmt_create")
+        for rv in (j5.get("data") or []):
+            if rv.get("uuid"):
+                d = _room_api_on_page(page, "/reserve/delete?sf_request_type=ajax",
+                                      method="POST", data={"uuid": rv["uuid"]},
+                                      timeout=25000)
+                log(f"🧹 清理 {rv['uuid']}: {str(d)[:100]}")
+    log("✅ 零残留确认完成")
+    findings.append("零残留✅")
+    return "🔬 probe v14 完成: " + "；".join(findings)
 
 
 def run_room_op(op_json):
