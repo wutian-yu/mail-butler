@@ -1735,32 +1735,158 @@ def _room_validate_booking(date_str, start, end):
     return None
 
 
-def _room_search_member(page, keyword):
-    """按统一账号搜同学 accNo（订房同伴用）。
-    GET /account/getMembers?key=<完整账号>（probe v30 实证：精确匹配、大小写不敏感、前缀无结果）。
-    服务器对返回姓名掩码（"Guanchen* Wu(***…26)"），无法与原文比对 → 直接取第一行 accNo。
-    status/localstatus=2 表示该账号被停用（remoteMethod 的 disable 映射）。
-    返回 accNo 或 None"""
+# ============ 同伴解析（中文名 → 西浦统一账号） ============
+# probe v31 实证：搜索只认账号（名.姓+入学年，精确匹配、大小写不敏感），
+# 不认中文真名（0行）、不认无后缀/错后缀；但拼音全名（"Guancheng Wu"）也能命中 → 兜底路径
+ROOM_COMPOUND_SURNAMES = (
+    "欧阳", "司马", "上官", "诸葛", "东方", "独孤", "南宫", "夏侯", "皇甫",
+    "尉迟", "长孙", "慕容", "司徒", "司空", "申屠", "公孙", "轩辕", "令狐",
+    "钟离", "宇文", "鲜于", "闾丘", "亓官", "司寇", "巫马", "公西", "颛孙",
+    "公良", "漆雕", "乐正", "宰父", "谷梁", "拓跋", "呼延", "端木", "闻人",
+    "东郭", "南门", "西门", "第五",
+)
+# 常见多音姓氏优先读音（排前面先试）
+ROOM_SURNAME_PREF = {
+    "曾": ["zeng", "ceng"], "单": ["shan", "dan", "chan"], "解": ["xie", "jie"],
+    "仇": ["qiu", "chou", "ju"], "查": ["zha", "cha", "chai"], "乐": ["yue", "le"],
+    "翟": ["zhai", "di"], "覃": ["qin", "tan", "yan"], "朴": ["piao", "pu", "po"],
+    "区": ["ou", "qu"], "种": ["chong", "zhong"], "秘": ["bi", "mi"],
+    "折": ["she", "zhe"], "繁": ["po", "fan"], "都": ["du", "dou"],
+    "缪": ["miao", "miu", "mou"], "员": ["yun", "yuan"], "能": ["nai", "neng"],
+}
+
+
+def _room_split_cn_name(name):
+    """中文姓名 → (姓, 名)。复姓优先；中文习惯姓在前"""
+    s = re.sub(r"[\s·•.．]+", "", str(name))
+    for cs in ROOM_COMPOUND_SURNAMES:
+        if s.startswith(cs) and len(s) > len(cs):
+            return cs, s[len(cs):]
+    if len(s) >= 2:
+        return s[0], s[1:]
+    return s, ""
+
+
+def _room_pinyin_variants(chars, cap=4, prefer_surname=False):
+    """汉字串 → 拼音候选（多音字组合、大写、音节相连）。pypinyin 缺失时返回空"""
+    try:
+        from pypinyin import pinyin, Style
+    except ImportError:
+        return []
+    outs = [""]
+    for ch in chars:
+        readings = pinyin(ch, style=Style.NORMAL, heteronym=True)
+        rd = list(dict.fromkeys(readings[0] if readings else [ch.lower()]))[:3]
+        if prefer_surname and ch in ROOM_SURNAME_PREF:
+            rd = sorted(rd, key=lambda r: (ROOM_SURNAME_PREF[ch].index(r)
+                                           if r in ROOM_SURNAME_PREF[ch] else 99))
+        outs = [o + r for o in outs for r in rd]
+        if len(outs) > cap * 3:
+            outs = outs[:cap * 3]
+            break
+    return [o.upper() for o in outs[:cap]]
+
+
+def _room_name_to_candidates(raw, years=("26",)):
+    """任意输入（中文名/拼音名/英文名/账号）→ 有序搜索候选 [(类型, key), ...]
+    账号式（名.姓+年，最精确）在前，拼音全名式（名 姓，无需年份）兜底在后"""
+    s = str(raw).strip()
+    cands = []
+    # 1) 已是账号式（含 . 且结尾两位数字）→ 原样
+    if re.match(r"^[A-Za-z][A-Za-z0-9.\-]*\.\w+\d{2}$", s):
+        return [("account", s)]
+    # 2) 纯 ASCII（拼音名/英文名/无年份账号）
+    if s.isascii() and re.match(r"^[A-Za-z][A-Za-z\s.\-]+$", s):
+        parts = [p for p in re.split(r"[\s.]+", s) if p]
+        if len(parts) >= 2:
+            given, surname = parts[0], parts[-1]
+            for y in years:
+                cands.append(("account", f"{given}.{surname}{y}".upper()))
+            cands.append(("truename", f"{given} {surname}".upper()))
+        else:
+            for y in years:
+                cands.append(("account", f"{s}{y}".upper()))
+        return cands
+    # 3) 中文姓名 → 拼音（姓在后接年份）
+    surname, given = _room_split_cn_name(s)
+    surn_pys = _room_pinyin_variants(surname, cap=3, prefer_surname=True)
+    given_pys = _room_pinyin_variants(given, cap=4)
+    seen = set()
+    for g in given_pys:
+        for sr in surn_pys:
+            for y in years:
+                key = f"{g}.{sr}{y}".upper()
+                if key not in seen:
+                    seen.add(key)
+                    cands.append(("account", key))
+            tn = f"{g} {sr}".upper()
+            if tn not in seen:
+                seen.add(tn)
+                cands.append(("truename", tn))
+        if len(cands) >= 14:
+            break
+    return cands
+
+
+def _room_search_member_rows(page, keyword):
+    """按 key 搜用户（/account/getMembers）。返回 (rows, err)：rows=list 或 None。
+    status/localstatus=2 = 账号停用（自动过滤）"""
     try:
         key = str(keyword).strip()
         path = (f"/account/getMembers?key={urllib.parse.quote(key, safe='')}"
                 f"&page=1&pageNum=10")
         r = _room_api_on_page(page, path, timeout=15000)
-        rows = r.get("data") or []
-        if r.get("code") == 0 and isinstance(rows, list) and rows:
-            x = rows[0]
-            if x.get("status") == 2 or x.get("localstatus") == 2:
-                log(f"⚠️ 同学 {key} 账号被停用(status={x.get('status')})，无法加入预定")
-                return None
-            acc = x.get("accNo")
-            if acc:
-                log(f"👥 搜索命中: {x.get('logonName')} → accNo={acc}")
-                return acc
-        log(f"⚠️ 搜索无结果 key={key}: code={r.get('code')} "
-            f"rows={len(rows) if isinstance(rows, list) else 0}（需完整账号）")
+        if r.get("code") != 0:
+            return None, str(r.get("message", ""))[:60]
+        rows = [x for x in (r.get("data") or [])
+                if isinstance(x, dict) and x.get("accNo")
+                and x.get("status") != 2 and x.get("localstatus") != 2]
+        return rows, None
     except Exception as e:
-        log(f"⚠️ 搜索异常: {e}")
+        return None, str(e)[:80]
+
+
+def _room_search_member(page, keyword):
+    """搜单个用户 → 返回行 dict（含 accNo/logonName 掩码名）或 None"""
+    rows, err = _room_search_member_rows(page, keyword)
+    if rows:
+        log(f"👥 搜索命中: {rows[0].get('logonName')} → accNo={rows[0].get('accNo')}")
+        return rows[0]
+    if err:
+        log(f"⚠️ 搜索异常 key={keyword}: {err}")
     return None
+
+
+def _room_resolve_partner(page, raw, years=("26",)):
+    """原始输入 → (row, 命中的key, 尝试记录, 多义rows)。
+    row=None 且 ambiguous=多行 时让用户挑；全空 = 没找到"""
+    tried = []
+    for kind, key in _room_name_to_candidates(raw, years)[:14]:
+        import time as _t
+        _t.sleep(1)
+        tried.append(key)
+        rows, err = _room_search_member_rows(page, key)
+        if err:
+            log(f"⚠️ 候选 {key} 搜索出错: {err}")
+            continue
+        if not rows:
+            log(f"👥 候选 {key}: 0 行")
+            continue
+        if len(rows) == 1:
+            log(f"👥 唯一命中 {kind}={key}: {rows[0].get('logonName')} → {rows[0].get('accNo')}")
+            return rows[0], key, tried, None
+        # 多行：账号式不应多行；拼音全名式可能同名多人 → 交给用户挑
+        log(f"👥 候选 {kind}={key} 命中 {len(rows)} 行（同名多人）")
+        return None, key, tried, rows[:5]
+    return None, None, tried, None
+
+
+def _room_partner_accno_from(row):
+    """行 dict → accNo（统一 int 化，digits 时）"""
+    acc = (row or {}).get("accNo")
+    if acc is None:
+        return None
+    return int(acc) if str(acc).isdigit() else acc
 
 
 def _room_spa_axios(page, url, payload):
@@ -1788,13 +1914,13 @@ def _room_spa_axios(page, url, payload):
         return {"ok": -2, "error": str(e)[:100]}
 
 
-def _butler_update_room_cache(page, date_str=None):
-    """订房/取消成功后，把最新预约列表（+当天可用性）写回 butler-data，
-    让飞书端「我的预约/查房」立即同步（不用等 30 分钟定时任务）。
-    用 GH_PAT 走 Contents API（room-ops.yml 已注入 GH_PAT）。"""
+def _butler_state_update(mutate, message, page=None, date_str=None):
+    """读改写 butler-data 的 xjtlu_state.json（GH_PAT + Contents API）。
+    mutate(state_dict) 原地修改；page+date_str 时顺带刷新预约/可用性缓存。
+    返回 True/False（失败不抛，调用方自行兜底）"""
     pat = os.environ.get("GH_PAT", "")
     if not pat:
-        return
+        return False
     try:
         req = urllib.request.Request(
             "https://api.github.com/repos/wutian-yu/butler-data/contents/xjtlu_state.json",
@@ -1802,21 +1928,22 @@ def _butler_update_room_cache(page, date_str=None):
         with urllib.request.urlopen(req, timeout=20000) as r:
             meta = json.load(r)
         state = json.loads(base64.b64decode(meta["content"]).decode())
-        room = state.setdefault("room", {})
-        begin = (_bjnow() - timedelta(days=1)).strftime("%Y-%m-%d")
-        end = (_bjnow() + timedelta(days=3)).strftime("%Y-%m-%d")
-        j = _room_api_on_page(
-            page, f"/reserve/resvInfo?beginDate={begin}&endDate={end}"
-                  f"&needStatus=8582&page=1&pageNum=20&orderKey=gmt_create")
-        rows = j.get("data") or []
-        room["bookings"] = _room_compact_bookings(rows)
-        if date_str:
-            raw = _room_query_avail_raw(page, date_str)
-            if raw is not None:
-                compact = _room_compact_avail(raw)
-                (room.setdefault("avail", {}))[date_str] = compact
+        if mutate:
+            mutate(state)
+        if page:
+            room = state.setdefault("room", {})
+            begin = (_bjnow() - timedelta(days=1)).strftime("%Y-%m-%d")
+            end = (_bjnow() + timedelta(days=3)).strftime("%Y-%m-%d")
+            j = _room_api_on_page(
+                page, f"/reserve/resvInfo?beginDate={begin}&endDate={end}"
+                      f"&needStatus=8582&page=1&pageNum=20&orderKey=gmt_create")
+            room["bookings"] = _room_compact_bookings(j.get("data") or [])
+            if date_str:
+                raw = _room_query_avail_raw(page, date_str)
+                if raw is not None:
+                    (room.setdefault("avail", {}))[date_str] = _room_compact_avail(raw)
         body = json.dumps({
-            "message": f"room ops refresh {date_str or ''}".strip(),
+            "message": message,
             "content": base64.b64encode(
                 json.dumps(state, ensure_ascii=False).encode()).decode(),
             "sha": meta["sha"],
@@ -1826,9 +1953,17 @@ def _butler_update_room_cache(page, date_str=None):
             data=body, method="PUT",
             headers={"Authorization": f"Bearer {pat}", "Accept": "application/vnd.github+json"})
         with urllib.request.urlopen(req, timeout=20000) as r:
-            log(f"✅ butler-data 缓存已刷新 ({date_str or 'bookings'})")
+            log(f"✅ butler-data 已更新: {message[:50]}")
+            return True
     except Exception as e:
-        log(f"⚠️ butler-data 刷新失败（不影响操作结果）: {str(e)[:120]}")
+        log(f"⚠️ butler-data 更新失败（不影响操作结果）: {str(e)[:120]}")
+        return False
+
+
+def _butler_update_room_cache(page, date_str=None):
+    """订房/取消成功后立即刷新预约列表（+当天可用性）缓存"""
+    _butler_state_update(None, f"room ops refresh {date_str or ''}".strip(),
+                         page=page, date_str=date_str)
 
 
 def _room_op_book(page, captured, op):
@@ -1863,14 +1998,22 @@ def _room_op_book(page, captured, op):
     if not acc_id:
         acc_id, _ = _room_probe_accid(page, captured)
     acc_id = acc_id or ""
-    # 同伴 accNo：数字 = 直接给 accNo；否则按统一账号搜索
+    # 同伴 accNo 解析：纯数字 = 已解析的 accNo；否则按 账号/拼音/中文名 搜索
     if partner.isdigit():
         partner_acc = int(partner)
+        partner_display = ""
     else:
-        partner_acc = _room_search_member(page, partner)
-        if not partner_acc:
-            return (f"❌ 没找到同学「{partner}」。请确认是同学学生邮箱 @ 前面那段"
-                    "（如 TOM.SMITH25），且拼写正确。")
+        row, hit_key, tried, ambiguous = _room_resolve_partner(page, partner)
+        if ambiguous:
+            names = "、".join(str(x.get("logonName")) for x in ambiguous)
+            return (f"❌ 叫「{partner}」的同学有多位：{names}\n"
+                    "请加上入学年再发，如「订房 房间 日期 时段 同伴 张伟 25」。")
+        if not row:
+            return (f"❌ 没找到同学「{partner}」（试过 {('、'.join(tried[:4])) or '无候选'}）。\n"
+                    "请确认名字写法（中文名即可，如 张伟），"
+                    "或直接发他的统一账号（学生邮箱@前面那段，如 TOM.SMITH25）。")
+        partner_acc = _room_partner_accno_from(row)
+        partner_display = str(row.get("logonName") or "")
     if str(partner_acc) == str(acc_id):
         return "❌ 同伴不能是你自己，请换一位同学。"
     payload = {
@@ -1895,12 +2038,13 @@ def _room_op_book(page, captured, op):
     log(f"📥 订房响应: {str(resp)[:200]}")
     if resp.get("code") == 0:
         _butler_update_room_cache(page, date)
+        who = f"\n👥 同伴：{partner_display}" if partner_display else "\n👥 已带上同伴（2人）"
         return (f"✅ 预定成功！\n\n🏛️ {dev.get('devName')}\n"
-                f"📅 {date} {start}-{end}\n👥 已带上同伴（2人）")
+                f"📅 {date} {start}-{end}{who}")
     if "number of people" in msg:
         return "❌ 人数不满足（研讨室需 2-10 人），请检查同伴账号。"
     if "does not exist" in msg:
-        return f"❌ 同伴账号「{partner}」不存在或无法加入，请确认拼写。"
+        return f"❌ 同伴账号不存在或无法加入，请确认「{partner}」信息。"
     if "Frequent" in msg:
         return "❌ 操作太频繁（服务器限流），请 1 分钟后再试。"
     return f"❌ 预定未成功：{msg or '未知错误'}"
@@ -1917,6 +2061,40 @@ def _room_op_cancel(page, captured, op):
         _butler_update_room_cache(page)
         return f"✅ 已取消预约{('：' + op['name']) if op.get('name') else ''}"
     return f"❌ 取消失败：{resp.get('message', '未知错误')}"
+
+
+def _room_op_partner(page, captured, op):
+    """设同伴：中文名/拼音/账号 → 搜索解析 → 存 accNo 到 butler-data → 掩码回显确认。
+    years: 入学年两位数列表（默认 26；用户可指定「设同伴 张伟 25」）"""
+    raw = str(op.get("name", "")).strip()
+    years = op.get("years") or ["26"]
+    if isinstance(years, str):
+        years = [years]
+    if not raw:
+        return "❌ 没识别到同伴名字。用法：「设同伴 张伟」或「设同伴 TOM.SMITH25」。"
+    row, hit_key, tried, ambiguous = _room_resolve_partner(page, raw, years)
+    if ambiguous:
+        names = "\n".join(f"· {x.get('logonName')}" for x in ambiguous)
+        return (f"🔍 叫「{raw}」的同学有多位：\n{names}\n\n"
+                "请加上他的入学年再发，如「设同伴 {raw} 26」。")
+    if not row:
+        return (f"❌ 没找到同学「{raw}」（试过 {('、'.join(tried[:5])) or '无候选'}）。\n\n"
+                "请确认名字写法（直接发中文名，如「设同伴 张伟」）；"
+                "如果他是学长学姐请带上年份，如「设同伴 张伟 24」；"
+                "或直接发他的统一账号（学生邮箱@前面那段）。")
+    acc = _room_partner_accno_from(row)
+    display = str(row.get("logonName") or "")
+    ok = _butler_state_update(
+        lambda st: (st.setdefault("room", {}).update({
+            "partner": raw, "partner_accNo": acc, "partner_display": display})),
+        f"set room partner={raw} accNo={acc}")
+    if not ok:
+        return (f"🔍 已找到同学：{display}\n\n⚠️ 但保存到配置失败，"
+                "订房时请直接带上名字（系统会现场解析）。")
+    return (f"✅ 常用同伴已保存：{display}\n"
+            f"（{raw} → 搜索词 {hit_key}）\n\n"
+            "以后「订房 房间 日期 时段」会自动带上 TA；"
+            "如认错人了，发「设同伴 新名字」重设，或「设同伴 清除」。")
 
 
 def _room_op_query(page, captured, op):
@@ -2062,6 +2240,8 @@ def run_room_op(op_json):
                     result = _room_op_cancel(page2, captured, op)
                 elif action == "query":
                     result = _room_op_query(page2, captured, op)
+                elif action == "partner":
+                    result = _room_op_partner(page2, captured, op)
                 elif action == "probe":
                     result = _room_op_probe(page2, captured, op)
                 else:
