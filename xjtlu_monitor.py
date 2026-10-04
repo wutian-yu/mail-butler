@@ -1269,7 +1269,19 @@ def format_notification(source, items):
 # ============ 主流程 ============
 def cookie_login(context, page):
     """用 Cookie 登录：先加载Cookie，通过SSO跳转eBridge创建SITS会话"""
-    cookie_str = os.environ.get("EBRIDGE_COOKIES", "")
+    cookie_str = ""
+    # v25: 优先读 butler-data/xjtlu_cookies.json（飞书「cookie」命令维护），无文件再退回环境变量
+    cookies_file = os.environ.get("XJTLU_COOKIES_FILE", "")
+    if cookies_file and os.path.exists(cookies_file):
+        try:
+            s = open(cookies_file, encoding="utf-8").read().strip()
+            if s.startswith("["):
+                cookie_str = s
+                log(f"🍪 使用文件 Cookie（butler-data，{len(s)} 字节）")
+        except Exception as e:
+            log(f"⚠️ Cookie 文件读取失败: {e}")
+    if not cookie_str:
+        cookie_str = os.environ.get("EBRIDGE_COOKIES", "")
     if not cookie_str:
         return False
     try:
@@ -2330,9 +2342,9 @@ def run():
                 state["lm_events"] = {ev["uid"]: 1 for ev in lm_events}
             if fails <= 3 and last_fail_day != today:
                 if XJTLU_USERNAME and XJTLU_PASSWORD:
-                    msgs.append("⚠️ 西浦网站登录失败\n\nCookie 已过期，系统已自动尝试账密登录但未成功。\n\n可能原因：SSO 密码已更改，或网络波动。\n\n请检查 GitHub Secrets 中的 XJTLU_USERNAME / XJTLU_PASSWORD 是否正确。\n\n为避免打扰，今日不再提醒。")
+                    msgs.append("⚠️ 西浦网站登录失败\n\nCookie 已过期，系统已自动尝试账密登录但未成功。\n\n刷新方法：跑 export_cookies.py 导出新 Cookie，以「cookie」开头直接粘贴到本群，管家自动入库验证；或让星辰直接抓取。\n\n为避免打扰，今日不再提醒。")
                 else:
-                    msgs.append("⚠️ 西浦网站登录失败\n\nCookie 已过期，且未配置账密自动登录。\n\n请在 GitHub Secrets 设置 XJTLU_USERNAME 和 XJTLU_PASSWORD 实现自动登录，或手动更新 EBRIDGE_COOKIES。\n\n为避免打扰，今日不再提醒。")
+                    msgs.append("⚠️ 西浦网站登录失败\n\nCookie 已过期，且未配置账密自动登录。\n\n刷新方法：跑 export_cookies.py 导出新 Cookie，以「cookie」开头直接粘贴到本群，管家自动入库验证；或让星辰直接抓取。\n\n为避免打扰，今日不再提醒。")
                 state["last_fail_notify"] = today
             if msgs:
                 feishu_send("\n\n".join(msgs))
@@ -2343,6 +2355,18 @@ def run():
             save_state(state)
             browser.close()
             return
+
+        # v25: 登录成功——重置失败计数；若此前处于失败状态，发恢复通知（闭环：飞书「cookie」命令的验证回报）
+        prev_fails = state.get("consecutive_fails", 0)
+        if prev_fails > 0:
+            state["consecutive_fails"] = 0
+            log(f"✅ 监控恢复（此前连续失败 {prev_fails} 次），发送恢复通知")
+            try:
+                feishu_send("✅ 西浦监控已恢复\n\n新 Cookie 已生效，eBridge 通知 / AMS 考勤 / 房间系统全部正常。")
+            except Exception:
+                pass
+        else:
+            state["consecutive_fails"] = 0
 
         notifications = []
 
