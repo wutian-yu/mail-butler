@@ -59,7 +59,7 @@ def feishu_send(chat_id, text, card_title="🌐 网页查询"):
             headers={"Authorization": f"Bearer {token}",
                      "Content-Type": "application/json"})
         urllib.request.urlopen(req, timeout=30)
-        log("✅ 飞书结果已发送")
+        log(f"✅ 飞书消息已发送：{text[:50]}")
     except Exception as e:
         log(f"⚠️ 飞书发送失败: {e}")
 
@@ -158,17 +158,26 @@ def main():
         try:
             log(f"🌐 打开: {url[:80]}")
             page.goto(url, wait_until="domcontentloaded", timeout=45000)
-            page.wait_for_timeout(3000)
+            # SSO 跳转链（LM→uim→LM / eBridge→uim→eBridge）可能要几秒，循环等它落地（最多30秒）
+            for i in range(10):
+                page.wait_for_timeout(3000)
+                u = page.url
+                if "login" not in u.lower() and "siw_lgn" not in u and "esc-sso" not in u:
+                    break
+                if i % 3 == 2:
+                    log(f"⏳ SSO 链跳转中... URL: {u[:70]}")
         except Exception as e:
             feishu_send(chat_id, f"⚠️ 页面打开失败：{str(e)[:80]}\n\n地址：{url[:80]}")
             browser.close()
             return
 
         final_url = page.url
-        if "login" in final_url.lower() or "siw_lgn" in final_url:
+        if "login" in final_url.lower() or "siw_lgn" in final_url or "esc-sso" in final_url:
             feishu_send(chat_id, "⚠️ Cookie 已失效（页面跳回了登录页）。\n\n刷新方法：飞书发「cookie <导出的JSON>」或找星辰直接抓，然后再查一次。")
             browser.close()
             return
+        # 再等 2 秒让页面 JS 完成渲染
+        page.wait_for_timeout(2000)
 
         info = page.evaluate(
             """() => {
