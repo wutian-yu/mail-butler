@@ -39,12 +39,15 @@ FEISHU_BASE = "https://open.feishu.cn"
 CHAT_ID_FALLBACK = os.environ.get("CHAT_ID", "")
 WEEKDAYS = ["周一", "周二", "周三", "周四", "周五", "周六", "周日"]
 
-# v37: 西浦常用部门邮箱（用户说"给教务处发邮件"时直接匹配，不用查 LM）
+# v37.1: 西浦常用部门邮箱（中英文都能匹配，用户说"给教务处/Registry发邮件"时直接匹配，不用查 LM）
 XJTLU_DEPT_EMAILS = {
     "教务处": "registry@xjtlu.edu.cn",
     "registry": "registry@xjtlu.edu.cn",
+    "registrar": "registry@xjtlu.edu.cn",
     "教务": "registry@xjtlu.edu.cn",
+    "课表室": "timetables@xjtlu.edu.cn",
     "课表": "timetables@xjtlu.edu.cn",
+    "timetable": "timetables@xjtlu.edu.cn",
     "timetables": "timetables@xjtlu.edu.cn",
     "调课": "timetables@xjtlu.edu.cn",
     "learningmall": "learningmall@xjtlu.edu.cn",
@@ -4205,8 +4208,12 @@ SYSTEM_PROMPT = (
     "26. 管家可以代用户发邮件（从学生邮箱 Guancheng.Wu26@student.xjtlu.edu.cn 发出）："
     "用户说「给微积分老师发邮件请假，我崴脚了去不了10/5的课」时，先用 web_fetch 去 LM 课程页查老师邮箱，"
     "再引导用户发「发邮件 邮箱 主题 正文」命令。发送前会出确认卡让用户确认，绝不擅自发送。"
-    "已知部门邮箱：教务处 registry@xjtlu.edu.cn、课表室 timetables@xjtlu.edu.cn、LM平台 learningmall@xjtlu.edu.cn。"
-    "用户说「给教务处发邮件」时直接匹配，不用查。\n"
+    "已知部门邮箱（中英文都能匹配，不用查 LM/eBridge）："
+    "教务处(Registry/Registrar) registry@xjtlu.edu.cn、"
+    "课表室(Timetable) timetables@xjtlu.edu.cn、"
+    "LM平台(LearningMall) learningmall@xjtlu.edu.cn、"
+    "终身学习(Lifelong Learning) lifelonglearning@xjtlu.edu.cn。"
+    "用户说「给教务处发邮件」「给 Registry 发邮件」「找教务处邮箱」时直接告知邮箱地址，不用 web_fetch 查。\n"
 )
 
 
