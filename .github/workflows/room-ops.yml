@@ -20,6 +20,9 @@ jobs:
       - name: Checkout 代码仓库
         uses: actions/checkout@v4
 
+      - name: Clone 私有数据仓库
+        run: git clone https://x-access-token:${{ secrets.GH_PAT }}@github.com/wutian-yu/butler-data.git data
+
       - name: Setup Python
         uses: actions/setup-python@v5
         with:
@@ -35,6 +38,7 @@ jobs:
           XJTLU_USERNAME: ${{ secrets.XJTLU_USERNAME }}
           XJTLU_PASSWORD: ${{ secrets.XJTLU_PASSWORD }}
           EBRIDGE_COOKIES: ${{ secrets.EBRIDGE_COOKIES }}
+          XJTLU_COOKIES_FILE: ${{ github.workspace }}/data/xjtlu_cookies.json
           FEISHU_APP_ID: ${{ secrets.FEISHU_APP_ID }}
           FEISHU_APP_SECRET: ${{ secrets.FEISHU_APP_SECRET }}
           GH_PAT: ${{ secrets.GH_PAT }}
