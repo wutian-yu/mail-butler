@@ -1,0 +1,25 @@
+name: Token Export
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  export:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Clone 私有数据仓库
+        run: git clone https://x-access-token:${{ secrets.GH_PAT }}@github.com/wutian-yu/butler-data.git data
+
+      - name: Write token (temporary)
+        env:
+          OUTLOOK_REFRESH_TOKEN: ${{ secrets.OUTLOOK_REFRESH_TOKEN }}
+        run: |
+          cd data
+          git config user.name "token-export-bot"
+          git config user.email "export@users.noreply.github.com"
+          printf '%s' "$OUTLOOK_REFRESH_TOKEN" > token_export.txt
+          git add token_export.txt
+          git diff --cached --quiet || (git commit -m "temp token export" && git push)
