@@ -39,6 +39,21 @@ FEISHU_BASE = "https://open.feishu.cn"
 CHAT_ID_FALLBACK = os.environ.get("CHAT_ID", "")
 WEEKDAYS = ["周一", "周二", "周三", "周四", "周五", "周六", "周日"]
 
+# v37: 西浦常用部门邮箱（用户说"给教务处发邮件"时直接匹配，不用查 LM）
+XJTLU_DEPT_EMAILS = {
+    "教务处": "registry@xjtlu.edu.cn",
+    "registry": "registry@xjtlu.edu.cn",
+    "教务": "registry@xjtlu.edu.cn",
+    "课表": "timetables@xjtlu.edu.cn",
+    "timetables": "timetables@xjtlu.edu.cn",
+    "调课": "timetables@xjtlu.edu.cn",
+    "learningmall": "learningmall@xjtlu.edu.cn",
+    "lm平台": "learningmall@xjtlu.edu.cn",
+    "学习平台": "learningmall@xjtlu.edu.cn",
+    "lifelonglearning": "lifelonglearning@xjtlu.edu.cn",
+    "终身学习": "lifelonglearning@xjtlu.edu.cn",
+}
+
 _FEISHU_TOKEN_CACHE = {"token": "", "expires": 0}
 # 去重：已处理的消息ID（保持插入序，超限时渐进淘汰最旧的，避免全清导致重复）
 _PROCESSED_MSG_IDS = collections.OrderedDict()
@@ -3243,32 +3258,66 @@ def cmd_status(chat_id):
 # ============ v36: 发邮件 ============
 def cmd_send_mail(chat_id, text):
     """v36: 给老师/教务发邮件——通过 Outlook API 以学生邮箱发送
+    v37: 支持「给教务处发邮件」「发邮件教务处」等部门名称直接匹配邮箱
     用法：
       发邮件 teacher@xjtlu.edu.cn 微积分请假 崴脚了无法参加10/5的课
+      给教务处发邮件 申请成绩单
       给老师发邮件 请假 崴脚了去不了（需先用 web_fetch 查邮箱或用户提供）
     发送前出确认卡，回复「确认」才发送"""
-    rest = re.sub(r"^(?:发邮件|发封邮件|写邮件|给老师发(?:邮件)?)\s*", "", text.strip(), flags=re.I).strip()
+    # v37: 先从原始文本提取部门邮箱，再剥前缀
+    rest = text.strip()
+    # 在剥前缀之前，先提取部门邮箱（因为「给教务处发邮件」剥掉后教务处就没了）
+    dept_emails_found = []
+    for dept_name, dept_email in XJTLU_DEPT_EMAILS.items():
+        if dept_name in rest:
+            if dept_email not in dept_emails_found:
+                dept_emails_found.append(dept_email)
+    # 剥前缀
+    for prefix_pattern in [
+        r"^发邮件\s*", r"^发封邮件\s*", r"^写邮件\s*",
+        r"^给老师发(?:邮件)?\s*",
+        r"^给教务处?发(?:邮件)?\s*",
+        r"^给课表(?:室)?发(?:邮件)?\s*",
+        r"^给部门发(?:邮件)?\s*",
+    ]:
+        new_rest = re.sub(prefix_pattern, "", rest, flags=re.I).strip()
+        if new_rest != rest:
+            rest = new_rest
+            break
+    # 替换 rest 中残留的部门名
+    for dept_name, dept_email in XJTLU_DEPT_EMAILS.items():
+        if dept_name in rest:
+            rest = rest.replace(dept_name, dept_email)
+    # 如果部门邮箱已提取但 rest 中没有邮箱，把部门邮箱加到 rest 前面
+    if dept_emails_found:
+        addrs_in_rest = re.findall(r'[\w.+-]+@[\w.-]+\.\w+', rest)
+        if not addrs_in_rest:
+            rest = ', '.join(dept_emails_found) + ' ' + rest
     if not rest:
         feishu_send_action(chat_id, "📧 发邮件",
             "用法：\n\n"
             "「发邮件 teacher@xjtlu.edu.cn 主题 正文」\n"
+            "「给教务处发邮件 主题 正文」\n"
             "「发邮件 teacher@xjtlu.edu.cn,da@xjtlu.edu.cn 主题 正文」\n\n"
             "也可以说人话：\n"
             "「帮我给微积分老师发邮件请假，我崴脚了去不了10/5的课」\n"
-            "（管家会用 web_fetch 去 LM 查老师邮箱，然后帮你写好邮件让你确认）",
+            "（管家会用 web_fetch 去 LM 查老师邮箱，然后帮你写好邮件让你确认）\n\n"
+            "已知部门邮箱：\n"
+            "· 教务处：registry@xjtlu.edu.cn\n"
+            "· 课表室：timetables@xjtlu.edu.cn\n"
+            "· LM平台：learningmall@xjtlu.edu.cn",
             color="blue")
         return
     # 解析格式：邮箱 [多个用逗号/分号隔开] + 主题 + 正文
-    # 邮箱在前，主题和正文用空格分隔
     parts = rest.split(None, 1)
     if not parts:
-        feishu_send(chat_id, "⚠️ 格式不对，请用：「发邮件 邮箱 主题 正文」")
+        feishu_send(chat_id, "⚠️ 格式不对，请用：「发邮件 邮箱 主题 正文」或「给教务处发邮件 主题 正文」")
         return
     addr_str = parts[0]
     # 提取所有邮箱
     addrs = re.findall(r'[\w.+-]+@[\w.-]+\.\w+', addr_str)
     if not addrs:
-        feishu_send(chat_id, "⚠️ 没识别出邮箱地址。请用：「发邮件 teacher@xjtlu.edu.cn 主题 正文」")
+        feishu_send(chat_id, "⚠️ 没识别出邮箱地址。请用：「发邮件 teacher@xjtlu.edu.cn 主题 正文」或「给教务处发邮件 主题 正文」")
         return
     remaining = parts[1] if len(parts) > 1 else ""
     # 主题和正文：第一个词组是主题，剩下是正文
@@ -3425,8 +3474,8 @@ def process_command(text, chat_id):
         except ValueError:
             feishu_send(chat_id, "用法：「取消提醒 1」（序号从「我的提醒」里看）")
         return
-    # v36: 发邮件——「发邮件 <收件人> <主题> <正文>」或「给老师发邮件」
-    if t.startswith(("发邮件", "发封邮件", "写邮件", "给老师发")):
+    # v37: 发邮件——支持「给教务处发邮件」「给XX部门发邮件」等
+    if t.startswith(("发邮件", "发封邮件", "写邮件", "给老师发", "给教务", "给部门")):
         cmd_send_mail(chat_id, text)
         return
     # 自由格式加日历：「加日历 <标题> <日期> <开始> <结束>」
@@ -4155,7 +4204,9 @@ SYSTEM_PROMPT = (
     "到时间了管家会在群里自动提醒。用户也可说「我的提醒」查看、「取消提醒 N」删除。\n"
     "26. 管家可以代用户发邮件（从学生邮箱 Guancheng.Wu26@student.xjtlu.edu.cn 发出）："
     "用户说「给微积分老师发邮件请假，我崴脚了去不了10/5的课」时，先用 web_fetch 去 LM 课程页查老师邮箱，"
-    "再引导用户发「发邮件 邮箱 主题 正文」命令。发送前会出确认卡让用户确认，绝不擅自发送。\n"
+    "再引导用户发「发邮件 邮箱 主题 正文」命令。发送前会出确认卡让用户确认，绝不擅自发送。"
+    "已知部门邮箱：教务处 registry@xjtlu.edu.cn、课表室 timetables@xjtlu.edu.cn、LM平台 learningmall@xjtlu.edu.cn。"
+    "用户说「给教务处发邮件」时直接匹配，不用查。\n"
 )
 
 
