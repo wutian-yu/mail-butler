@@ -2227,7 +2227,42 @@ def _room_op_probe(page, captured, op):
     else:
         log("✅ 零残留")
         findings.append("零残留✅")
-    return "🔬 probe v31 完成: " + "；".join(findings)
+
+    # === 房间详情探测：dump 一个房间的完整原始字段 + 试 deviceDetail ===
+    ds = _bjnow().strftime("%Y%m%d")
+    raw = _room_api_on_page(page, f"/reserve?sysKind=1&resvDates={ds}&labIds={ROOM_SIP_LABS}")
+    if raw and isinstance(raw, list):
+        for campus in raw:
+            if "SIP" not in (campus.get("campusName") or ""):
+                continue
+            for lab in campus.get("labInfos") or []:
+                for r in (lab.get("roomInfos") or [])[:1]:
+                    log(f"📦 房间完整字段: {json.dumps(r, ensure_ascii=False, default=str)[:600]}")
+                    findings.append(f"字段:{','.join(sorted(r.keys()))}")
+                    break
+                break
+            break
+    # 试 roomDevice/roomInfos（可能含设备详情）
+    r2 = _room_api_on_page(page, "/roomDevice/roomInfos")
+    if r2.get("code") == 0 and r2.get("data"):
+        d2 = r2["data"]
+        if isinstance(d2, list):
+            for campus in d2:
+                if "SIP" not in (campus.get("campusName") or ""):
+                    continue
+                for lab in campus.get("labInfos") or []:
+                    for r in (lab.get("roomInfos") or [])[:1]:
+                        log(f"📦 roomDevice房间字段: {json.dumps(r, ensure_ascii=False, default=str)[:800]}")
+                        findings.append(f"deviceFields:{','.join(sorted(r.keys()))}")
+                        break
+                    break
+                break
+        else:
+            log(f"📦 roomDevice data类型: {type(d2)} {str(d2)[:300]}")
+            findings.append(f"deviceData:{str(d2)[:100]}")
+    else:
+        findings.append(f"roomDevice:code={r2.get('code')}")
+    return "🔬 probe v32 完成: " + "；".join(findings)
 
 
 def run_room_op(op_json):
