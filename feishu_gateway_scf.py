@@ -1206,6 +1206,27 @@ def trigger_monitor_refresh():
         return False
 
 
+def _trigger_web_fetch(op):
+    """v26: 调度 web-fetch workflow——云端浏览器实地打开指定页面抓取回答"""
+    if not GH_TOKEN:
+        return False
+    try:
+        req = urllib.request.Request(
+            f"https://api.github.com/repos/{REPO}/actions/workflows/web-fetch.yml/dispatches",
+            data=json.dumps({"ref": "main",
+                             "inputs": {"op": json.dumps(op, ensure_ascii=False)}}).encode(),
+            method="POST",
+            headers={"Authorization": f"Bearer {GH_TOKEN}",
+                     "Accept": "application/vnd.github+json",
+                     "Content-Type": "application/json"})
+        urllib.request.urlopen(req, timeout=10)
+        log(f"✅ 已调度 web-fetch: {op.get('url', '')[:60]}")
+        return True
+    except Exception as e:
+        log(f"触发 web-fetch 失败: {e}")
+        return False
+
+
 def _ams_token_dead(resp):
     """AMS 响应是否为凭证失效（实测 401 响应：The account is invalid. Please log in again.）"""
     if not isinstance(resp, dict):
@@ -3156,6 +3177,9 @@ SYSTEM_PROMPT = (
     "20. 回答考核结构、请假缓考规则、升学学位问题时，以上方「西浦规章制度」知识块为准——"
     "那是 2026-10-04 从 LM 课程页、Module Handbook 和 FYE 政策库原文抓取的真实内容，不是常识猜测；"
     "涉及用户个人的具体安排（场次/分组/成绩）仍引导查 LM 或问老师。\n"
+    "21. 你有 web_fetch 工具：用户要查 LM/eBridge 上的具体页面（课程页新帖、论坛、考试页、成绩页等）时用它，"
+    "云端浏览器会实地打开抓取，1-2 分钟后自动把结果发到群里；你要先告知用户稍等。"
+    "作业/考试截止时间优先 query_homework（秒回）。Cookie 失效时结果会提示刷新，引导用户发「cookie <JSON>」或找星辰。\n"
 )
 
 
@@ -3252,13 +3276,15 @@ TOOLS_DEF = [
     {
         "type": "function",
         "function": {
-            "name": "query_calendar",
-            "description": "查询用户 Outlook 日历日程。用户问今天/明天有什么安排、日程时调用。",
+            "name": "web_fetch",
+            "description": "用云端浏览器实地打开西浦网页（LM/eBridge），抓取正文并按问题回答。适合查课程页动态、论坛新帖、eBridge 页面等没有现成数据的页面。每次约 1-2 分钟，结果自动发到群里。仅支持 xjtlu.edu.cn / learningmall.cn。常用页面 id：MTH026课程=1148/考试页=1510；MTH028课程=1150/考试页=1513；EAP043=361、SCI004=1217、PSP004=1211、CCT007=782、CCT001=780、FYE=1421。LM 课程页 URL 形如 https://core.xjtlu.edu.cn/course/view.php?id=<id>；LM 首页 https://core.xjtlu.edu.cn/my/；eBridge 首页 https://ebridge.xjtlu.edu.cn。注意：作业/考试的截止时间用 query_homework 查（秒回），不要用本工具。",
             "parameters": {
                 "type": "object",
                 "properties": {
-                    "days": {"type": "integer", "description": "查询未来天数，默认 3"},
+                    "url": {"type": "string", "description": "要打开的完整页面 URL"},
+                    "question": {"type": "string", "description": "想让页面回答的问题，如'最新的公告是什么'；不填则直接回贴正文"},
                 },
+                "required": ["url"],
             },
         },
     },
@@ -3392,6 +3418,18 @@ def execute_tool(name, args_raw, chat_id):
                 if now - timedelta(hours=12) <= s <= horizon:
                     rows.append(f"{s.strftime('%m-%d %H:%M')} {ev.get('Subject', '')}")
             return "\n".join(rows) if rows else f"未来{days}天没有日程安排。"
+        if name == "web_fetch":
+            url = str(args.get("url") or "").strip()
+            if not url:
+                return "缺少参数：需要 url。"
+            if not any(d in url for d in ("xjtlu.edu.cn", "learningmall.cn")):
+                return "该地址不在西浦域名白名单内，无法查询。"
+            question = str(args.get("question") or "").strip()
+            ok = _trigger_web_fetch({"url": url, "question": question, "chat_id": chat_id})
+            if ok:
+                return ("已派云端浏览器去查「" + (question or url[:40]) + "」，约 1-2 分钟后结果会直接发到群里。"
+                        "请立刻这样告知用户，不要等待或编造结果。")
+            return "查询调度失败（GitHub API 异常），请稍后再试。"
         return f"未知工具: {name}"
     except Exception as e:
         log(f"❌ 工具执行异常 {name}: {e}")
