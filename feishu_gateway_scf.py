@@ -43,6 +43,14 @@ _FEISHU_TOKEN_CACHE = {"token": "", "expires": 0}
 # 去重：已处理的消息ID（保持插入序，超限时渐进淘汰最旧的，避免全清导致重复）
 _PROCESSED_MSG_IDS = collections.OrderedDict()
 
+# v29: GitHub token 健康状态（内存级，同一 SCF 实例生命周期内有效）
+# _GH_TOKEN_STATUS: "ok" / "revoked" / "unknown"
+# _GH_TOKEN_REVOKED_AT: 失效检测时间戳
+# _GH_TOKEN_NOTIFIED: 是否已发过飞书通知（避免每次调用都刷屏）
+_GH_TOKEN_STATUS = "unknown"
+_GH_TOKEN_REVOKED_AT = 0
+_GH_TOKEN_NOTIFIED = False
+
 
 def log(msg):
     print(f"[{datetime.now().strftime('%H:%M:%S')}] {msg}", flush=True)
@@ -159,6 +167,9 @@ def gh_read_json(path):
         except Exception as e:
             if getattr(e, "code", None) == 404:
                 raise
+            if getattr(e, "code", None) == 401:
+                _gh_check_token()
+                _gh_token_revoked_notify()
             last_err = e
             log(f"GitHub读取失败(第{attempt+1}次): {e}")
             if attempt == 0:
@@ -195,6 +206,65 @@ def gh_write_json(path, data, sha, message="update", retries=2):
     raise last_err
 
 
+# v29: 检测 GitHub token 是否被撤销（调用 /user API，401 = 被撤销）
+def _gh_check_token():
+    """主动检测 GH_TOKEN 有效性。返回 (ok, detail)。
+    检测结果写入全局 _GH_TOKEN_STATUS，供体检报告和其他调用点使用。"""
+    global _GH_TOKEN_STATUS, _GH_TOKEN_REVOKED_AT, _GH_TOKEN_NOTIFIED
+    if not GH_TOKEN:
+        _GH_TOKEN_STATUS = "revoked"
+        return False, "未配置 GH_TOKEN"
+    try:
+        req = urllib.request.Request(
+            "https://api.github.com/user",
+            headers={"Authorization": f"Bearer {GH_TOKEN}",
+                     "Accept": "application/vnd.github+json",
+                     "User-Agent": "butler-token-check"})
+        with urllib.request.urlopen(req, timeout=10) as r:
+            data = json.loads(r.read().decode())
+            login = data.get("login", "")
+            if login:
+                _GH_TOKEN_STATUS = "ok"
+                _GH_TOKEN_NOTIFIED = False  # 恢复后重置通知标记
+                return True, f"有效（用户 {login}）"
+            _GH_TOKEN_STATUS = "unknown"
+            return False, "API 返回无 login 字段"
+    except urllib.error.HTTPError as e:
+        if e.code == 401:
+            _GH_TOKEN_STATUS = "revoked"
+            _GH_TOKEN_REVOKED_AT = time.time()
+            try:
+                body = json.loads(e.read().decode())
+                msg = body.get("message", "Bad credentials")
+            except Exception:
+                msg = "Bad credentials"
+            return False, f"已被撤销（401: {msg}）"
+        _GH_TOKEN_STATUS = "unknown"
+        return False, f"HTTP {e.code}"
+    except Exception as e:
+        _GH_TOKEN_STATUS = "unknown"
+        return False, f"网络异常: {str(e)[:60]}"
+
+
+# v29: GitHub API 调用失败时检测是否为 token 撤销，首次检测到时飞书通知
+def _gh_token_revoked_notify(chat_id=CHAT_ID_FALLBACK):
+    """token 被撤销时发一次飞书通知（同实例只发一次，避免刷屏）"""
+    global _GH_TOKEN_NOTIFIED
+    if _GH_TOKEN_NOTIFIED or _GH_TOKEN_STATUS != "revoked":
+        return
+    _GH_TOKEN_NOTIFIED = True
+    ts = datetime.now().strftime("%H:%M")
+    feishu_send_action(chat_id, "⚠️ GitHub Token 已失效",
+        f"管家检测到 GitHub Token 已被撤销（401 Bad credentials），时间 {ts}。\n\n"
+        "受影响功能：作业查询、状态体检、订房调度、网页查询、监控提醒。\n"
+        "不受影响：飞书消息处理、加/删日历、请假、签到、出勤。\n\n"
+        "修复方法：找星辰（TeleAgent），说「GitHub token 又挂了」，他会重新生成并更新。\n"
+        "（token 设了无过期，被撤销通常是 GitHub secret scanning 检测到明文暴露后自动撤销，"
+        "会发邮件到 GitHub 绑定邮箱，可查看暴露来源。）",
+        color="red")
+    log(f"⚠️ GitHub token 被撤销，已发飞书通知")
+
+
 def trigger_github():
     """触发 GitHub Actions 重新生成 ICS"""
     if not GH_TOKEN:
@@ -209,8 +279,13 @@ def trigger_github():
                      "Content-Type": "application/json",
                      "X-GitHub-Api-Version": "2022-11-28"})
         urllib.request.urlopen(req, timeout=10)
+    except urllib.error.HTTPError as e:
+        if e.code == 401:
+            _gh_check_token()  # 更新全局状态
+            _gh_token_revoked_notify()
+        log(f"⚠️ trigger_github 失败 (HTTP {e.code}): token 可能已失效")
     except Exception as e:
-        log(f"⚠️ trigger_github 失败: {e}")  # M7 修复：不再静默吞掉
+        log(f"⚠️ trigger_github 失败: {e}")
 
 
 # ============ Outlook API ============
@@ -1207,12 +1282,15 @@ def trigger_monitor_refresh():
         urllib.request.urlopen(req, timeout=10)
         log("✅ 已触发 monitor 立刻刷新 AMS x-token")
         return True
+    except urllib.error.HTTPError as e:
+        if e.code == 401:
+            _gh_check_token()
+            _gh_token_revoked_notify()
+        log(f"触发 monitor 刷新失败 (HTTP {e.code}): token 可能已失效")
+        return False
     except Exception as e:
         log(f"触发 monitor 刷新失败: {e}")
         return False
-
-
-def _trigger_web_fetch(op):
     """v26: 调度 web-fetch workflow——云端浏览器实地打开指定页面抓取回答"""
     if not GH_TOKEN:
         return False
@@ -1228,6 +1306,12 @@ def _trigger_web_fetch(op):
         urllib.request.urlopen(req, timeout=10)
         log(f"✅ 已调度 web-fetch: {op.get('url', '')[:60]}")
         return True
+    except urllib.error.HTTPError as e:
+        if e.code == 401:
+            _gh_check_token()
+            _gh_token_revoked_notify()
+        log(f"触发 web-fetch 失败 (HTTP {e.code}): token 可能已失效")
+        return False
     except Exception as e:
         log(f"触发 web-fetch 失败: {e}")
         return False
@@ -1849,6 +1933,12 @@ def _trigger_room_op(op):
         urllib.request.urlopen(req, timeout=12)
         log(f"🚀 已触发房间操作: {json.dumps(op, ensure_ascii=False)[:80]}")
         return True
+    except urllib.error.HTTPError as e:
+        if e.code == 401:
+            _gh_check_token()
+            _gh_token_revoked_notify()
+        log(f"⚠️ 触发房间操作失败 (HTTP {e.code}): token 可能已失效")
+        return False
     except Exception as e:
         log(f"⚠️ 触发房间操作失败: {e}")
         return False
@@ -2481,13 +2571,24 @@ def cmd_add_calendar(chat_id, text, confirmed=False):
 
 
 def cmd_status(chat_id):
-    """v27: 管家体检报告——西浦 Cookie / AMS / 房间 session 健康状况 + 依赖关系 + 根因结论"""
+    """v29: 管家体检报告——GitHub token / 西浦 Cookie / AMS / 房间 session 健康状况 + 依赖关系 + 根因结论"""
     state = None
+    gh_read_ok = True
     try:
         state, _ = gh_read_json("xjtlu_state.json")
+    except urllib.error.HTTPError as e:
+        if getattr(e, "code", None) == 401:
+            gh_read_ok = False
+        # 404 等其他错误不影响体检（state 可能还没创建）
     except Exception:
         pass
     lines = ["🩺 **管家体检报告**", ""]
+    # 0) v29: GitHub token 健康检查（主动探测，不依赖 gh_read_json 是否成功）
+    gh_ok, gh_detail = _gh_check_token()
+    if gh_ok:
+        lines.append(f"· **GitHub Token**（作业/体检/订房/监控）：✅ {gh_detail}")
+    else:
+        lines.append(f"· **GitHub Token**（作业/体检/订房/监控）：❌ {gh_detail}")
     # 1) 西浦 Cookie（根源凭证，以监控 30 分钟一验的结果为准）
     fails = (state or {}).get("consecutive_fails", 0) or 0
     last_check = str((state or {}).get("last_check") or "")
@@ -2507,13 +2608,15 @@ def cmd_status(chat_id):
     # 2) AMS 凭证（签到/请假用；依赖 Cookie 续命，有滞后）
     ams_token = ((state or {}).get("ams") or {}).get("token") or ""
     ams_live = None
-    if ams_token:
+    if ams_token and gh_ok:
         try:
             resp = _http(f"{AMS_URL}/xjtlu/stuapi/xjtlu-leave/getLeaveList?pageNum=1&pageSize=1",
                          headers={"x-token": ams_token}, timeout=12)
             ams_live = (not _ams_token_dead(resp)) and resp.get("code") == 0
         except Exception:
             ams_live = False
+    elif not gh_ok:
+        ams_live = None  # token 挂了，无法读 state，跳过
     if ams_live is True:
         lines.append("· **AMS 凭证**（签到/请假；靠 Cookie 续命）：✅ 刚实测有效")
     elif ams_live is False:
@@ -2528,11 +2631,18 @@ def cmd_status(chat_id):
         lines.append(f"· **房间系统**（订房；靠 Cookie 续命）：✅ session 在（{upd}更新）")
     else:
         lines.append("· **房间系统**（订房）：⚠️ 无 session，等监控下一轮写入")
-    # 4) 不受 Cookie 影响的部分
-    lines.append("· **LM 作业提醒 / Outlook 日历 / 邮件**：不依赖 Cookie，常年在岗")
+    # 4) 不受 Cookie/GitHub token 影响的部分
+    lines.append("· **LM 作业提醒 / Outlook 日历 / 邮件**：不依赖 Cookie/GitHub token，常年在岗")
     # 结论
-    if cookie_ok and ams_live:
+    if gh_ok and cookie_ok and ams_live:
         lines += ["", "—— ✅ 全部正常 ——"]
+    elif not gh_ok:
+        lines += ["", "—— ⚠️ 根因：GitHub Token 已失效 ——",
+                  "受影响：作业查询、状态体检（读取历史数据）、订房调度、网页查询、监控触发。",
+                  "不受影响：加/删日历、请假、签到、出勤、飞书消息处理。",
+                  "修复方法：找星辰（TeleAgent），说「GitHub token 又挂了」，他会重新生成并更新。",
+                  "（token 设了无过期，被撤销通常是 GitHub secret scanning 检测到明文暴露后自动撤销，",
+                  "会发邮件到 GitHub 绑定邮箱，可查看暴露来源。）"]
     elif not cookie_ok:
         lines += ["", "—— ⚠️ 根因：西浦 Cookie 已失效 ——",
                   "刷新方法：跑 export_cookies.py 导出 JSON，以「cookie」开头粘进来；或找星辰直接抓。",
@@ -2542,7 +2652,7 @@ def cmd_status(chat_id):
                   "2-4 分钟后再发一次「状态」复查。"]
         trigger_monitor_refresh()
     feishu_send_action(chat_id, "🩺 管家体检报告", "\n".join(lines),
-                       color="green" if (cookie_ok and ams_live) else "red")
+                       color="green" if (gh_ok and cookie_ok and ams_live) else "red")
 
 
 def cmd_cookie(chat_id, text):
