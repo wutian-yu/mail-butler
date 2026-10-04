@@ -36,7 +36,7 @@ DATA_REPO = "wutian-yu/butler-data"          # 私有仓库：所有状态数据
 FEISHU_VERIFY_TOKEN = os.environ.get("FEISHU_VERIFY_TOKEN", "")
 LM_CAL_URL = os.environ.get("LM_CAL_URL", "https://core.xjtlu.edu.cn/calendar/export_execute.php?userid=7860&authtoken=e0f4ad6318700f9841cb02a96315cb30d6451624&preset_what=all&preset_time=recentupcoming")
 FEISHU_BASE = "https://open.feishu.cn"
-CHAT_ID_FALLBACK = "oc_0f1f851c3fce82feff595f7a44bcc88a"
+CHAT_ID_FALLBACK = os.environ.get("CHAT_ID", "oc_0f1f851c3fce82feff595f7a44bcc88a")
 WEEKDAYS = ["周一", "周二", "周三", "周四", "周五", "周六", "周日"]
 
 _FEISHU_TOKEN_CACHE = {"token": "", "expires": 0}
