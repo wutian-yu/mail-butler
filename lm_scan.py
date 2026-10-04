@@ -47,7 +47,18 @@ def main():
             sys.exit(1)
         log("✅ SSO 会话有效")
 
-        # SAML 登录（复刻 monitor regenerate_lm_calendar_url 的方式）
+        # eBridge 预热：monitor 的成功路径是先登 eBridge 让 IdP 建立 session，
+        # 直接走 SAML 会卡在 IdP 的 SSO 端点
+        page.goto("https://ebridge.xjtlu.edu.cn", wait_until="domcontentloaded", timeout=45000)
+        for i in range(20):
+            time.sleep(3)
+            u = page.url
+            log(f"  eBridge预热[{i+1}]: {u[:70]}")
+            if "ebridge" in u and "siw_lgn" not in u and "login" not in u.lower():
+                log("✅ eBridge 登录完成（IdP session 已建立）")
+                break
+
+        # SAML 登录（此时 IdP 已有 session，应自动放行）
         page.goto(LM_SAML_LOGIN_URL, wait_until="domcontentloaded", timeout=60000)
         logged = False
         for i in range(20):
