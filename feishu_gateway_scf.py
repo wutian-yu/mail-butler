@@ -28,7 +28,7 @@ GH_TOKEN = os.environ.get("GH_TOKEN", "")
 FEISHU_APP_ID = os.environ.get("FEISHU_APP_ID", "")
 FEISHU_APP_SECRET = os.environ.get("FEISHU_APP_SECRET", "")
 OUTLOOK_REFRESH_TOKEN = os.environ.get("OUTLOOK_REFRESH_TOKEN", "")
-OUTLOOK_CLIENT_ID = os.environ.get("OUTLOOK_CLIENT_ID", "d3590ed6-52b3-4102-aeff-aad2292ab01c")
+OUTLOOK_CLIENT_ID = os.environ.get("OUTLOOK_CLIENT_ID", "")
 DEEPSEEK_API_KEY = os.environ.get("DEEPSEEK_API_KEY", "")
 
 REPO = "wutian-yu/mail-butler"              # 公开仓库：代码+workflow（仅用于触发Actions）
@@ -36,7 +36,7 @@ DATA_REPO = "wutian-yu/butler-data"          # 私有仓库：所有状态数据
 FEISHU_VERIFY_TOKEN = os.environ.get("FEISHU_VERIFY_TOKEN", "")
 LM_CAL_URL = os.environ.get("LM_CAL_URL", "https://core.xjtlu.edu.cn/calendar/export_execute.php?userid=7860&authtoken=e0f4ad6318700f9841cb02a96315cb30d6451624&preset_what=all&preset_time=recentupcoming")
 FEISHU_BASE = "https://open.feishu.cn"
-CHAT_ID_FALLBACK = os.environ.get("CHAT_ID", "oc_0f1f851c3fce82feff595f7a44bcc88a")
+CHAT_ID_FALLBACK = os.environ.get("CHAT_ID", "")
 WEEKDAYS = ["周一", "周二", "周三", "周四", "周五", "周六", "周日"]
 
 _FEISHU_TOKEN_CACHE = {"token": "", "expires": 0}
