@@ -56,9 +56,16 @@ IC_API = ROOM_URL + "/ic-web"
 
 IMPORTANT_KEYWORDS = [
     "考试", "exam", "deadline", "截止", "ddl", "作业", "assignment",
-    "成绩", "grade", "通知", "announcement", "重要", "important",
+    "成绩", "grade", "score", "通知", "announcement", "重要", "important",
     "选课", "补考", "quiz", "test", "提交", "submit",
     "讲座", "lecture", "活动", "event", "报名", "register",
+    # v35: 课程变更相关
+    "教室", "room change", "venue", "地点变更", "调课", "课程取消",
+    "cancelled", "rescheduled", "moved to", "改为", "更换",
+    "schedule change", "timetable",
+    # v35: 成绩相关
+    "成绩发布", "成绩公布", "grade release", "marks", "result",
+    "分数", "出分", "评分",
 ]
 
 
@@ -1245,14 +1252,46 @@ def format_notification(source, items):
     """格式化飞书通知"""
     if not items:
         return None
+    # v35: 识别课程变更和成绩发布，加专门标签
+    ROOM_CHANGE_KW = ["教室", "room change", "venue", "地点变更", "调课",
+                      "课程取消", "cancelled", "rescheduled", "moved to",
+                      "改为", "更换", "schedule change", "timetable"]
+    GRADE_KW = ["成绩发布", "成绩公布", "grade release", "marks", "result",
+                "分数", "出分", "评分", "grade", "score"]
+
     important = [i for i in items if i["important"]]
     normal = [i for i in items if not i["important"]]
 
+    # v35: 给重要内容分类标注
+    room_changes = []
+    grade_notices = []
+    other_important = []
+    for item in important:
+        text_lower = item["text"].lower()
+        if any(kw.lower() in text_lower for kw in ROOM_CHANGE_KW):
+            room_changes.append(item)
+        elif any(kw.lower() in text_lower for kw in GRADE_KW):
+            grade_notices.append(item)
+        else:
+            other_important.append(item)
+
     lines = [f"📡 **{source}** 发现 {len(items)} 条新内容\n"]
 
-    if important:
-        lines.append(f"🚨 **重要内容（{len(important)}条）：**")
-        for item in important[:5]:
+    if room_changes:
+        lines.append(f"📍 **课程/教室变更（{len(room_changes)}条）：**")
+        for item in room_changes[:5]:
+            lines.append(f"  • {item['text'][:80]}")
+        lines.append("")
+
+    if grade_notices:
+        lines.append(f"📊 **成绩相关（{len(grade_notices)}条）：**")
+        for item in grade_notices[:5]:
+            lines.append(f"  • {item['text'][:80]}")
+        lines.append("")
+
+    if other_important:
+        lines.append(f"🚨 **重要内容（{len(other_important)}条）：**")
+        for item in other_important[:5]:
             lines.append(f"  • {item['text'][:60]}")
         lines.append("")
 
