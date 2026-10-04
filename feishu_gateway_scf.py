@@ -217,9 +217,23 @@ def trigger_github():
 _OUTLOOK_TOKEN_CACHE = {"token": "", "expires": 0}
 
 def get_outlook_token():
-    # M3 修复：加缓存，避免同一请求重复获取 token
+    # 缓存有效直接用
     if _OUTLOOK_TOKEN_CACHE["token"] and time.time() < _OUTLOOK_TOKEN_CACHE["expires"]:
         return _OUTLOOK_TOKEN_CACHE["token"]
+    # v23: 优先读 butler-data/state.json 里的 access token——由 GitHub Actions butler 流程
+    # 每 5 分钟刷新写入。云函数所在 IP 可能被微软条件访问策略拒绝刷新（refresh 返回 400），
+    # 读现成的 access token 彻底绕开该限制（token 1 小时有效，5 分钟一更，永远新鲜）
+    try:
+        state, _ = gh_read_json("state.json")
+        oa = (state or {}).get("outlook_access") or {}
+        if oa.get("token") and time.time() < (oa.get("expires_at") or 0):
+            _OUTLOOK_TOKEN_CACHE["token"] = oa["token"]
+            _OUTLOOK_TOKEN_CACHE["expires"] = oa.get("expires_at", 0)
+            log("✅ 使用 butler-data 提供的 Outlook access token")
+            return oa["token"]
+    except Exception as e:
+        log(f"⚠️ 读 butler-data outlook token 失败，回退本地刷新: {e}")
+    # 回退：云函数自己刷新（若云函数 IP 被微软允许则可用）
     body = urllib.parse.urlencode({
         "client_id": OUTLOOK_CLIENT_ID,
         "grant_type": "refresh_token",
