@@ -4864,7 +4864,7 @@ def poll_group_messages():
                         process_command(t, CHAT_ID_FALLBACK)
                     except Exception as e:
                         log(f"❌ 处理失败: {e}")
-                threading.Thread(target=_process_async, daemon=True).start()
+                threading.Thread(target=_process_async, daemon=False).start()
             else:
                 # 图片消息：同步处理（不用 daemon 线程——函数返回后线程可能被回收，
                 # 必须在本周期内完成 下载→上传AMS→提交 全流程）
@@ -5059,6 +5059,6 @@ def main_handler(event, context):
                     feishu_send(chat_id, f"⚠️ 处理失败：{err_hint}\n\n请重试，若持续失败请反馈给管理员。")
                 except Exception:
                     pass
-        t = threading.Thread(target=_async_process, daemon=True)
+        t = threading.Thread(target=_async_process, daemon=False)
         t.start()
     return {"statusCode": 200, "body": "ok"}
