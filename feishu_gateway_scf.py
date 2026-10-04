@@ -364,7 +364,11 @@ HELP_TEXT = (
     "「我的预约」查我的预定\n"
     "「取消预定 N」取消第N个\n"
     "（研讨室要求至少2人；也可自然语言：「明天下午和张伟订个研讨室」）\n\n"
-    "💡 也可以直接跟我聊天～"
+    "🩺 体检\n"
+    "「状态」「体检」「管家身体怎么样」查看 Cookie/AMS/房间健康\n"
+    "「cookie <JSON>」粘贴导出的新 Cookie 自动刷新\n\n"
+    "💡 不确定指令词？直接说你想干嘛就行（如「我明天想请假」「帮我把数学作业加到日历」）。\n"
+    "🔐 凡是写操作（加/删日历、请假、订房），管家都会先出确认卡，回复「确认」才会动手，绝不擅自执行。"
 )
 
 
@@ -2163,18 +2167,13 @@ def cmd_del_calendar(chat_id, text):
         if not matched:
             feishu_send(chat_id, "📭 没找到匹配的日历事件。")
             return
-        # 「全部」→ 全删
+        # 「全部」→ 全删（v28: 先确认）
         if "全部" in text or "所有" in text or len(matched) == 1:
-            deleted = 0
-            for e in matched:
-                try:
-                    outlook_delete(e.get("Id", ""))
-                    deleted += 1
-                except Exception:
-                    pass
-            names = "、".join((e.get("Subject") or "")[:30] for e in matched[:3])
-            feishu_send_action(chat_id, "✅ 已删除",
-                f"删除了 {deleted} 个日历事件：\n{names}", color="green")
+            names = [(e.get("Subject") or "")[:30] for e in matched]
+            _pending_set(chat_id, "del_calendar", {"ids": [e.get("Id", "") for e in matched], "names": names})
+            feishu_send_action(chat_id, "🗑️ 确认删除？",
+                f"将删除 {len(matched)} 个日历事件：\n" + "\n".join(names[:5])
+                + ("\n…" if len(names) > 5 else "") + "\n\n回复「确认」执行；回复「取消」放弃。", color="red")
             return
         # 否则列出匹配的供选择
         lines = [f"找到 {len(matched)} 个匹配的日历事件："]
@@ -2209,11 +2208,10 @@ def cmd_del_calendar(chat_id, text):
     target = events[num - 1]
     eid = target.get("Id", "")
     subj = (target.get("Subject") or "")[:45]
-    try:
-        outlook_delete(eid)
-        feishu_send_action(chat_id, "✅ 已删除", f"已从 Outlook 日历删除：\n{subj}", color="green")
-    except Exception as e:
-        feishu_send(chat_id, f"❌ 删除失败：{e}")
+    # v28: 先确认再删
+    _pending_set(chat_id, "del_calendar", {"ids": [eid], "names": [subj]})
+    feishu_send_action(chat_id, "🗑️ 确认删除？",
+        f"将删除日历事件：\n{subj}\n\n回复「确认」执行；回复「取消」放弃。", color="red")
 
 
 def cmd_del_calendar_all_hw(chat_id):
@@ -2227,19 +2225,15 @@ def cmd_del_calendar_all_hw(chat_id):
     if not hw_events:
         feishu_send(chat_id, "📭 没有找到📚开头的作业日历事件。")
         return
-    deleted = 0
-    for e in hw_events:
-        try:
-            outlook_delete(e.get("Id", ""))
-            deleted += 1
-        except Exception:
-            pass
-    feishu_send_action(chat_id, "✅ 批量删除完成",
-        f"已删除 {deleted} 个作业日历事件。\n\n现在可以重新发「把XX作业加到日历」，不会再重复了。",
-        color="green")
+    # v28: 批量删除先确认
+    names = [(e.get("Subject") or "")[:30] for e in hw_events]
+    _pending_set(chat_id, "del_calendar", {"ids": [e.get("Id", "") for e in hw_events], "names": names})
+    feishu_send_action(chat_id, "🗑️ 确认删除？",
+        f"将删除 {len(hw_events)} 个作业日历事件：\n" + "\n".join(names[:5])
+        + ("\n…" if len(names) > 5 else "") + "\n\n回复「确认」执行；回复「取消」放弃。", color="red")
 
 
-def cmd_homework_to_calendar(chat_id, text):
+def cmd_homework_to_calendar(chat_id, text, confirmed=False):
     """把 LM 作业写进 Outlook 日历（用户说"把XX作业加到日历"时触发）
     支持：课程名/课程码过滤 + 日期过滤"""
     events = fetch_lm_assignments()
@@ -2285,6 +2279,14 @@ def cmd_homework_to_calendar(chat_id, text):
     if not matched:
         feishu_send(chat_id, "📭 没找到匹配的作业。试试「把10月9号的数学作业加到日历」。")
         return
+    # v28: 写操作确认门——先给用户预览，回复「确认」才批量写入
+    if not confirmed:
+        _pending_set(chat_id, "hw_to_calendar", {"text": text})
+        preview = "\n".join(f"· {ev['summary'][:50]} — {ev['dt'].strftime('%m月%d日 %H:%M')}" for ev in matched[:5])
+        feishu_send_action(chat_id, "📌 确认写入日历？",
+            f"将写入 {len(matched)} 项作业：\n{preview}\n\n回复「确认」执行；回复「取消」放弃。",
+            color="blue")
+        return
     # 创建 Outlook 日历事件（防重复：先查是否已有同名事件）
     created = 0
     failed = 0
@@ -2329,7 +2331,63 @@ def cmd_homework_to_calendar(chat_id, text):
     feishu_send(chat_id, "\n".join(summary_lines))
 
 
-def cmd_add_calendar(chat_id, text):
+# v28: 写操作确认机制——加/删日历、作业写日历先出确认卡，回复「确认」才动手
+_PENDING_CONFIRM = {}  # chat_id -> {"kind": str, "payload": dict, "ts": float}
+
+
+def _pending_set(chat_id, kind, payload):
+    _PENDING_CONFIRM[chat_id] = {"kind": kind, "payload": payload, "ts": time.time()}
+
+
+def _pending_pop(chat_id):
+    p = _PENDING_CONFIRM.pop(chat_id, None)
+    if p and time.time() - p["ts"] > 900:  # 15 分钟未确认则过期
+        return None
+    return p
+
+
+def _exec_pending_confirm(chat_id):
+    """执行用户确认后的待定写操作（加/删日历、作业写日历）。返回 True 表示已处理"""
+    p = _pending_pop(chat_id)
+    if not p:
+        return False
+    kind, pay = p["kind"], p["payload"]
+    try:
+        if kind == "add_calendar":
+            start_dt = datetime.fromisoformat(pay["start"])
+            end_dt = datetime.fromisoformat(pay["end"])
+            eid = outlook_create_event(pay["title"], start_dt, end_dt,
+                                       body=f"管家添加：{pay['title']}")
+            if eid:
+                wd = ["周一", "周二", "周三", "周四", "周五", "周六", "周日"][start_dt.weekday()]
+                feishu_send_action(chat_id, "✅ 已加入日历",
+                    f"📅 {pay['title'][:60]}\n"
+                    f"{start_dt.strftime('%m月%d日')}（{wd}）{start_dt.strftime('%H:%M')}~{end_dt.strftime('%H:%M')}\n\n"
+                    "已写入 Outlook 日历，iPhone 日历会自动同步显示。", color="green")
+            else:
+                feishu_send(chat_id, "❌ Outlook 日历写入失败（API 返回空），请稍后重试。")
+        elif kind == "del_calendar":
+            ids, names = pay["ids"], pay["names"]
+            deleted = 0
+            for eid in ids:
+                try:
+                    if outlook_delete(eid):
+                        deleted += 1
+                except Exception:
+                    pass
+            feishu_send_action(chat_id, "✅ 已删除",
+                               f"删除了 {deleted} 个日历事件：\n" + "\n".join(names[:5]),
+                               color="green")
+        elif kind == "hw_to_calendar":
+            cmd_homework_to_calendar(chat_id, pay["text"], confirmed=True)
+        else:
+            feishu_send(chat_id, "⚠️ 未知的待确认操作，已放弃。")
+    except Exception as e:
+        feishu_send(chat_id, f"❌ 执行失败（未做任何修改）：{e}")
+    return True
+
+
+def cmd_add_calendar(chat_id, text, confirmed=False):
     """自由格式加日历：用户说「加日历 <标题> <日期> <开始时间> <结束时间>」
     例如：加日历 微积分 Practice quiz 1 - W4 截止 10-03 22:00 23:00
     智能解析标题/日期/时段 → 创建 Outlook 日历事件"""
@@ -2394,6 +2452,16 @@ def cmd_add_calendar(chat_id, text):
         return
     if end_dt <= start_dt:
         feishu_send(chat_id, "❌ 结束时间不能早于开始时间。")
+        return
+    # v28: 写操作确认门——先给用户预览，回复「确认」才写入
+    if not confirmed:
+        wd = ["周一", "周二", "周三", "周四", "周五", "周六", "周日"][start_dt.weekday()]
+        _pending_set(chat_id, "add_calendar",
+                     {"title": title_raw[:120], "start": start_dt.isoformat(), "end": end_dt.isoformat()})
+        feishu_send_action(chat_id, "📌 确认写入日历？",
+            f"📅 {title_raw[:60]}\n"
+            f"{date_str}（{wd}）{start_t}~{end_t}\n\n"
+            "回复「确认」即写入 Outlook；回复「取消」放弃。", color="blue")
         return
     # 创建 Outlook 事件
     try:
@@ -2658,6 +2726,14 @@ def process_command(text, chat_id):
                 break
         cmd_smart_delete(chat_id, rest)
     else:
+        # v28: 写操作确认/取消——仅明确的确认词才执行待定操作（弱确认词不触发，防误删）
+        if t in ("确认", "确定", "确认执行", "确认写入", "确认删除"):
+            if _exec_pending_confirm(chat_id):
+                return
+        if t in ("取消", "算了", "不弄了", "放弃", "不用了", "先不弄"):
+            if _PENDING_CONFIRM.pop(chat_id, None):
+                feishu_send(chat_id, "🗑️ 已取消，未做任何修改。")
+                return
         # 慢速路径：未匹配固定命令 → 大模型理解意图并直接执行
         reply, action = call_llm_chat(text, chat_id)
         if action:
@@ -3256,112 +3332,74 @@ SYSTEM_PROMPT = (
     "（即时报告 Cookie/AMS/房间三项健康）。因果链要讲清：西浦 Cookie 是根源凭证，eBridge 公告和网页查询直接依赖它，"
     "一过期立刻失效；签到/请假/订房用的是各自缓存的凭证，Cookie 断供后有滞后才失效；"
     "LM 作业提醒和 Outlook 日历不依赖 Cookie，永不受影响。\n"
+    "23. 写操作必须先确认，绝不擅自执行：加日历/删日历/作业写日历会先出确认卡，等用户明确回复「确认」才写入；"
+    "订房工具带 confirmed 参数，仅当用户明确说「确认/订吧/好」后才传 true；请假流程用户发证明照片才算最终确认。"
+    "用户表达不清或你理解不确定时，先复述你的理解并请用户确认，得到明确同意再执行。\n"
 )
 
 
 # ============ LLM Function Calling 工具 ============
 TOOLS_DEF = [
-    {
+{
         "type": "function",
         "function": {
-            "name": "check_room_availability",
-            "description": "查询图书馆（SIP校区）研讨室在指定日期的空闲情况（数据来自监控缓存，约每30分钟更新）。用户问'有没有空房'、'查房间'、'明天有什么研讨室'时调用。",
+            "name": "query_calendar",
+            "description": "查询用户 Outlook 日历日程。用户问今天/明天有什么安排、日程时调用。",
             "parameters": {
                 "type": "object",
                 "properties": {
-                    "date": {"type": "string", "description": "查询日期，格式 YYYY-MM-DD"},
+                    "days": {"type": "integer", "description": "查询未来天数，默认 3"},
                 },
-                "required": ["date"],
             },
         },
     },
     {
         "type": "function",
         "function": {
-            "name": "book_room",
-            "description": "预定图书馆研讨室。提交后由云端浏览器执行（约2-4分钟），结果会自动发消息给用户。仅在用户明确要求预定时调用；调用前建议先查空闲确认。研讨室要求至少2人：系统会自动带上用户设置的常用同伴；用户提到和某位同学一起订时，把同学的中文名或账号填入 partner 参数（中文名如'张伟'即可，系统自动转拼音搜索）。每次最长3小时、每天限1次、最多提前3天。",
+            "name": "request_leave",
+            "description": "帮用户发起请假申请（AMS 请假）。当用户明确表达想请假（如'明天上午请假去看牙医'、'下周三想请个假'）时调用。把用户的原话尽量完整地传给 text 参数，系统会自动解析日期和原因、生成假条并让用户确认；用户发送证明照片后才会真正提交，不会在未确认时误提交。",
             "parameters": {
                 "type": "object",
                 "properties": {
-                    "date": {"type": "string", "description": "预定日期 YYYY-MM-DD"},
-                    "start_time": {"type": "string", "description": "开始时间 HH:MM（如 14:00）"},
-                    "end_time": {"type": "string", "description": "结束时间 HH:MM"},
-                    "room": {"type": "string", "description": "房间号，如 '543'、'Room 543'、'1014'"},
-                    "memo": {"type": "string", "description": "用途备注，可选，如'小组讨论'"},
-                    "partner": {"type": "string", "description": "同伴的中文名（如'张伟'）或统一账号（如 TOM.SMITH25），可选；不填则用用户设置的常用同伴"},
-                    "partner_year": {"type": "string", "description": "同伴入学年后两位（如'24'、'25'、'26'），仅在知道同伴不是2026级时填写，可选"},
+                    "text": {"type": "string", "description": "用户关于请假的原始描述，尽量原样传入"},
                 },
-                "required": ["date", "start_time", "end_time", "room"],
+                "required": ["text"],
             },
         },
     },
     {
         "type": "function",
         "function": {
-            "name": "set_room_partner",
-            "description": "设置研讨室预定的常用同伴。研讨室要求每次预定至少2人，用户说出同伴名字时调用（如'以后订房都带上张伟'、'我的常用同伴是张伟'）。支持中文名（自动转拼音搜索）、拼音名、统一账号。提交后约2-4分钟自动搜索并回发确认结果。",
+            "name": "check_in",
+            "description": "AMS 远程签到。用户发来签到码（如'签到 123456'、'打卡'场景）时调用。注意：只有在用户明确提供签到码或要求签到时才调用。",
             "parameters": {
                 "type": "object",
                 "properties": {
-                    "name": {"type": "string", "description": "同伴中文名或统一账号，如'张伟'、'TOM.SMITH25'"},
-                    "year": {"type": "string", "description": "同伴入学年后两位，如'26'；默认26（大一同学），可选"},
-                    "action": {"type": "string", "description": "clear 时清除常用同伴；不填默认为设置", "enum": ["clear"]},
+                    "code": {"type": "string", "description": "签到码（数字或字符串）"},
                 },
-                "required": ["name"],
+                "required": ["code"],
             },
         },
     },
     {
         "type": "function",
         "function": {
-            "name": "list_my_room_bookings",
-            "description": "查看用户当前的研讨室预约列表（含序号、房间、时间、状态）。用户问'我的预约'、'我订了什么房'时调用。",
+            "name": "revoke_leave",
+            "description": "撤回已提交的请假申请。用户想撤销某天的请假时调用（如'把10月11号的假撤了''请假不用了'）。可先调 query_attendance 或直接调用；date 参数格式如 10-11 或 2026-10-11，不填则撤回全部待审批申请。",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "date": {"type": "string", "description": "要撤回的日期（可选），如 '10-11' 或 '2026-10-11'；不填表示全部"},
+                },
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "health_status",
+            "description": "管家健康体检：报告西浦 Cookie / AMS 凭证 / 房间系统三项状态及依赖关系。用户问管家是否正常、怀疑 Cookie 过期、或签到/请假/订房报凭证错误时调用。",
             "parameters": {"type": "object", "properties": {}},
-        },
-    },
-    {
-        "type": "function",
-        "function": {
-            "name": "cancel_room_booking",
-            "description": "取消用户的研讨室预约。提交后由云端浏览器执行（约2-4分钟），结果会自动发消息给用户。仅在用户明确要求取消时调用。",
-            "parameters": {
-                "type": "object",
-                "properties": {
-                    "index": {"type": "integer", "description": "要取消的预约序号（先调 list_my_room_bookings 获取）"},
-                },
-                "required": ["index"],
-            },
-        },
-    },
-    {
-        "type": "function",
-        "function": {
-            "name": "query_homework",
-            "description": "查询 LearningMall 近期作业/测验截止时间列表。用户问作业、DDL、截止时间时调用。",
-            "parameters": {"type": "object", "properties": {}},
-        },
-    },
-    {
-        "type": "function",
-        "function": {
-            "name": "query_attendance",
-            "description": "查询 AMS 考勤出勤率统计。用户问出勤、考勤、缺勤时调用。",
-            "parameters": {"type": "object", "properties": {}},
-        },
-    },
-    {
-        "type": "function",
-        "function": {
-            "name": "web_fetch",
-            "description": "用云端浏览器实地打开西浦网页（LM/eBridge），抓取正文并按问题回答。适合查课程页动态、论坛新帖、eBridge 页面等没有现成数据的页面。每次约 1-2 分钟，结果自动发到群里。仅支持 xjtlu.edu.cn / learningmall.cn。常用页面 id：MTH026课程=1148/考试页=1510；MTH028课程=1150/考试页=1513；EAP043=361、SCI004=1217、PSP004=1211、CCT007=782、CCT001=780、FYE=1421。LM 课程页 URL 形如 https://core.xjtlu.edu.cn/course/view.php?id=<id>；LM 首页 https://core.xjtlu.edu.cn/my/；eBridge 首页 https://ebridge.xjtlu.edu.cn。注意：作业/考试的截止时间用 query_homework 查（秒回），不要用本工具。",
-            "parameters": {
-                "type": "object",
-                "properties": {
-                    "url": {"type": "string", "description": "要打开的完整页面 URL"},
-                    "question": {"type": "string", "description": "想让页面回答的问题，如'最新的公告是什么'；不填则直接回贴正文"},
-                },
-                "required": ["url"],
-            },
         },
     },
 ]
@@ -3418,6 +3456,11 @@ def execute_tool(name, args_raw, chat_id):
                 return ("预定未提交：研讨室要求每次预定至少2人，而用户还没设置常用同伴。"
                         "请引导用户发送「设同伴 同学的中文名」（如 设同伴 张伟），"
                         "或让用户告知一起订房的同学名字后，把名字填进 partner 参数重试。")
+            # v28: 确认门——用户明确说「确认/订吧/好」前绝不派发
+            if not args.get("confirmed"):
+                return (f"📌 请先向用户确认预订信息：\n"
+                        f"· 房间 {room_key}\n· {date} {start}-{end}\n· 同伴：{partner}\n"
+                        f"用户明确回复「确认」后，再用相同参数重调本工具并把 confirmed 设为 true。")
             ok = _trigger_room_op({"action": "book", "date": date, "start": start,
                                    "end": end, "room": room_key, "memo": memo,
                                    "partner": partner, "years": years})
@@ -3506,6 +3549,26 @@ def execute_tool(name, args_raw, chat_id):
                 return ("已派云端浏览器去查「" + (question or url[:40]) + "」，约 1-2 分钟后结果会直接发到群里。"
                         "请立刻这样告知用户，不要等待或编造结果。")
             return "查询调度失败（GitHub API 异常），请稍后再试。"
+        # v28: 自然语言直达固定命令（请假/签到/撤回/体检）
+        if name == "request_leave":
+            text = str(args.get("text") or "").strip()
+            if not text:
+                return "缺少参数：text（用户的请假原话）。"
+            cmd_leave(chat_id, text)
+            return "已调用请假流程（结果/后续步骤会直接发给用户）。"
+        if name == "check_in":
+            code = str(args.get("code") or "").strip()
+            if not code:
+                return "缺少参数：code（签到码）。"
+            cmd_checkin(chat_id, code)
+            return "已调用签到流程（结果会直接发给用户）。"
+        if name == "revoke_leave":
+            arg = str(args.get("date") or "").strip()
+            cmd_leave_revoke(chat_id, arg)
+            return "已调用撤回流程（结果会直接发给用户）。"
+        if name == "health_status":
+            cmd_status(chat_id)
+            return "体检报告已生成并发送给用户。"
         return f"未知工具: {name}"
     except Exception as e:
         log(f"❌ 工具执行异常 {name}: {e}")
