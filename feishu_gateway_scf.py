@@ -436,6 +436,159 @@ def _daily_brief(chat_id=CHAT_ID_FALLBACK):
     log(f"☀️ 已发每日早报")
 
 
+# ============ v35: 晚安提醒 ============
+_GOODNIGHT_DATE = ""
+
+def _goodnight_brief(chat_id=CHAT_ID_FALLBACK):
+    """v35: 每天晚上 10 点发一条晚安提醒——明天课程 + 未交作业 + 待办提醒
+    帮你收尾今天、预备明天"""
+    global _GOODNIGHT_DATE
+    now = datetime.now()
+    if now.hour != 22:
+        return
+    today = now.strftime("%Y-%m-%d")
+    if _GOODNIGHT_DATE == today:
+        return
+    _GOODNIGHT_DATE = today
+    weekdays = ["周一", "周二", "周三", "周四", "周五", "周六", "周日"]
+    tomorrow = now + timedelta(days=1)
+    tm_wd = weekdays[tomorrow.weekday()]
+    lines = [f"🌙 晚安冠呈，今天辛苦了", ""]
+
+    # 1. 明天的课程
+    try:
+        events = outlook_events()
+        tm_str = tomorrow.strftime("%Y-%m-%d")
+        tm_events = [e for e in events if (e.get("Start", {}).get("DateTime", "") or "")[:10] == tm_str]
+        if tm_events:
+            lines.append(f"📅 明天（{tm_wd}）{len(tm_events)} 节课/日程：")
+            for ev in sorted(tm_events, key=lambda e: e.get("Start", {}).get("DateTime", "")):
+                t = (ev.get("Start", {}).get("DateTime", "") or "")[11:16]
+                lines.append(f"  · {t} {ev.get('Subject', '')[:30]}")
+        else:
+            lines.append(f"📅 明天（{tm_wd}）没有课")
+    except Exception:
+        lines.append("📅 日历查询失败")
+
+    # 2. 明天/近期截止的作业
+    try:
+        lm_events = fetch_lm_assignments(days_ahead=3)
+        urgent = [ev for ev in lm_events if ev.get("dt") and ev["dt"].date() <= tomorrow.date()]
+        if urgent:
+            lines.append("📚 临近 DDL：")
+            for ev in urgent[:5]:
+                exam_tag = " ⚠️机房考试" if "Exam Page" in (ev.get("categories") or "") else ""
+                lines.append(f"  · {ev['summary'][:35]} {ev.get('countdown', '')}{exam_tag}")
+    except Exception:
+        pass
+
+    # 3. 待办提醒
+    try:
+        reminders = _load_reminders()
+        if reminders:
+            lines.append("📦 你的提醒：")
+            for r in sorted(reminders, key=lambda x: x.get("time", "")):
+                lines.append(f"  · {r.get('time', '?')} {r.get('event', '?')[:25]}")
+    except Exception:
+        pass
+
+    feishu_send_action(chat_id, "🌙 晚安提醒", "\n".join(lines), color="blue")
+    log("🌙 已发晚安提醒")
+
+
+# ============ v35: 周日复盘 ============
+_WEEKLY_REVIEW_DATE = ""
+
+def _weekly_review(chat_id=CHAT_ID_FALLBACK):
+    """v35: 每周日晚上 8 点发本周回顾 + 下周预告
+    本周：作业完成情况、出勤、请假
+    下周：课程安排、DDL、考试"""
+    global _WEEKLY_REVIEW_DATE
+    now = datetime.now()
+    # 只在周日 20:00 触发
+    if now.weekday() != 6 or now.hour != 20:
+        return
+    week_key = now.strftime("%Y-W%W")
+    if _WEEKLY_REVIEW_DATE == week_key:
+        return
+    _WEEKLY_REVIEW_DATE = week_key
+    weekdays = ["周一", "周二", "周三", "周四", "周五", "周六", "周日"]
+    lines = [f"📊 本周复盘（{(now - timedelta(days=now.weekday())).strftime('%m月%d日')} - {now.strftime('%m月%d日')}）", ""]
+
+    # 1. 出勤回顾
+    try:
+        state, _ = gh_read_json("xjtlu_state.json")
+        att = (state or {}).get("ams", {}).get("attendance") or {}
+        if att.get("overall") is not None:
+            modules = att.get("modules") or {}
+            abs_count = sum(m.get("absences", 0) for m in modules.values())
+            if abs_count == 0:
+                lines.append(f"✅ 本周全勤（{len(modules)} 门课无缺勤）")
+            else:
+                flagged = {c: m for c, m in modules.items() if m.get("absences", 0) > 0}
+                lines.append(f"⚠️ 本周有 {abs_count} 节缺勤")
+                for c, m in flagged.items():
+                    lines.append(f"  · {c} 缺勤 {m.get('absences', 0)} 次")
+        else:
+            lines.append("✅ 出勤数据待同步")
+    except Exception:
+        lines.append("✅ 出勤数据待同步")
+
+    # 2. 请假记录
+    try:
+        leave_state, _ = gh_read_json("leave_status.json")
+        leaves = leave_state.get("records", []) if leave_state else []
+        week_leaves = [r for r in leaves if r.get("date", "") >= (now - timedelta(days=7)).strftime("%Y-%m-%d")]
+        if week_leaves:
+            lines.append(f"🏫 本周请假 {len(week_leaves)} 次")
+        else:
+            lines.append("🏫 本周无请假")
+    except Exception:
+        lines.append("🏫 请假数据待同步")
+
+    # 3. 本周作业完成情况
+    try:
+        lm_events = fetch_lm_assignments(days_ahead=14)
+        past = [ev for ev in lm_events if ev.get("dt") and ev["dt"] < now and ev["dt"] > now - timedelta(days=7)]
+        future = [ev for ev in lm_events if ev.get("dt") and ev["dt"] >= now]
+        lines.append(f"📚 本周处理了 {len(past)} 个作业/测验，剩余 {len(future)} 个未到 DDL")
+    except Exception:
+        lines.append("📚 作业数据待同步")
+
+    # 4. 下周预告
+    lines.append("")
+    lines.append("📋 下周安排：")
+    next_week = now + timedelta(days=1)
+    next_week_end = now + timedelta(days=7)
+    # 课程
+    try:
+        events = outlook_events()
+        nw_events = [e for e in events
+                     if next_week.strftime("%Y-%m-%d") <= (e.get("Start", {}).get("DateTime", "") or "")[:10] <= next_week_end.strftime("%Y-%m-%d")]
+        if nw_events:
+            lines.append(f"📅 {len(nw_events)} 节课/日程")
+        else:
+            lines.append("📅 下周暂无日程")
+    except Exception:
+        lines.append("📅 日历查询失败")
+    # DDL 和考试
+    try:
+        lm_events = fetch_lm_assignments(days_ahead=7)
+        if lm_events:
+            exams = [ev for ev in lm_events if "Exam Page" in (ev.get("categories") or "")]
+            if exams:
+                lines.append(f"⏰ {len(exams)} 个考试/Quiz")
+            if len(lm_events) > len(exams):
+                lines.append(f"📚 {len(lm_events) - len(exams)} 个作业 DDL")
+        else:
+            lines.append("📚 下周无 DDL")
+    except Exception:
+        lines.append("📚 作业查询失败")
+
+    feishu_send_action(chat_id, "📊 每周复盘", "\n".join(lines), color="green")
+    log("📊 已发每周复盘")
+
+
 # ============ v34: 考试倒计时提醒 ============
 _EXAM_REMINDER_DATES = set()  # 内存级：已发过的 (exam_key, advance_days) 组合
 
@@ -4353,6 +4506,10 @@ def poll_group_messages():
     _exam_countdown_remind(CHAT_ID_FALLBACK)
     # v34: 备忘提醒——检查到期的提醒
     _check_reminders(CHAT_ID_FALLBACK)
+    # v35: 晚安提醒（每晚 22:00）
+    _goodnight_brief(CHAT_ID_FALLBACK)
+    # v35: 周日复盘（每周日 20:00）
+    _weekly_review(CHAT_ID_FALLBACK)
     # v32: GitHub Actions 保活心跳——每 10 分钟主动触发一次 butler + monitor
     # 原因：GitHub Actions schedule 停摆后不会自动恢复（token 失效期间停了就停了）
     # 管家每分钟轮询，每 10 分钟检查一次，距上次超过 10 分钟就主动 dispatch
