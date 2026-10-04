@@ -2340,11 +2340,25 @@ def run():
             # 已知事件入库，防止下次登录成功后重复推送全量
             if lm_events:
                 state["lm_events"] = {ev["uid"]: 1 for ev in lm_events}
-            if fails <= 3 and last_fail_day != today:
-                if XJTLU_USERNAME and XJTLU_PASSWORD:
-                    msgs.append("⚠️ 西浦网站登录失败\n\nCookie 已过期，系统已自动尝试账密登录但未成功。\n\n刷新方法：跑 export_cookies.py 导出新 Cookie，以「cookie」开头直接粘贴到本群，管家自动入库验证；或让星辰直接抓取。\n\n为避免打扰，今日不再提醒。")
+            # v27: 前 3 次连败每天提醒 1 条；之后每 3 天补 1 条心跳，防止用户漏看后系统长期哑掉
+            should_notify = False
+            if last_fail_day != today:
+                if fails <= 3:
+                    should_notify = True
                 else:
-                    msgs.append("⚠️ 西浦网站登录失败\n\nCookie 已过期，且未配置账密自动登录。\n\n刷新方法：跑 export_cookies.py 导出新 Cookie，以「cookie」开头直接粘贴到本群，管家自动入库验证；或让星辰直接抓取。\n\n为避免打扰，今日不再提醒。")
+                    try:
+                        last_dt = datetime.strptime(last_fail_day, "%Y-%m-%d")
+                        should_notify = (datetime.now() - last_dt).days >= 3
+                    except Exception:
+                        should_notify = True
+            if should_notify:
+                if fails <= 3:
+                    if XJTLU_USERNAME and XJTLU_PASSWORD:
+                        msgs.append("⚠️ 西浦网站登录失败\n\nCookie 已过期，系统已自动尝试账密登录但未成功。\n\n刷新方法：跑 export_cookies.py 导出新 Cookie，以「cookie」开头直接粘贴到本群，管家自动入库验证；或找星辰直接抓。\n\n为避免打扰，今日不再提醒。")
+                    else:
+                        msgs.append("⚠️ 西浦网站登录失败\n\nCookie 已过期，且未配置账密自动登录。\n\n刷新方法：跑 export_cookies.py 导出新 Cookie，以「cookie」开头直接粘贴到本群，管家自动入库验证；或找星辰直接抓。\n\n为避免打扰，今日不再提醒。")
+                else:
+                    msgs.append(f"💔 西浦监控仍未恢复（已连败 {fails} 次）\n\nCookie 已过期。刷新方法：跑 export_cookies.py 导出，以「cookie」开头粘到群里；或找星辰直接抓。\n（为避免打扰，每 3 天提醒一次）")
                 state["last_fail_notify"] = today
             if msgs:
                 feishu_send("\n\n".join(msgs))
