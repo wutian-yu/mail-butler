@@ -283,6 +283,38 @@ def _gh_token_revoked_notify(chat_id=CHAT_ID_FALLBACK):
     log(f"⚠️ GitHub token 被撤销，已发飞书通知")
 
 
+# ============ v37.7: 定时推送通用持久化去重 ============
+# 问题：早报/晚安/周复盘/下雨的"已发"记录只存在内存变量里，SCF 容器回收即清空，
+# 周日20点窗口内容器重启几次就发几次周复盘（用户实测：20:39/20:40/20:46 连发3次）。
+# 改为持久化到 butler-data/scheduled_sent.json，容器重启也不重发。
+SCHEDULE_SENT_FILE = "scheduled_sent.json"
+_sched_cache = None  # 内存缓存，避免每分钟打 GitHub API
+
+def _load_sched():
+    global _sched_cache
+    if _sched_cache is not None:
+        return _sched_cache
+    try:
+        data, _ = gh_read_json(SCHEDULE_SENT_FILE)
+        _sched_cache = set(data.get("sent", []))
+    except Exception:
+        _sched_cache = set()
+    return _sched_cache
+
+def _sched_should_send(key):
+    """持久化去重：key 已发过返回 False；未发过立即标记并返回 True"""
+    s = _load_sched()
+    if key in s:
+        return False
+    s.add(key)
+    _sched_cache = s
+    try:
+        gh_write_json(SCHEDULE_SENT_FILE, {"sent": list(s)}, "", "sched mark: " + key)
+    except Exception as e:
+        log(f"⚠️ scheduled_sent 保存失败: {e}")
+    return True
+
+
 # ============ 天气查询 (wttr.in 免费 API，无需 key) ============
 _RAIN_REMINDER_DATE = ""  # 内存级：今日是否已发过带伞提醒（格式 YYYY-MM-DD）
 
@@ -329,7 +361,7 @@ def _fetch_weather_text(city="苏州", days=1):
 
 def _check_rain_and_remind(chat_id=CHAT_ID_FALLBACK):
     """v32: 每天早上 8 点发苏州天气——下雨提醒带伞，不下雨就不发
-    （内存级去重：同一 SCF 实例内当天只发一次；实例重启后重置，最多多发一次，可接受）
+    v37.7: 改为持久化去重（scheduled_sent.json），容器重启不重发
     触发窗口 8:00-8:59，覆盖 SCF 每分钟轮询节奏）"""
     global _RAIN_REMINDER_DATE
     now = datetime.now()
@@ -338,8 +370,10 @@ def _check_rain_and_remind(chat_id=CHAT_ID_FALLBACK):
     # 只在 8 点窗口检查
     if hour != 8:
         return
-    if _RAIN_REMINDER_DATE == today:
+    if not _sched_should_send(f"rain:{today}"):
+        _RAIN_REMINDER_DATE = today
         return  # 今天已发过
+    _RAIN_REMINDER_DATE = today
     try:
         data = _fetch_weather_raw("苏州", 1)
         today_w = (data.get("weather") or [{}])[0]
@@ -364,10 +398,8 @@ def _check_rain_and_remind(chat_id=CHAT_ID_FALLBACK):
                 color="blue")
             log(f"🌧️ 已发带伞提醒（今日最大降雨概率 {max_rain}%）")
         # 不下雨就不发——用户只要下雨提醒
-        _RAIN_REMINDER_DATE = today
     except Exception as e:
         log(f"天气检查失败: {str(e)[:60]}")
-        _RAIN_REMINDER_DATE = today  # 失败也标记，避免每分钟重试
 
 
 # ============ v34: 每日早报 ============
@@ -375,15 +407,16 @@ _DAILY_BRIEF_DATE = ""  # 内存级：今日早报是否已发
 
 def _daily_brief(chat_id=CHAT_ID_FALLBACK):
     """v34: 每天早上 8 点发一条综合早报——天气 + 课程 + 作业 + 出勤
+    v37.7: 持久化去重，当天只发一次（容器重启不重发）
     与下雨提醒合并：如果下雨提醒已发，早报里就不再重复天气卡，而是在早报里提带伞"""
     global _DAILY_BRIEF_DATE, _RAIN_REMINDER_DATE
     now = datetime.now()
     if now.hour != 8:
         return
     today = now.strftime("%Y-%m-%d")
-    if _DAILY_BRIEF_DATE == today:
+    if not _sched_should_send(f"daily:{today}"):
         return
-    _DAILY_BRIEF_DATE = today  # 标记
+    _DAILY_BRIEF_DATE = today  # 标记（内存，防同实例重复）
     weekdays = ["周一", "周二", "周三", "周四", "周五", "周六", "周日"]
     wd = weekdays[now.weekday()]
     lines = [f"☀️ 早安冠呈，今天 {now.strftime('%m月%d日')} {wd}", ""]
@@ -459,13 +492,14 @@ _GOODNIGHT_DATE = ""
 
 def _goodnight_brief(chat_id=CHAT_ID_FALLBACK):
     """v35: 每天晚上 10 点发一条晚安提醒——明天课程 + 未交作业 + 待办提醒
+    v37.7: 持久化去重，当天只发一次
     帮你收尾今天、预备明天"""
     global _GOODNIGHT_DATE
     now = datetime.now()
     if now.hour != 22:
         return
     today = now.strftime("%Y-%m-%d")
-    if _GOODNIGHT_DATE == today:
+    if not _sched_should_send(f"goodnight:{today}"):
         return
     _GOODNIGHT_DATE = today
     weekdays = ["周一", "周二", "周三", "周四", "周五", "周六", "周日"]
@@ -519,6 +553,7 @@ _WEEKLY_REVIEW_DATE = ""
 
 def _weekly_review(chat_id=CHAT_ID_FALLBACK):
     """v35: 每周日晚上 8 点发本周回顾 + 下周预告
+    v37.7: 持久化去重，每周只发一次（容器重启不重发——用户实测一次窗口连发3次）
     本周：作业完成情况、出勤、请假
     下周：课程安排、DDL、考试"""
     global _WEEKLY_REVIEW_DATE
@@ -527,7 +562,7 @@ def _weekly_review(chat_id=CHAT_ID_FALLBACK):
     if now.weekday() != 6 or now.hour != 20:
         return
     week_key = now.strftime("%Y-W%W")
-    if _WEEKLY_REVIEW_DATE == week_key:
+    if not _sched_should_send(f"weekly:{week_key}"):
         return
     _WEEKLY_REVIEW_DATE = week_key
     weekdays = ["周一", "周二", "周三", "周四", "周五", "周六", "周日"]
