@@ -1642,7 +1642,7 @@ def _room_probe_accid(page, captured):
 
 
 def _room_open_room_ctx(browser, main_context, captured_hook=None):
-    """开房间系统 context 并走完登录链；返回 (ctx, page) 或 (None, None)"""
+    """开房间系统 context 并走完登录链；返回 (ctx, page, room_menu) 或 (None, None, None)"""
     ctx = browser.new_context(locale="zh-CN")  # 桌面 UA：IC 是 PC 系统
     try:
         ctx.add_cookies(main_context.cookies())
@@ -1658,8 +1658,8 @@ def _room_open_room_ctx(browser, main_context, captured_hook=None):
         if j.get("code") != 0:
             log(f"❌ 房间系统 API 未登录: {str(j.get('message'))[:60]}")
             ctx.close()
-            return None, None
-        return ctx, page
+            return None, None, None
+        return ctx, page, j.get("data")
     except Exception as e:
         log(f"⚠️ 房间系统 context 异常: {e}")
         try:
@@ -1690,7 +1690,7 @@ def fetch_roombookings_session(browser, main_context, with_cache=True):
         except Exception:
             pass
 
-    ctx, page = _room_open_room_ctx(browser, main_context, _capture)
+    ctx, page, room_menu = _room_open_room_ctx(browser, main_context, _capture)
     if not page:
         return None
     try:
@@ -1715,6 +1715,9 @@ def fetch_roombookings_session(browser, main_context, with_cache=True):
             "name": user_name or "",
             "updated": _bjnow().isoformat(timespec="seconds"),
         }
+        if room_menu is not None:
+            session["menu"] = room_menu
+            log(f"📋 roomMenu 全量楼区: {json.dumps(room_menu, ensure_ascii=False, default=str)[:400]}")
         if with_cache:
             # 可用性缓存：今天 + 未来 3 天（预定窗口）
             avail = {}
@@ -2280,7 +2283,7 @@ def run_room_op(op_json):
             if not logged_in:
                 feishu_send("❌ 房间操作失败：西浦账号登录未成功，请稍后重试。")
                 return
-            ctx2, page2 = _room_open_room_ctx(browser, context, _capture)
+            ctx2, page2, _rmenu = _room_open_room_ctx(browser, context, _capture)
             if not page2:
                 feishu_send("❌ 房间系统登录未成功，请稍后重试。")
                 return
