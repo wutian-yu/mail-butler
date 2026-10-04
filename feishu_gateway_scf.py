@@ -352,6 +352,45 @@ def _check_rain_and_remind(chat_id=CHAT_ID_FALLBACK):
         _RAIN_REMINDER_DATE = today  # 失败也标记，避免每分钟重试
 
 
+# v32: GitHub Actions 保活心跳
+# 内存级时间戳：距上次触发超过间隔才再触发（SCF 实例重启后重置，最多多发一次，可接受）
+_KEEPALIVE_LAST = {"butler": 0, "monitor": 0}
+_KEPT_ALIVE_DATE = ""  # 每天第一次保活时发一条状态到群里（可选）
+
+def _gh_actions_keepalive(chat_id=CHAT_ID_FALLBACK):
+    """v32: GitHub Actions schedule 停摆后不会自动恢复——管家主动保活
+    每 10 分钟触发一次 butler（邮件处理）和 monitor（西浦监控），替代 GitHub cron"""
+    if not GH_TOKEN:
+        return
+    if _GH_TOKEN_STATUS == "revoked":
+        return  # token 挂了不浪费请求
+    now = time.time()
+    interval = 600  # 10 分钟
+    # butler 保活（邮件处理，原 schedule 每 5 分钟）
+    if now - _KEEPALIVE_LAST["butler"] >= interval:
+        _KEEPALIVE_LAST["butler"] = now
+        try:
+            req = urllib.request.Request(
+                f"https://api.github.com/repos/{REPO}/actions/workflows/butler.yml/dispatches",
+                data=json.dumps({"ref": "main"}).encode(), method="POST",
+                headers={"Authorization": f"Bearer {GH_TOKEN}",
+                         "Accept": "application/vnd.github+json",
+                         "Content-Type": "application/json"})
+            urllib.request.urlopen(req, timeout=8)
+            log("🔄 butler 保活触发成功")
+        except urllib.error.HTTPError as e:
+            if e.code == 401:
+                _gh_check_token()
+                _gh_token_revoked_notify()
+            log(f"⚠️ butler 保活失败 (HTTP {e.code})")
+        except Exception as e:
+            log(f"⚠️ butler 保活失败: {str(e)[:60]}")
+    # monitor 保活（西浦监控，原 schedule 每 30 分钟）
+    if now - _KEEPALIVE_LAST["monitor"] >= 1800:
+        _KEEPALIVE_LAST["monitor"] = now
+        trigger_monitor_refresh()
+
+
 def trigger_github():
     """触发 GitHub Actions 重新生成 ICS"""
     if not GH_TOKEN:
@@ -4004,6 +4043,10 @@ def poll_group_messages():
     _check_leave_approval(CHAT_ID_FALLBACK)
     # v31: 每日下雨提醒（7-9点窗口，每天最多发一次）
     _check_rain_and_remind(CHAT_ID_FALLBACK)
+    # v32: GitHub Actions 保活心跳——每 10 分钟主动触发一次 butler + monitor
+    # 原因：GitHub Actions schedule 停摆后不会自动恢复（token 失效期间停了就停了）
+    # 管家每分钟轮询，每 10 分钟检查一次，距上次超过 10 分钟就主动 dispatch
+    _gh_actions_keepalive()
     try:
         processed_ids, last_msg_id = _load_poll_state()
         token = get_feishu_token()
