@@ -608,14 +608,43 @@ def _weekly_review(chat_id=CHAT_ID_FALLBACK):
 
 
 # ============ v34: 考试倒计时提醒 ============
-_EXAM_REMINDER_DATES = set()  # 内存级：已发过的 (exam_key, advance_days) 组合
+# v37.2 修复：持久化到 butler-data，防止 SCF 容器回收后重复发送
+_EXAM_REMINDER_FILE = "exam_reminders_sent.json"
+_exam_reminder_cache = None  # 内存缓存，避免每分钟打 GitHub API
+
+def _load_exam_sent():
+    """从 butler-data 加载已发过的考试提醒 key 列表（带内存缓存）"""
+    global _exam_reminder_cache
+    if _exam_reminder_cache is not None:
+        return _exam_reminder_cache
+    try:
+        data, _ = gh_read_json(_EXAM_REMINDER_FILE)
+        _exam_reminder_cache = set(data.get("sent", []))
+    except Exception:
+        _exam_reminder_cache = set()
+    return _exam_reminder_cache
+
+def _save_exam_sent(sent_set):
+    """保存已发提醒 key 到 butler-data"""
+    global _exam_reminder_cache
+    _exam_reminder_cache = sent_set
+    try:
+        # 过滤掉已过去的考试（key 含日期，格式 examkey_YYYYMMDD_advance）
+        today_str = datetime.now().strftime("%Y%m%d")
+        cleaned = [k for k in sent_set if k.split("_")[-2] >= today_str]
+        gh_write_json(_EXAM_REMINDER_FILE, {"sent": cleaned}, "", "update exam reminders sent")
+    except Exception as e:
+        log(f"⚠️ exam_reminder 保存失败: {e}")
 
 def _exam_countdown_remind(chat_id=CHAT_ID_FALLBACK):
     """v34: 从 LM 作业数据中识别 Exam 类型测验，提前 7/3/1 天提醒
+    v37.2: 持久化去重，防止容器回收后重复发送
     Exam Page 类型的 quiz 是正式机房考试，必须提醒"""
     try:
+        sent = _load_exam_sent()
         lm_events = fetch_lm_assignments(days_ahead=14)
         now = datetime.now()
+        changed = False
         for ev in lm_events:
             cats = ev.get("categories") or ""
             if "Exam Page" not in cats:
@@ -627,9 +656,10 @@ def _exam_countdown_remind(chat_id=CHAT_ID_FALLBACK):
             for advance in (7, 3, 1):
                 if day_gap == advance:
                     key = f"{ev['summary'][:20]}_{dt.strftime('%Y%m%d')}_{advance}"
-                    if key in _EXAM_REMINDER_DATES:
+                    if key in sent:
                         continue
-                    _EXAM_REMINDER_DATES.add(key)
+                    sent.add(key)
+                    changed = True
                     when = "后天" if advance == 2 else "明天" if advance == 1 else f"{advance}天后"
                     feishu_send_action(chat_id, "⏰ 考试倒计时提醒",
                         f"⚠️ {ev['summary'][:40]}\n"
@@ -638,6 +668,8 @@ def _exam_countdown_remind(chat_id=CHAT_ID_FALLBACK):
                         f"具体场次和房间请到 LearningMall 查 schedule PDF 确认。",
                         color="orange")
                     log(f"⏰ 考试倒计时提醒: {ev['summary'][:20]} 还剩 {advance} 天")
+        if changed:
+            _save_exam_sent(sent)
     except Exception as e:
         log(f"考试倒计时检查失败: {str(e)[:60]}")
 
