@@ -863,7 +863,9 @@ def cmd_checkin(chat_id, code):
         hint = ""
         if _ams_token_dead(resp):
             hint = ("\n\n⏳ 已触发监控立刻刷新凭证（约 2~4 分钟），稍等后重试即可。"
-                    if trigger_monitor_refresh() else "\n\n💡 x-token 已过期且刷新失败，请检查监控 Actions。")
+                    if trigger_monitor_refresh() else
+                    "\n\n⚠️ x-token 已过期且刷新失败——根因多半是西浦 Cookie 过期（它负责给签到凭证续命）。"
+                    "发「状态」可确认，发「cookie <JSON>」刷新。")
         else:
             hint = "\n\n💡 x-token 可能已过期，等监控下次运行自动刷新后再试。" \
                if (rc in (401, 403) or "token" in str(msg).lower()) else ""
@@ -1299,13 +1301,14 @@ def cmd_leave(chat_id, text):
     except Exception as e:
         feishu_send(chat_id, f"❌ 查询课节失败：{e}")
         return
-    if _ams_token_dead(resp):
-        if trigger_monitor_refresh():
-            feishu_send(chat_id, "⏳ AMS 凭证刚好过期，我已触发监控立刻刷新（约 2~4 分钟）\n\n"
-                                 "稍等几分钟后重说一遍「请假 日期 原因」即可，假条不会丢。")
-        else:
-            feishu_send(chat_id, "❌ AMS 凭证过期且自动刷新失败，请检查监控 Actions 是否正常。")
-        return
+        if _ams_token_dead(resp):
+            if trigger_monitor_refresh():
+                feishu_send(chat_id, "⏳ AMS 凭证刚好过期，我已触发监控立刻刷新（约 2~4 分钟）\n\n"
+                                     "稍等几分钟后重说一遍「请假 日期 原因」即可，假条不会丢。")
+            else:
+                feishu_send(chat_id, "❌ AMS 凭证过期且自动刷新失败——根因多半是西浦 Cookie 过期（它负责给请假凭证续命）。\n\n"
+                                     "发「状态」可确认，发「cookie <JSON>」刷新后再来请假。")
+            return
     if not isinstance(resp, dict) or resp.get("code") != 0 or not resp.get("data"):
         feishu_send(chat_id, "📭 该日期没有可请假的课节（可能没课或超出范围）。")
         return
@@ -2409,6 +2412,71 @@ def cmd_add_calendar(chat_id, text):
         feishu_send(chat_id, "❌ Outlook 日历写入失败（API 返回空），请稍后重试。")
 
 
+def cmd_status(chat_id):
+    """v27: 管家体检报告——西浦 Cookie / AMS / 房间 session 健康状况 + 依赖关系 + 根因结论"""
+    state = None
+    try:
+        state, _ = gh_read_json("xjtlu_state.json")
+    except Exception:
+        pass
+    lines = ["🩺 **管家体检报告**", ""]
+    # 1) 西浦 Cookie（根源凭证，以监控 30 分钟一验的结果为准）
+    fails = (state or {}).get("consecutive_fails", 0) or 0
+    last_check = str((state or {}).get("last_check") or "")
+    cookie_ok = fails == 0 and bool(last_check)
+    if cookie_ok:
+        try:
+            lc = datetime.fromisoformat(last_check)
+            mins = int((datetime.now() - lc).total_seconds() // 60)
+            age = (f"{mins} 分钟前" if mins < 90 else
+                   (f"{mins // 60} 小时前" if mins < 2880 else f"{mins // 1440} 天前"))
+        except Exception:
+            age = last_check[:16] or "时间未知"
+        lines.append(f"· **西浦 Cookie**（根源凭证，监控 30 分钟一验）：✅ 健康（{age}验证过）")
+    else:
+        lines.append(f"· **西浦 Cookie**（根源凭证）：❌ 已连败 {fails} 次"
+                     f"（最后成功：{last_check[:16] or '未知'}）")
+    # 2) AMS 凭证（签到/请假用；依赖 Cookie 续命，有滞后）
+    ams_token = ((state or {}).get("ams") or {}).get("token") or ""
+    ams_live = None
+    if ams_token:
+        try:
+            resp = _http(f"{AMS_URL}/xjtlu/stuapi/xjtlu-leave/getLeaveList?pageNum=1&pageSize=1",
+                         headers={"x-token": ams_token}, timeout=12)
+            ams_live = (not _ams_token_dead(resp)) and resp.get("code") == 0
+        except Exception:
+            ams_live = False
+    if ams_live is True:
+        lines.append("· **AMS 凭证**（签到/请假；靠 Cookie 续命）：✅ 刚实测有效")
+    elif ams_live is False:
+        lines.append("· **AMS 凭证**（签到/请假）：❌ 刚实测已失效"
+                     + ("（根因：Cookie 过期，续不上命）" if not cookie_ok else "（Cookie 还活着，监控稍后会自动刷新）"))
+    else:
+        lines.append("· **AMS 凭证**（签到/请假）：⚠️ 暂无 token，等监控下一轮写入")
+    # 3) 房间系统（订房用；依赖 Cookie 续命，有滞后）
+    room = (state or {}).get("room") or {}
+    if room.get("cookies"):
+        upd = str(room.get("updated") or "")[:16].replace("T", " ")
+        lines.append(f"· **房间系统**（订房；靠 Cookie 续命）：✅ session 在（{upd}更新）")
+    else:
+        lines.append("· **房间系统**（订房）：⚠️ 无 session，等监控下一轮写入")
+    # 4) 不受 Cookie 影响的部分
+    lines.append("· **LM 作业提醒 / Outlook 日历 / 邮件**：不依赖 Cookie，常年在岗")
+    # 结论
+    if cookie_ok and ams_live:
+        lines += ["", "—— ✅ 全部正常 ——"]
+    elif not cookie_ok:
+        lines += ["", "—— ⚠️ 根因：西浦 Cookie 已失效 ——",
+                  "刷新方法：跑 export_cookies.py 导出 JSON，以「cookie」开头粘进来；或找星辰直接抓。",
+                  "刷新后：eBridge 公告、网页查询立即恢复；签到/请假/订房等监控跑一轮后恢复。"]
+    else:
+        lines += ["", "—— ⚠️ Cookie 正常但 AMS 凭证异常，已触发监控刷新 ——",
+                  "2-4 分钟后再发一次「状态」复查。"]
+        trigger_monitor_refresh()
+    feishu_send_action(chat_id, "🩺 管家体检报告", "\n".join(lines),
+                       color="green" if (cookie_ok and ams_live) else "red")
+
+
 def cmd_cookie(chat_id, text):
     """v25: 接收用户粘贴的新 Cookie JSON → 校验 → 写 butler-data/xjtlu_cookies.json → 触发监控验证
 
@@ -2471,6 +2539,10 @@ def process_command(text, chat_id):
     # 请假流程（优先级高，避免「请假」被其他规则吞掉）
     if text.strip().startswith("请假") or t.startswith("请个假") or t.startswith("申请请假"):
         cmd_leave(chat_id, text)
+        return
+    # v27: 体检固定命令
+    if t.startswith(("状态", "体检", "健康自检")) or "管家身体" in t or "管家还活着" in t:
+        cmd_status(chat_id)
         return
     # v25: Cookie 刷新固定命令——「cookie <JSON>」
     if t.startswith("cookie"):
@@ -3180,6 +3252,10 @@ SYSTEM_PROMPT = (
     "21. 你有 web_fetch 工具：用户要查 LM/eBridge 上的具体页面（课程页新帖、论坛、考试页、成绩页等）时用它，"
     "云端浏览器会实地打开抓取，1-2 分钟后自动把结果发到群里；你要先告知用户稍等。"
     "作业/考试截止时间优先 query_homework（秒回）。Cookie 失效时结果会提示刷新，引导用户发「cookie <JSON>」或找星辰。\n"
+    "22. 「状态」是固定体检命令：用户怀疑 Cookie 过期、问管家是否正常、或签到/请假/订房报凭证错误时，引导发「状态」"
+    "（即时报告 Cookie/AMS/房间三项健康）。因果链要讲清：西浦 Cookie 是根源凭证，eBridge 公告和网页查询直接依赖它，"
+    "一过期立刻失效；签到/请假/订房用的是各自缓存的凭证，Cookie 断供后有滞后才失效；"
+    "LM 作业提醒和 Outlook 日历不依赖 Cookie，永不受影响。\n"
 )
 
 
