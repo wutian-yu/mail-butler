@@ -920,6 +920,33 @@ def outlook_create_event(subject, start_dt, end_dt, body=""):
     return resp.get("Id") if resp else None
 
 
+def outlook_send_mail(to_recipients, subject, body_text, cc_recipients=None):
+    """v36: 通过 Outlook API 发邮件（以学生邮箱身份发送）
+    to_recipients: 收件人邮箱列表 ["a@xjtlu.edu.cn", ...]
+    cc_recipients: 抄送列表（可选）
+    返回 True/False"""
+    token = get_outlook_token()
+    mail = {
+        "Message": {
+            "Subject": subject[:200],
+            "Body": {"ContentType": "Text", "Content": body_text},
+            "ToRecipients": [{"EmailAddress": {"Address": a.strip()}} for a in to_recipients if a.strip()],
+        },
+        "SaveToSentItems": "true",
+    }
+    if cc_recipients:
+        mail["Message"]["CcRecipients"] = [{"EmailAddress": {"Address": a.strip()}} for a in cc_recipients if a.strip()]
+    data = json.dumps(mail).encode()
+    req = urllib.request.Request(
+        "https://outlook.office.com/api/v2.0/me/sendmail",
+        data=data, method="POST",
+        headers={"Authorization": f"Bearer {token}",
+                 "Accept": "application/json",
+                 "Content-Type": "application/json"})
+    with urllib.request.urlopen(req, timeout=30) as r:
+        return r.status == 202
+
+
 # ============ 日期工具 ============
 def fmt_date(s):
     if not s:
@@ -995,6 +1022,9 @@ HELP_TEXT = (
     "「我的提醒」查看待提醒列表\n"
     "「取消提醒 N」删除第N个\n"
     "（到时间了管家会在群里提醒你）\n\n"
+    "📧 发邮件\n"
+    "「发邮件 teacher@xjtlu.edu.cn 主题 正文」直接发\n"
+    "（需回复确认才发送；也可以说人话让管家帮你写）\n\n"
     "💡 不确定指令词？直接说你想干嘛就行（如「我明天想请假」「帮我签到 12345」「管家身体怎么样」）。\n"
     "🔐 写操作确认机制：加/删日历、作业写日历、订房——管家先出确认卡，回复「确认」才执行，说「好」「是」不会误触发。"
 )
@@ -3023,6 +3053,8 @@ def _exec_pending_confirm(chat_id):
                                color="green")
         elif kind == "hw_to_calendar":
             cmd_homework_to_calendar(chat_id, pay["text"], confirmed=True)
+        elif kind == "send_mail":
+            cmd_send_mail_confirm(chat_id, pay)
         else:
             feishu_send(chat_id, "⚠️ 未知的待确认操作，已放弃。")
     except Exception as e:
@@ -3208,6 +3240,87 @@ def cmd_status(chat_id):
                        color="green" if (gh_ok and cookie_ok and ams_live) else "red")
 
 
+# ============ v36: 发邮件 ============
+def cmd_send_mail(chat_id, text):
+    """v36: 给老师/教务发邮件——通过 Outlook API 以学生邮箱发送
+    用法：
+      发邮件 teacher@xjtlu.edu.cn 微积分请假 崴脚了无法参加10/5的课
+      给老师发邮件 请假 崴脚了去不了（需先用 web_fetch 查邮箱或用户提供）
+    发送前出确认卡，回复「确认」才发送"""
+    rest = re.sub(r"^(?:发邮件|发封邮件|写邮件|给老师发(?:邮件)?)\s*", "", text.strip(), flags=re.I).strip()
+    if not rest:
+        feishu_send_action(chat_id, "📧 发邮件",
+            "用法：\n\n"
+            "「发邮件 teacher@xjtlu.edu.cn 主题 正文」\n"
+            "「发邮件 teacher@xjtlu.edu.cn,da@xjtlu.edu.cn 主题 正文」\n\n"
+            "也可以说人话：\n"
+            "「帮我给微积分老师发邮件请假，我崴脚了去不了10/5的课」\n"
+            "（管家会用 web_fetch 去 LM 查老师邮箱，然后帮你写好邮件让你确认）",
+            color="blue")
+        return
+    # 解析格式：邮箱 [多个用逗号/分号隔开] + 主题 + 正文
+    # 邮箱在前，主题和正文用空格分隔
+    parts = rest.split(None, 1)
+    if not parts:
+        feishu_send(chat_id, "⚠️ 格式不对，请用：「发邮件 邮箱 主题 正文」")
+        return
+    addr_str = parts[0]
+    # 提取所有邮箱
+    addrs = re.findall(r'[\w.+-]+@[\w.-]+\.\w+', addr_str)
+    if not addrs:
+        feishu_send(chat_id, "⚠️ 没识别出邮箱地址。请用：「发邮件 teacher@xjtlu.edu.cn 主题 正文」")
+        return
+    remaining = parts[1] if len(parts) > 1 else ""
+    # 主题和正文：第一个词组是主题，剩下是正文
+    sub_parts = remaining.split(None, 1)
+    subject = sub_parts[0] if sub_parts else "(无主题)"
+    body = sub_parts[1] if len(sub_parts) > 1 else ""
+    # 写操作确认门
+    global _PENDING_CONFIRM
+    _PENDING_CONFIRM[chat_id] = {
+        "kind": "send_mail",
+        "payload": {
+            "to": addrs,
+            "subject": subject[:100],
+            "body": body,
+        },
+        "ts": time.time(),
+    }
+    preview = (f"📧 发件人：Guancheng.Wu26@student.xjtlu.edu.cn\n"
+               f"收件人：{', '.join(addrs)}\n"
+               f"主题：{subject[:60]}\n"
+               f"正文：{body[:200]}{'...' if len(body) > 200 else ''}")
+    feishu_send_action(chat_id, "📧 确认发送邮件",
+        preview + "\n\n回复「确认」发送，「取消」放弃。", color="blue")
+    log(f"📧 邮件待确认: {addrs} 主题={subject[:30]}")
+
+
+def cmd_send_mail_confirm(chat_id, payload):
+    """确认后实际发送邮件"""
+    to = payload.get("to") or []
+    subject = payload.get("subject") or "(无主题)"
+    body = payload.get("body") or ""
+    if not to:
+        feishu_send(chat_id, "⚠️ 收件人为空，邮件未发送。")
+        return
+    # 正文签名
+    signature = "\n\n—\n吴冠呈\n西交利物浦大学\nGuancheng.Wu26@student.xjtlu.edu.cn"
+    full_body = body + signature
+    try:
+        ok = outlook_send_mail(to, subject, full_body)
+        if ok:
+            feishu_send_action(chat_id, "✅ 邮件已发送",
+                f"收件人：{', '.join(to)}\n主题：{subject[:60]}\n\n"
+                f"已从你的学生邮箱发出，可在 Outlook 已发送文件夹查看。",
+                color="green")
+            log(f"✅ 邮件已发送: {to} 主题={subject[:30]}")
+        else:
+            feishu_send(chat_id, "❌ 邮件发送失败（API 返回异常），请稍后重试。")
+    except Exception as e:
+        feishu_send(chat_id, f"❌ 邮件发送失败：{str(e)[:80]}")
+        log(f"❌ 发邮件失败: {e}")
+
+
 def cmd_cookie(chat_id, text):
     """v25: 接收用户粘贴的新 Cookie JSON → 校验 → 写 butler-data/xjtlu_cookies.json → 触发监控验证
 
@@ -3311,6 +3424,10 @@ def process_command(text, chat_id):
                 feishu_send(chat_id, f"⚠️ 序号超出范围（共 {len(reminders)} 个提醒）")
         except ValueError:
             feishu_send(chat_id, "用法：「取消提醒 1」（序号从「我的提醒」里看）")
+        return
+    # v36: 发邮件——「发邮件 <收件人> <主题> <正文>」或「给老师发邮件」
+    if t.startswith(("发邮件", "发封邮件", "写邮件", "给老师发")):
+        cmd_send_mail(chat_id, text)
         return
     # 自由格式加日历：「加日历 <标题> <日期> <开始> <结束>」
     if t.startswith(("加日历", "添加日历", "写入日历", "标到日历", "加到日历")):
@@ -4036,6 +4153,9 @@ SYSTEM_PROMPT = (
     "每天早上 8 点管家会自动发每日早报（天气+课程+作业+出勤一条消息），不用用户问。\n"
     "25. 用户说「提醒我明天下午3点去取快递」时，引导用户直接发「提醒我 <时间> <事件>」命令即可设置备忘提醒；"
     "到时间了管家会在群里自动提醒。用户也可说「我的提醒」查看、「取消提醒 N」删除。\n"
+    "26. 管家可以代用户发邮件（从学生邮箱 Guancheng.Wu26@student.xjtlu.edu.cn 发出）："
+    "用户说「给微积分老师发邮件请假，我崴脚了去不了10/5的课」时，先用 web_fetch 去 LM 课程页查老师邮箱，"
+    "再引导用户发「发邮件 邮箱 主题 正文」命令。发送前会出确认卡让用户确认，绝不擅自发送。\n"
 )
 
 
