@@ -265,6 +265,97 @@ def _gh_token_revoked_notify(chat_id=CHAT_ID_FALLBACK):
     log(f"⚠️ GitHub token 被撤销，已发飞书通知")
 
 
+# ============ 天气查询 (wttr.in 免费 API，无需 key) ============
+_RAIN_REMINDER_DATE = ""  # 内存级：今日是否已发过带伞提醒（格式 YYYY-MM-DD）
+
+def _fetch_weather_raw(city="苏州", days=1):
+    """从 wttr.in 获取天气 JSON 数据"""
+    city_en = {"苏州": "Suzhou", "上海": "Shanghai", "北京": "Beijing",
+               "南京": "Nanjing", "杭州": "Hangzhou", "苏州工业园区": "Suzhou"}.get(city, city)
+    url = f"https://wttr.in/{urllib.parse.quote(city_en)}?format=j1"
+    req = urllib.request.Request(url, headers={"User-Agent": "curl/8.0"})
+    with urllib.request.urlopen(req, timeout=10) as r:
+        return json.loads(r.read().decode())
+
+
+def _fetch_weather_text(city="苏州", days=1):
+    """获取天气并格式化成文本（供 LLM 工具返回）"""
+    try:
+        data = _fetch_weather_raw(city, days)
+        cur = (data.get("current_condition") or [{}])[0]
+        desc = (cur.get("weatherDesc") or [{}])[0].get("value", "")
+        temp = cur.get("temp_C", "?")
+        feel = cur.get("FeelsLikeC", "?")
+        humidity = cur.get("humidity", "?")
+        wind = cur.get("windspeedKmph", "?")
+        # 今日/未来预报
+        forecasts = data.get("weather", [])[:max(days, 1)]
+        lines = [f"📍 {city}天气（wttr.in）",
+                 f"当前：{desc}，{temp}°C（体感{feel}°C），湿度{humidity}%，风速{wind}km/h"]
+        for w in forecasts:
+            date = w.get("date", "")
+            maxt = w.get("maxtempC", "?")
+            mint = w.get("mintempC", "?")
+            rain_hours = []
+            for h in w.get("hourly", []):
+                rain_chance = h.get("chanceofrain", "0")
+                h_desc = (h.get("weatherDesc") or [{}])[0].get("value", "")
+                if int(rain_chance) >= 30 or "rain" in h_desc.lower() or "drizzle" in h_desc.lower():
+                    rain_hours.append(f"{h.get('time','').zfill(4)[:2]}:00({rain_chance}%)")
+            lines.append(f"\n📅 {date}：{mint}~{maxt}°C" +
+                         (f"  🌧️ 降雨时段: {', '.join(rain_hours)}" if rain_hours else "  ☀️ 无明显降雨"))
+        return "\n".join(lines)
+    except Exception as e:
+        return f"天气查询失败: {str(e)[:80]}"
+
+
+def _check_rain_and_remind(chat_id=CHAT_ID_FALLBACK):
+    """v31: 每日下雨提醒——早上 7-9 点首次轮询时检查苏州天气，下雨则发带伞提醒
+    （内存级去重：同一 SCF 实例内当天只发一次；实例重启后重置，最多多发一次，可接受）"""
+    global _RAIN_REMINDER_DATE
+    now = datetime.now()
+    hour = now.hour
+    today = now.strftime("%Y-%m-%d")
+    # 只在 7-9 点窗口检查（早出门前提醒才有意义）
+    if hour < 7 or hour >= 9:
+        return
+    if _RAIN_REMINDER_DATE == today:
+        return  # 今天已发过
+    try:
+        data = _fetch_weather_raw("苏州", 1)
+        today_w = (data.get("weather") or [{}])[0]
+        max_rain = 0
+        rain_descs = []
+        for h in today_w.get("hourly", []):
+            chance = int(h.get("chanceofrain", "0"))
+            desc = (h.get("weatherDesc") or [{}])[0].get("value", "")
+            if chance > max_rain:
+                max_rain = chance
+            if "rain" in desc.lower() or "drizzle" in desc.lower() or chance >= 40:
+                t = h.get("time", "").zfill(4)[:2] + ":" + h.get("time", "").zfill(4)[2:]
+                rain_descs.append(f"{t} {desc}({chance}%)")
+        cur = (data.get("current_condition") or [{}])[0]
+        cur_desc = (cur.get("weatherDesc") or [{}])[0].get("value", "")
+        cur_temp = cur.get("temp_C", "?")
+        maxt = today_w.get("maxtempC", "?")
+        mint = today_w.get("mintempC", "?")
+        # 下雨判定：当前在下雨 或 今天有时段降雨概率 >= 40%
+        is_raining = "rain" in cur_desc.lower() or "drizzle" in cur_desc.lower() or max_rain >= 40
+        if is_raining and rain_descs:
+            rain_summary = "、".join(rain_descs[:4])
+            feishu_send_action(chat_id, "🌧️ 今日带伞提醒",
+                f"苏州今天有雨，出门记得带伞！\n\n"
+                f"当前：{cur_desc} {cur_temp}°C\n"
+                f"今日温度：{mint}~{maxt}°C\n"
+                f"降雨时段：{rain_summary}",
+                color="blue")
+            log(f"🌧️ 已发带伞提醒（今日最大降雨概率 {max_rain}%）")
+        _RAIN_REMINDER_DATE = today  # 无论是否下雨都标记（晴天不发提醒，但也不重复检查）
+    except Exception as e:
+        log(f"天气检查失败: {str(e)[:60]}")
+        _RAIN_REMINDER_DATE = today  # 失败也标记，避免每分钟重试
+
+
 def trigger_github():
     """触发 GitHub Actions 重新生成 ICS"""
     if not GH_TOKEN:
@@ -443,6 +534,9 @@ HELP_TEXT = (
     "🩺 体检 · Cookie\n"
     "「状态」「体检」「管家身体怎么样」查看 GitHub token/Cookie/AMS/房间健康\n"
     "「cookie <JSON>」粘贴导出的新 Cookie 自动刷新\n\n"
+    "🌤️ 天气\n"
+    "「天气」查苏州天气（或「苏州天气」「今天下雨吗」「带不带伞」）\n"
+    "（每天早上 7-9 点如下雨会自动提醒带伞，不用你问）\n\n"
     "💡 不确定指令词？直接说你想干嘛就行（如「我明天想请假」「帮我签到 12345」「管家身体怎么样」）。\n"
     "🔐 写操作确认机制：加/删日历、作业写日历、订房——管家先出确认卡，回复「确认」才执行，说「好」「是」不会误触发。"
 )
@@ -3447,6 +3541,8 @@ SYSTEM_PROMPT = (
     "23. 写操作必须先确认，绝不擅自执行：加日历/删日历/作业写日历会先出确认卡，等用户明确回复「确认」才写入；"
     "订房工具带 confirmed 参数，仅当用户明确说「确认/订吧/好」后才传 true；请假流程用户发证明照片才算最终确认。"
     "用户表达不清或你理解不确定时，先复述你的理解并请用户确认，得到明确同意再执行。\n"
+    "24. 你有 query_weather 工具：用户问天气、温度、下雨、带不带伞、穿什么衣服时调用它，默认查苏州（西交利物浦大学所在地）。"
+    "每天早上 7-9 点管家会自动查苏州天气，下雨会主动在群里发带伞提醒，不用用户问。"
 )
 
 
@@ -3512,6 +3608,20 @@ TOOLS_DEF = [
             "name": "health_status",
             "description": "管家健康体检：报告 GitHub token / 西浦 Cookie / AMS 凭证 / 房间系统四项状态及依赖关系。用户问管家是否正常、怀疑 Cookie 过期、或签到/请假/订房报凭证错误时调用。",
             "parameters": {"type": "object", "properties": {}},
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "query_weather",
+            "description": "查询指定城市的实时天气和未来预报。用户问天气、温度、下雨、穿什么衣服、带不带伞时调用。默认查苏州（西交利物浦大学所在地）。",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "city": {"type": "string", "description": "城市名（中英文均可），默认苏州"},
+                    "days": {"type": "integer", "description": "预报天数 1-3，默认 1（今天）"},
+                },
+            },
         },
     },
 ]
@@ -3681,6 +3791,10 @@ def execute_tool(name, args_raw, chat_id):
         if name == "health_status":
             cmd_status(chat_id)
             return "体检报告已生成并发送给用户。"
+        if name == "query_weather":
+            city = str(args.get("city") or "").strip() or "苏州"
+            days = int(args.get("days") or 1)
+            return _fetch_weather_text(city, days)
         return f"未知工具: {name}"
     except Exception as e:
         log(f"❌ 工具执行异常 {name}: {e}")
@@ -3710,11 +3824,12 @@ def call_llm_chat(user_text, chat_id):
             messages.append({"role": msg["role"], "content": msg["content"]})
         messages.append({"role": "user", "content": f"当前上下文：\n{context}\n\n用户消息：{user_text}"})
 
-        # 是否带 tools：含房间/作业/出勤/日程意图时才启用（降低无关请求的成本）
+        # 是否带 tools：含房间/作业/出勤/日程/天气意图时才启用（降低无关请求的成本）
         tool_intent = any(kw in user_text for kw in (
             "房", "研讨", "预定", "预约", "订", "room", "book", "同伴",
             "作业", "ddl", "截止", "homework", "出勤", "考勤", "缺勤", "attendance",
-            "日历", "日程", "安排", "calendar", "schedule", "今天", "明天", "这周", "计划"))
+            "日历", "日程", "安排", "calendar", "schedule", "今天", "明天", "这周", "计划",
+            "天气", "下雨", "雨", "温度", "几度", "冷不冷", "热不热", "带伞", "穿什么", "weather"))
 
         def _call_ds(msgs, use_tools):
             payload = {
@@ -3891,6 +4006,8 @@ def poll_group_messages():
     _check_pending_revoke(CHAT_ID_FALLBACK)
     # 审批结果监控：Pending → 已办结/已批准时发提醒（兑现提交卡片的承诺）
     _check_leave_approval(CHAT_ID_FALLBACK)
+    # v31: 每日下雨提醒（7-9点窗口，每天最多发一次）
+    _check_rain_and_remind(CHAT_ID_FALLBACK)
     try:
         processed_ids, last_msg_id = _load_poll_state()
         token = get_feishu_token()
