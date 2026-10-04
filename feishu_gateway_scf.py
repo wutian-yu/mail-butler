@@ -352,6 +352,271 @@ def _check_rain_and_remind(chat_id=CHAT_ID_FALLBACK):
         _RAIN_REMINDER_DATE = today  # 失败也标记，避免每分钟重试
 
 
+# ============ v34: 每日早报 ============
+_DAILY_BRIEF_DATE = ""  # 内存级：今日早报是否已发
+
+def _daily_brief(chat_id=CHAT_ID_FALLBACK):
+    """v34: 每天早上 8 点发一条综合早报——天气 + 课程 + 作业 + 出勤
+    与下雨提醒合并：如果下雨提醒已发，早报里就不再重复天气卡，而是在早报里提带伞"""
+    global _DAILY_BRIEF_DATE, _RAIN_REMINDER_DATE
+    now = datetime.now()
+    if now.hour != 8:
+        return
+    today = now.strftime("%Y-%m-%d")
+    if _DAILY_BRIEF_DATE == today:
+        return
+    _DAILY_BRIEF_DATE = today  # 标记
+    weekdays = ["周一", "周二", "周三", "周四", "周五", "周六", "周日"]
+    wd = weekdays[now.weekday()]
+    lines = [f"☀️ 早安冠呈，今天 {now.strftime('%m月%d日')} {wd}", ""]
+
+    # 1. 天气（只说下不下雨，不报温度湿度）
+    rain_msg = ""
+    try:
+        data = _fetch_weather_raw("苏州", 1)
+        today_w = (data.get("weather") or [{}])[0]
+        max_rain = 0
+        for h in today_w.get("hourly", []):
+            chance = int(h.get("chanceofrain", "0"))
+            if chance > max_rain:
+                max_rain = chance
+        if max_rain >= 40 or "rain" in str((data.get("current_condition") or [{}])[0].get("weatherDesc", "")).lower():
+            rain_msg = f"🌧️ 苏州今天有雨，记得带伞（最大降雨概率 {max_rain}%）"
+        else:
+            rain_msg = f"☀️ 苏州今天无明显降雨，不用带伞"
+    except Exception:
+        rain_msg = "🌤️ 天气查询失败"
+    lines.append(rain_msg)
+    _RAIN_REMINDER_DATE = today  # 合并后标记，避免下雨提醒重复发
+
+    # 2. 今天的课程（Outlook 日历）
+    try:
+        events = outlook_events()
+        today_str = now.strftime("%Y-%m-%d")
+        today_events = [e for e in events if (e.get("Start", {}).get("DateTime", "") or "")[:10] == today_str]
+        if today_events:
+            lines.append(f"📅 今天 {len(today_events)} 节课/日程：")
+            for ev in sorted(today_events, key=lambda e: e.get("Start", {}).get("DateTime", "")):
+                t = (ev.get("Start", {}).get("DateTime", "") or "")[11:16]
+                lines.append(f"  · {t} {ev.get('Subject', '')[:30]}")
+        else:
+            lines.append("📅 今天没有课")
+    except Exception:
+        lines.append("📅 日历查询失败")
+
+    # 3. 本周作业/考试 DDL
+    try:
+        lm_events = fetch_lm_assignments(days_ahead=7)
+        if lm_events:
+            lines.append(f"📚 本周 {len(lm_events)} 个 DDL：")
+            for ev in lm_events[:5]:
+                exam_tag = "⚠️机房考试" if "Exam Page" in (ev.get("categories") or "") else ""
+                lines.append(f"  · {ev['summary'][:35]} {ev.get('countdown', '')} {exam_tag}")
+        else:
+            lines.append("📚 本周没有 DDL")
+    except Exception:
+        lines.append("📚 作业查询失败")
+
+    # 4. 出勤状态
+    try:
+        state, _ = gh_read_json("xjtlu_state.json")
+        att = (state or {}).get("ams", {}).get("attendance") or {}
+        if att.get("overall") is not None:
+            abs_count = sum(m.get("absences", 0) for m in (att.get("modules") or {}).values())
+            if abs_count == 0:
+                lines.append(f"✅ 出勤正常（{len(att.get('modules', {}))} 门课无缺勤）")
+            else:
+                lines.append(f"⚠️ 有 {abs_count} 节缺勤，注意补签窗口")
+        else:
+            lines.append("✅ 出勤数据待同步")
+    except Exception:
+        lines.append("✅ 出勤数据待同步")
+
+    feishu_send_action(chat_id, "☀️ 每日早报", "\n".join(lines), color="green")
+    log(f"☀️ 已发每日早报")
+
+
+# ============ v34: 考试倒计时提醒 ============
+_EXAM_REMINDER_DATES = set()  # 内存级：已发过的 (exam_key, advance_days) 组合
+
+def _exam_countdown_remind(chat_id=CHAT_ID_FALLBACK):
+    """v34: 从 LM 作业数据中识别 Exam 类型测验，提前 7/3/1 天提醒
+    Exam Page 类型的 quiz 是正式机房考试，必须提醒"""
+    try:
+        lm_events = fetch_lm_assignments(days_ahead=14)
+        now = datetime.now()
+        for ev in lm_events:
+            cats = ev.get("categories") or ""
+            if "Exam Page" not in cats:
+                continue  # 只关注机房考试
+            dt = ev.get("dt")
+            if not dt:
+                continue
+            day_gap = (dt.date() - now.date()).days
+            for advance in (7, 3, 1):
+                if day_gap == advance:
+                    key = f"{ev['summary'][:20]}_{dt.strftime('%Y%m%d')}_{advance}"
+                    if key in _EXAM_REMINDER_DATES:
+                        continue
+                    _EXAM_REMINDER_DATES.add(key)
+                    when = "后天" if advance == 2 else "明天" if advance == 1 else f"{advance}天后"
+                    feishu_send_action(chat_id, "⏰ 考试倒计时提醒",
+                        f"⚠️ {ev['summary'][:40]}\n"
+                        f"距离考试还有 {advance} 天（{when}，{dt.strftime('%m月%d日 %H:%M')}）\n\n"
+                        f"这是机房考试，需按分配场次到机房参加，有参与分。\n"
+                        f"具体场次和房间请到 LearningMall 查 schedule PDF 确认。",
+                        color="orange")
+                    log(f"⏰ 考试倒计时提醒: {ev['summary'][:20]} 还剩 {advance} 天")
+    except Exception as e:
+        log(f"考试倒计时检查失败: {str(e)[:60]}")
+
+
+# ============ v34: 备忘提醒 ============
+REMINDERS_FILE = "reminders.json"
+
+def _load_reminders():
+    """从 butler-data 加载备忘提醒列表"""
+    try:
+        data, _ = gh_read_json(REMINDERS_FILE)
+        return data.get("reminders", [])
+    except Exception:
+        return []
+
+def _save_reminders(reminders):
+    """保存提醒列表到 butler-data"""
+    try:
+        gh_write_json(REMINDERS_FILE, {"reminders": reminders}, "", "update reminders")
+    except Exception as e:
+        log(f"⚠️ 备忘提醒保存失败: {e}")
+
+def add_reminder(chat_id, text):
+    """v34: 添加备忘提醒——用户说"提醒我明天下午3点去取快递"
+    格式：提醒我 [时间描述] [事件]
+    支持的相对时间：明天下午3点、后天上午10点、今天晚上8点、X月X日 等"""
+    rest = re.sub(r"^提醒我\s*", "", text.strip(), flags=re.I).strip()
+    if not rest:
+        feishu_send(chat_id, "⏰ 备忘提醒用法：\n\n"
+             "「提醒我 明天下午3点 去取快递」\n"
+             "「提醒我 后天上午10点 交作业」\n"
+             "「提醒我 10月15号 去医院复查」\n\n"
+             "到时间了管家会在群里提醒你。")
+        return
+    # 解析时间
+    now = datetime.now()
+    target = None
+    event_text = rest
+    # 相对日期
+    m_tomorrow = re.search(r"明天|后天|今天|今晚", rest)
+    if m_tomorrow:
+        kw = m_tomorrow.group()
+        if kw == "明天":
+            target = now + timedelta(days=1)
+        elif kw == "后天":
+            target = now + timedelta(days=2)
+        elif kw in ("今天", "今晚"):
+            target = now
+        # 去掉日期关键词
+        event_text = rest.replace(kw, "").strip()
+        # 找时间段
+        m_time = re.search(r"(上午|下午|晚上|中午|傍晚)?\s*(\d{1,2})[点时:：](\d{1,2})?", event_text)
+        if m_time:
+            ap = m_time.group(1) or ""
+            hour = int(m_time.group(2))
+            minute = int(m_time.group(3)) if m_time.group(3) else 0
+            if "下午" in ap or "晚上" in ap or "傍晚" in ap:
+                if hour < 12: hour += 12
+            elif "上午" in ap or "中午" in ap:
+                pass  # 上午不变
+            elif "今晚" in kw and hour < 12:
+                hour += 12
+            target = target.replace(hour=hour, minute=minute, second=0)
+            event_text = event_text[:m_time.start()] + event_text[m_time.end():]
+    # 绝对日期：X月X日
+    if not target:
+        m_date = re.search(r"(\d{1,2})月(\d{1,2})[号日]?", rest)
+        if m_date:
+            month = int(m_date.group(1))
+            day = int(m_date.group(2))
+            year = now.year
+            if month < now.month or (month == now.month and day < now.day):
+                year += 1
+            target = datetime(year, month, day)
+            event_text = rest[:m_date.start()] + rest[m_date.end():]
+            # 找时间
+            m_time = re.search(r"(上午|下午|晚上|中午|傍晚)?\s*(\d{1,2})[点时:：](\d{1,2})?", event_text)
+            if m_time:
+                ap = m_time.group(1) or ""
+                hour = int(m_time.group(2))
+                minute = int(m_time.group(3)) if m_time.group(3) else 0
+                if "下午" in ap or "晚上" in ap or "傍晚" in ap:
+                    if hour < 12: hour += 12
+                target = target.replace(hour=hour, minute=minute, second=0)
+                event_text = event_text[:m_time.start()] + event_text[m_time.end():]
+    event_text = event_text.strip().strip("，,。.").strip()
+    if not event_text:
+        event_text = "提醒事项"
+    if not target:
+        feishu_send(chat_id, f"⚠️ 没解析出时间，请用这种格式：\n「提醒我 明天下午3点 去取快递」\n「提醒我 10月15号上午10点 去医院」")
+        return
+    # 如果时间已过，提示
+    if target < now:
+        feishu_send(chat_id, f"⚠️ {target.strftime('%m月%d日 %H:%M')} 已经过了，设不了过去的提醒。")
+        return
+    # 保存
+    reminders = _load_reminders()
+    reminder = {
+        "time": target.strftime("%Y-%m-%d %H:%M"),
+        "event": event_text[:50],
+        "created": now.strftime("%Y-%m-%d %H:%M"),
+    }
+    reminders.append(reminder)
+    try:
+        _save_reminders(reminders)
+    except Exception as e:
+        # gh_write_json 可能因 sha 问题失败，用新建模式重试
+        try:
+            gh_write_json(REMINDERS_FILE, {"reminders": reminders}, "", "create reminders")
+        except Exception as e2:
+            feishu_send(chat_id, f"⚠️ 提醒保存失败：{str(e2)[:60]}")
+            return
+    when_str = "明天" if (target.date() - now.date()).days == 1 else \
+               "后天" if (target.date() - now.date()).days == 2 else \
+               target.strftime("%m月%d日")
+    time_str = target.strftime("%H:%M")
+    feishu_send_action(chat_id, "⏰ 提醒已设置",
+        f"{when_str} {time_str}：{event_text}\n\n到时间了管家会在群里提醒你。",
+        color="blue")
+    log(f"⏰ 备忘提醒已设置: {when_str} {time_str} {event_text}")
+
+def _check_reminders(chat_id=CHAT_ID_FALLBACK):
+    """v34: 检查到期的提醒，发通知后删除"""
+    try:
+        reminders = _load_reminders()
+        if not reminders:
+            return
+        now = datetime.now()
+        due = []
+        pending = []
+        for r in reminders:
+            try:
+                t = datetime.strptime(r["time"], "%Y-%m-%d %H:%M")
+                if t <= now:
+                    due.append(r)
+                else:
+                    pending.append(r)
+            except Exception:
+                pending.append(r)  # 格式错误的保留不删
+        for r in due:
+            feishu_send_action(chat_id, "⏰ 该做的事来啦",
+                f"{r.get('event', '提醒事项')}\n\n设定时间：{r.get('time', '')}",
+                color="orange")
+            log(f"⏰ 提醒触发: {r.get('event', '')[:30]}")
+        if due:
+            _save_reminders(pending)
+    except Exception as e:
+        log(f"提醒检查失败: {str(e)[:60]}")
+
+
 # v32: GitHub Actions 保活心跳
 # 内存级时间戳：距上次触发超过间隔才再触发（SCF 实例重启后重置，最多多发一次，可接受）
 _KEEPALIVE_LAST = {"butler": 0, "monitor": 0}
@@ -571,7 +836,12 @@ HELP_TEXT = (
     "「cookie <JSON>」粘贴导出的新 Cookie 自动刷新\n\n"
     "🌤️ 天气\n"
     "「天气」查苏州天气（或「苏州天气」「今天下雨吗」「带不带伞」）\n"
-    "（每天早上 7-9 点如下雨会自动提醒带伞，不用你问）\n\n"
+    "（每天早上 8 点会自动发每日早报：天气+课程+作业+出勤一条消息）\n\n"
+    "⏰ 备忘提醒\n"
+    "「提醒我 明天下午3点 去取快递」设提醒\n"
+    "「我的提醒」查看待提醒列表\n"
+    "「取消提醒 N」删除第N个\n"
+    "（到时间了管家会在群里提醒你）\n\n"
     "💡 不确定指令词？直接说你想干嘛就行（如「我明天想请假」「帮我签到 12345」「管家身体怎么样」）。\n"
     "🔐 写操作确认机制：加/删日历、作业写日历、订房——管家先出确认卡，回复「确认」才执行，说「好」「是」不会误触发。"
 )
@@ -2856,6 +3126,39 @@ def process_command(text, chat_id):
     if t.startswith("cookie"):
         cmd_cookie(chat_id, text)
         return
+    # v34: 备忘提醒——「提醒我 <时间> <事件>」
+    if t.startswith("提醒我") or t.startswith("提醒一下"):
+        add_reminder(chat_id, text)
+        return
+    # v34: 查看提醒列表——「我的提醒」
+    if t in ("我的提醒", "提醒列表", "查看提醒"):
+        reminders = _load_reminders()
+        if not reminders:
+            feishu_send(chat_id, "⏰ 目前没有待提醒的事项。\n\n设置方式：「提醒我 明天下午3点 去取快递」")
+        else:
+            lines = [f"⏰ 待提醒事项（{len(reminders)} 个）："]
+            for r in sorted(reminders, key=lambda x: x.get("time", "")):
+                lines.append(f"  · {r.get('time', '?')} {r.get('event', '?')[:30]}")
+            feishu_send(chat_id, "\n".join(lines))
+        return
+    # v34: 删除提醒——「取消提醒 N」
+    if t.startswith("取消提醒") or t.startswith("删除提醒"):
+        rest = text.replace("取消提醒", "").replace("删除提醒", "").strip()
+        reminders = _load_reminders()
+        if not reminders:
+            feishu_send(chat_id, "⏰ 目前没有待提醒的事项。")
+            return
+        try:
+            idx = int(rest) - 1
+            if 0 <= idx < len(reminders):
+                removed = reminders.pop(idx)
+                _save_reminders(reminders)
+                feishu_send(chat_id, f"✅ 已删除提醒：{removed.get('time', '?')} {removed.get('event', '?')[:30]}")
+            else:
+                feishu_send(chat_id, f"⚠️ 序号超出范围（共 {len(reminders)} 个提醒）")
+        except ValueError:
+            feishu_send(chat_id, "用法：「取消提醒 1」（序号从「我的提醒」里看）")
+        return
     # 自由格式加日历：「加日历 <标题> <日期> <开始> <结束>」
     if t.startswith(("加日历", "添加日历", "写入日历", "标到日历", "加到日历")):
         cmd_add_calendar(chat_id, text)
@@ -3577,7 +3880,9 @@ SYSTEM_PROMPT = (
     "订房工具带 confirmed 参数，仅当用户明确说「确认/订吧/好」后才传 true；请假流程用户发证明照片才算最终确认。"
     "用户表达不清或你理解不确定时，先复述你的理解并请用户确认，得到明确同意再执行。\n"
     "24. 你有 query_weather 工具：用户问天气、温度、下雨、带不带伞、穿什么衣服时调用它，默认查苏州（西交利物浦大学所在地）。"
-    "每天早上 7-9 点管家会自动查苏州天气，下雨会主动在群里发带伞提醒，不用用户问。"
+    "每天早上 8 点管家会自动发每日早报（天气+课程+作业+出勤一条消息），不用用户问。\n"
+    "25. 用户说「提醒我明天下午3点去取快递」时，引导用户直接发「提醒我 <时间> <事件>」命令即可设置备忘提醒；"
+    "到时间了管家会在群里自动提醒。用户也可说「我的提醒」查看、「取消提醒 N」删除。\n"
 )
 
 
@@ -4041,8 +4346,13 @@ def poll_group_messages():
     _check_pending_revoke(CHAT_ID_FALLBACK)
     # 审批结果监控：Pending → 已办结/已批准时发提醒（兑现提交卡片的承诺）
     _check_leave_approval(CHAT_ID_FALLBACK)
-    # v31: 每日下雨提醒（7-9点窗口，每天最多发一次）
-    _check_rain_and_remind(CHAT_ID_FALLBACK)
+    # v31: 每日下雨提醒（8点窗口，每天最多发一次）
+    # v34: 改为每日早报（含天气+课程+作业+出勤），下雨提醒合并进早报
+    _daily_brief(CHAT_ID_FALLBACK)
+    # v34: 考试倒计时提醒（提前7/3/1天）
+    _exam_countdown_remind(CHAT_ID_FALLBACK)
+    # v34: 备忘提醒——检查到期的提醒
+    _check_reminders(CHAT_ID_FALLBACK)
     # v32: GitHub Actions 保活心跳——每 10 分钟主动触发一次 butler + monitor
     # 原因：GitHub Actions schedule 停摆后不会自动恢复（token 失效期间停了就停了）
     # 管家每分钟轮询，每 10 分钟检查一次，距上次超过 10 分钟就主动 dispatch
