@@ -155,24 +155,60 @@ def main():
             browser.close()
             return
         page = ctx.new_page()
-        try:
-            log(f"🌐 打开: {url[:80]}")
-            page.goto(url, wait_until="domcontentloaded", timeout=45000)
-            # SSO 跳转链（LM→uim→LM / eBridge→uim→eBridge）可能要几秒，循环等它落地（最多30秒）
-            for i in range(10):
+        LM_SAML_URL = ("https://core.xjtlu.edu.cn/auth/saml2/login.php"
+                       "?wants=https%3A%2F%2Fcore.xjtlu.edu.cn%2F"
+                       "&idp=59e86c8687092bdfa106649b2d5519e5&passive=off")
+
+        def _settle(max_rounds=10, need_click=True):
+            """等 SSO 跳转链落地；eBridge 门户若停在登录页则自动点 XJTLU Account 按钮触发 SSO"""
+            for i in range(max_rounds):
                 page.wait_for_timeout(3000)
                 u = page.url
-                if "login" not in u.lower() and "siw_lgn" not in u and "esc-sso" not in u:
-                    break
+                if all(k not in u for k in ("login", "siw_lgn", "esc-sso")) and "/auth/saml2" not in u:
+                    return u
                 if i % 3 == 2:
                     log(f"⏳ SSO 链跳转中... URL: {u[:70]}")
+                if need_click and "siw_lgn" in u:
+                    try:
+                        btn = page.locator("button:has-text('XJTLU Account')")
+                        if btn.count() > 0 and btn.first.is_visible():
+                            log("🖱️ 自动点击 XJTLU Account 按钮触发 SSO")
+                            btn.first.click()
+                            need_click = False
+                    except Exception:
+                        pass
+            return page.url
+
+        try:
+            if "core.xjtlu.edu.cn" in url:
+                # LM(Moodle)：先走 SAML 链建立会话（与监控 saml_login_core 同款），直接访问会被晾在登录页
+                log("🔐 先走 LM SAML 链建立会话...")
+                try:
+                    page.goto(LM_SAML_URL, wait_until="domcontentloaded", timeout=60000)
+                    _settle(15, need_click=False)
+                except Exception as e:
+                    log(f"⚠️ SAML 链异常: {e}")
+            elif "ebridge.xjtlu.edu.cn" in url:
+                # eBridge：先过 uim 激活 TGC
+                try:
+                    page.goto("https://uim.xjtlu.edu.cn", wait_until="domcontentloaded", timeout=45000)
+                    page.wait_for_timeout(2000)
+                    if "login" in page.url.lower() or "esc-sso" in page.url:
+                        feishu_send(chat_id, "⚠️ Cookie 已失效（uim 回到登录页）。\n\n刷新方法：飞书发「cookie <导出的JSON>」或找星辰直接抓，然后再查一次。")
+                        browser.close()
+                        return
+                    log("✅ uim 会话有效")
+                except Exception as e:
+                    log(f"⚠️ uim 预热异常（继续尝试）: {e}")
+            log(f"🌐 打开目标页: {url[:80]}")
+            page.goto(url, wait_until="domcontentloaded", timeout=45000)
+            final_url = _settle()
         except Exception as e:
             feishu_send(chat_id, f"⚠️ 页面打开失败：{str(e)[:80]}\n\n地址：{url[:80]}")
             browser.close()
             return
 
-        final_url = page.url
-        if "login" in final_url.lower() or "siw_lgn" in final_url or "esc-sso" in final_url:
+        if "login" in final_url.lower() or "siw_lgn" in final_url or "esc-sso" in final_url or "/auth/saml2" in final_url:
             feishu_send(chat_id, "⚠️ Cookie 已失效（页面跳回了登录页）。\n\n刷新方法：飞书发「cookie <导出的JSON>」或找星辰直接抓，然后再查一次。")
             browser.close()
             return
