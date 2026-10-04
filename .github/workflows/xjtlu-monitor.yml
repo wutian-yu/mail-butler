@@ -34,6 +34,7 @@ jobs:
           XJTLU_USERNAME: ${{ secrets.XJTLU_USERNAME }}
           XJTLU_PASSWORD: ${{ secrets.XJTLU_PASSWORD }}
           EBRIDGE_COOKIES: ${{ secrets.EBRIDGE_COOKIES }}
+          XJTLU_COOKIES_FILE: ${{ github.workspace }}/data/xjtlu_cookies.json
           FEISHU_APP_ID: ${{ secrets.FEISHU_APP_ID }}
           FEISHU_APP_SECRET: ${{ secrets.FEISHU_APP_SECRET }}
           XJTLU_STATE_FILE: ${{ github.workspace }}/data/xjtlu_state.json
