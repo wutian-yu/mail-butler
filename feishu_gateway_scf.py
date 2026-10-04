@@ -1817,9 +1817,20 @@ def _http_upload_ams(url, token, filename, data):
 
 
 def _load_leave_pending():
+    """读取待提交请假草稿
+    v37.9: 超过 24 小时的旧草稿自动作废——用户早已办完/放弃时，不再反复提醒"待完成" """
     try:
         d, sha = gh_read_json(AMS_LEAVE_PENDING_FILE)
         if isinstance(d, dict) and d.get("status"):
+            # 草稿超 24h 视为过期：自动清除，杜绝"已办完还一直被提醒"
+            created_ts = d.get("created_ts") or 0
+            if created_ts and time.time() - created_ts > 86400:
+                log("🧹 过期请假草稿自动清除（>24h）")
+                try:
+                    gh_write_json(AMS_LEAVE_PENDING_FILE, {}, sha, "expire old leave pending")
+                except Exception:
+                    pass
+                return {}, ""
             return d, sha
     except Exception:
         pass
