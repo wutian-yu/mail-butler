@@ -4703,6 +4703,8 @@ def _save_poll_state(processed_ids, last_msg_id):
             log(f"⚠️ poll_state 保存失败: {e}")
 
 _LAST_IMAGE_HINT = {"ts": 0}
+# v37.5: 轮询异常诊断限流（每分钟最多发一次错误到群里，避免刷屏）
+_LAST_POLL_ERR = {"ts": 0}
 
 
 def _maybe_notify_no_pending_image(chat_id):
@@ -4747,15 +4749,28 @@ def poll_group_messages():
         token = get_feishu_token()
         # 关键：必须传 start_time/end_time（单位秒）——不传则返回最早的历史消息（9月22日的），新消息永远拉不到
         now_s = int(time.time())
-        url = (f"https://open.feishu.cn/open-apis/im/v1/messages"
-               f"?container_id_type=chat&container_id={CHAT_ID_FALLBACK}"
-               f"&start_time={now_s - 7200}&end_time={now_s}&page_size=50")
-        req = urllib.request.Request(url, headers={
-            "Authorization": f"Bearer {token}",
-            "Content-Type": "application/json"})
-        with urllib.request.urlopen(req, timeout=15) as r:
-            result = json.loads(r.read().decode())
-        items = result.get("data", {}).get("items", [])
+        # v37.4 修复：窗口内消息超过 page_size=50 时，最新消息会被截断永远拉不到（用户消息丢失）。
+        # 改为分页循环拉取窗口内全部消息（has_more + page_token）
+        all_items = []
+        page_token = ""
+        for _page in range(5):  # 最多 5 页（250 条），防止死循环
+            url = (f"https://open.feishu.cn/open-apis/im/v1/messages"
+                   f"?container_id_type=chat&container_id={CHAT_ID_FALLBACK}"
+                   f"&start_time={now_s - 7200}&end_time={now_s}&page_size=50")
+            if page_token:
+                url += f"&page_token={urllib.parse.quote(page_token)}"
+            req = urllib.request.Request(url, headers={
+                "Authorization": f"Bearer {token}",
+                "Content-Type": "application/json"})
+            with urllib.request.urlopen(req, timeout=15) as r:
+                result = json.loads(r.read().decode())
+            page_items = result.get("data", {}).get("items", [])
+            all_items.extend(page_items)
+            has_more = result.get("data", {}).get("has_more", False)
+            page_token = result.get("data", {}).get("page_token", "") or ""
+            if not has_more or not page_items or not page_token:
+                break
+        items = all_items
         if not items:
             return
         new_processed = False
@@ -4779,14 +4794,14 @@ def poll_group_messages():
             # 跨路径去重：事件推送路径已处理过 → 同步到state并跳过
             # 注意：图片消息不由事件路径负责（事件受3秒限制、线程不可靠），统一交给轮询同步处理，因此对 image 放行
             if msg_id in _PROCESSED_MSG_IDS and mtype != "image":
-                processed_ids.add(msg_id)
+                processed_ids[msg_id] = True
                 last_msg_id = msg_id
                 new_processed = True
                 continue
             # 回复检测：该消息之后群里已有bot回复 → 已被处理，不再转发
             msg_ts = int(m.get("create_time", "0")) / 1000
             if any(at > msg_ts for at in app_times):
-                processed_ids.add(msg_id)
+                processed_ids[msg_id] = True
                 last_msg_id = msg_id
                 new_processed = True
                 continue
@@ -4794,11 +4809,11 @@ def poll_group_messages():
             # 注意：图片消息放行——轮询周期（5分钟）与过滤窗口同长，图片常被误判为旧消息而永不处理；
             #       图片处理有 pending 状态校验兜底（无进行中请假则忽略/限流提示），重复处理无害
             if msg_ts < time.time() - 300 and mtype != "image":
-                processed_ids.add(msg_id)
+                processed_ids[msg_id] = True
                 last_msg_id = msg_id
                 new_processed = True
                 continue
-            processed_ids.add(msg_id)
+            processed_ids[msg_id] = True
             last_msg_id = msg_id
             new_processed = True
             import threading
@@ -4852,6 +4867,14 @@ def poll_group_messages():
             _save_poll_state(processed_ids, last_msg_id)
     except Exception as e:
         log(f"❌ 轮询失败: {e}")
+        # v37.5: 诊断钩子——拉取异常时发一条到群里（每分钟限1次），便于定位 SCF 内真实错误
+        try:
+            if time.time() - _LAST_POLL_ERR.get("ts", 0) > 60:
+                _LAST_POLL_ERR["ts"] = time.time()
+                feishu_send(CHAT_ID_FALLBACK,
+                    f"⚠️ 轮询诊断 {datetime.now().strftime('%H:%M:%S')}：{str(e)[:120]}")
+        except Exception:
+            pass
 
 
 # ============ 主入口 ============
@@ -4862,6 +4885,10 @@ def main_handler(event, context):
         if "ams" in trigger.lower() or "sign" in trigger.lower():
             # AMS 实时轮询器（1分钟）：课节状态秒级感知
             ams_timer_poll()
+            # v37.4 修复：定时器同时执行群消息轮询。
+            # 之前只走 ams_timer_poll，poll_group_messages 从不被定时器触发，
+            # 群消息只靠 webhook 推送；webhook 断连（部署/网络）期间消息全部丢失。
+            poll_group_messages()
             return {"statusCode": 200, "body": "ams polled"}
         # 默认 Timer：主动轮询群消息（防事件推送遗漏）
         log("🔄 定时轮询开始（6轮×10秒）")
