@@ -310,22 +310,24 @@ def _fetch_weather_text(city="苏州", days=1):
 
 
 def _check_rain_and_remind(chat_id=CHAT_ID_FALLBACK):
-    """v31: 每日下雨提醒——早上 7-9 点首次轮询时检查苏州天气，下雨则发带伞提醒
-    （内存级去重：同一 SCF 实例内当天只发一次；实例重启后重置，最多多发一次，可接受）"""
+    """v32: 每天早上 8 点发苏州天气——下雨提醒带伞，不下雨就不发
+    （内存级去重：同一 SCF 实例内当天只发一次；实例重启后重置，最多多发一次，可接受）
+    触发窗口 8:00-8:59，覆盖 SCF 每分钟轮询节奏）"""
     global _RAIN_REMINDER_DATE
     now = datetime.now()
     hour = now.hour
     today = now.strftime("%Y-%m-%d")
-    # 只在 7-9 点窗口检查（早出门前提醒才有意义）
-    if hour < 7 or hour >= 9:
+    # 只在 8 点窗口检查
+    if hour != 8:
         return
     if _RAIN_REMINDER_DATE == today:
         return  # 今天已发过
     try:
         data = _fetch_weather_raw("苏州", 1)
         today_w = (data.get("weather") or [{}])[0]
+        # 统计今天降雨情况
         max_rain = 0
-        rain_descs = []
+        rain_hours = []   # 有雨的时段
         for h in today_w.get("hourly", []):
             chance = int(h.get("chanceofrain", "0"))
             desc = (h.get("weatherDesc") or [{}])[0].get("value", "")
@@ -333,24 +335,18 @@ def _check_rain_and_remind(chat_id=CHAT_ID_FALLBACK):
                 max_rain = chance
             if "rain" in desc.lower() or "drizzle" in desc.lower() or chance >= 40:
                 t = h.get("time", "").zfill(4)[:2] + ":" + h.get("time", "").zfill(4)[2:]
-                rain_descs.append(f"{t} {desc}({chance}%)")
-        cur = (data.get("current_condition") or [{}])[0]
-        cur_desc = (cur.get("weatherDesc") or [{}])[0].get("value", "")
-        cur_temp = cur.get("temp_C", "?")
-        maxt = today_w.get("maxtempC", "?")
-        mint = today_w.get("mintempC", "?")
-        # 下雨判定：当前在下雨 或 今天有时段降雨概率 >= 40%
-        is_raining = "rain" in cur_desc.lower() or "drizzle" in cur_desc.lower() or max_rain >= 40
-        if is_raining and rain_descs:
-            rain_summary = "、".join(rain_descs[:4])
-            feishu_send_action(chat_id, "🌧️ 今日带伞提醒",
-                f"苏州今天有雨，出门记得带伞！\n\n"
-                f"当前：{cur_desc} {cur_temp}°C\n"
-                f"今日温度：{mint}~{maxt}°C\n"
+                rain_hours.append(f"{t} {desc}({chance}%)")
+        # 判定：今天是否需要带伞
+        need_umbrella = bool(rain_hours) or max_rain >= 40
+        if need_umbrella:
+            rain_summary = "、".join(rain_hours[:4]) if rain_hours else f"最大降雨概率 {max_rain}%"
+            feishu_send_action(chat_id, "🌧️ 今天有雨，记得带伞",
+                f"苏州今天有雨，出门记得带伞。\n\n"
                 f"降雨时段：{rain_summary}",
                 color="blue")
             log(f"🌧️ 已发带伞提醒（今日最大降雨概率 {max_rain}%）")
-        _RAIN_REMINDER_DATE = today  # 无论是否下雨都标记（晴天不发提醒，但也不重复检查）
+        # 不下雨就不发——用户只要下雨提醒
+        _RAIN_REMINDER_DATE = today
     except Exception as e:
         log(f"天气检查失败: {str(e)[:60]}")
         _RAIN_REMINDER_DATE = today  # 失败也标记，避免每分钟重试
