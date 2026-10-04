@@ -78,7 +78,8 @@ CHAT_HISTORY_FILE = "chat_history.json"
 
 
 # ============ HTTP 工具 ============
-def _http(url, method="GET", headers=None, data=None, timeout=30):
+def _http(url, method="GET", headers=None, data=None, timeout=15):
+    # v38: 默认超时 30→15 秒——防慢调用把 SCF 容器占死（实例并发=1 时全线堵塞、"过一会儿又坏"）
     body = None
     if data is not None:
         body = json.dumps(data).encode() if isinstance(data, (dict, list)) else data
@@ -5057,8 +5058,12 @@ def main_handler(event, context):
         if not msg_text:
             return {"statusCode": 200, "body": "ok"}
         log(f"📩 收到: {msg_text[:30]}")
-        # 关键：先立即返回 200（飞书要求 3 秒内返回，否则认为推送失败）
-        # 用线程异步处理消息，不阻塞响应
+        # v38: webhook 处理策略（根治"过一会儿又不理人"）
+        # 问题：慢任务（读 Outlook/LLM 10-20s）占住 SCF 实例（并发=1），后续所有请求排队 → 全线失联。
+        # 方案：线程非 daemon + handler join 最多 20 秒。
+        #   · 20 秒内完成 → 回复一定发出（用户 20 秒内收到，接近秒回）
+        #   · 20 秒没完 → handler 返回（飞书已重推，_PROCESSED_MSG_IDS 去重），线程在容器里继续跑，回复稍后发出；
+        #     即使容器被回收，轮询兜底（消息已记录）也不会丢
         import threading
         def _async_process():
             try:
@@ -5072,4 +5077,5 @@ def main_handler(event, context):
                     pass
         t = threading.Thread(target=_async_process, daemon=False)
         t.start()
+        t.join(timeout=20)
     return {"statusCode": 200, "body": "ok"}
