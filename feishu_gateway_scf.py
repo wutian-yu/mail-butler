@@ -2388,11 +2388,72 @@ def cmd_add_calendar(chat_id, text):
         feishu_send(chat_id, "❌ Outlook 日历写入失败（API 返回空），请稍后重试。")
 
 
+def cmd_cookie(chat_id, text):
+    """v25: 接收用户粘贴的新 Cookie JSON → 校验 → 写 butler-data/xjtlu_cookies.json → 触发监控验证
+
+    格式兼容：playwright cookies 数组（export_cookies.py / 星辰抓取的输出）或 storage_state dict。
+    监控端 cookie_login 优先读该文件（XJTLU_COOKIES_FILE），验证结果由 monitor 的恢复/失败通知闭环。
+    """
+    body = re.sub(r"^\s*cookie", "", text.strip(), count=1, flags=re.I).strip()
+    m = re.search(r"[\[{]", body)
+    if not m:
+        feishu_send_action(chat_id, "🍪 Cookie 刷新",
+                           "把导出的 Cookie JSON 整段发出来，消息以「cookie」开头：\n"
+                           "【cookie [ {…} ]】\n\n"
+                           "导出方式二选一：\n"
+                           "· 跑 mail-butler 仓库的 export_cookies.py，复制它输出的那行 JSON\n"
+                           "· 找星辰（TeleAgent），让他用内置浏览器直接抓\n\n"
+                           "收到后自动校验、入库并触发监控验证，2-3 分钟内回报结果。", color="blue")
+        return
+    raw = body[m.start():]
+    # 从最后一个括号截断，去掉尾部可能混入的文字
+    end = max(raw.rfind("]"), raw.rfind("}"))
+    if end > 0:
+        raw = raw[:end + 1]
+    try:
+        data = json.loads(raw)
+    except Exception as e:
+        feishu_send(chat_id, f"⚠️ Cookie JSON 解析失败：{str(e)[:60]}\n请整段复制脚本输出的 JSON，不要手工增删字符。")
+        return
+    if isinstance(data, dict):
+        data = data.get("cookies") or []
+    if not isinstance(data, list) or not data:
+        feishu_send(chat_id, "⚠️ 没解析出 Cookie 列表（应为 JSON 数组，或含 cookies 字段的 storage_state）。")
+        return
+    if not all(isinstance(c, dict) and c.get("name") and c.get("value") and c.get("domain") for c in data):
+        feishu_send(chat_id, "⚠️ 有 Cookie 缺少 name/value/domain 字段，格式不对，未入库。\n请用 export_cookies.py 的原始输出。")
+        return
+    doms = sorted({str(c.get("domain", "")).lstrip(".") for c in data})
+    try:
+        _, sha = gh_read_json("xjtlu_cookies.json")
+    except Exception:
+        sha = ""
+    try:
+        gh_write_json("xjtlu_cookies.json", data, sha, "refresh cookies via feishu cookie cmd")
+    except Exception as e:
+        feishu_send(chat_id, f"⚠️ Cookie 入库失败：{str(e)[:60]}，稍后再试一次。")
+        return
+    keys = [c["name"] for c in data if c.get("name") in
+            ("TGC", "MDL_SSP_AuthToken", "MDL_SSP_SessID", "EVISION_SESSION", "MoodleSession")]
+    ok = trigger_monitor_refresh()
+    feishu_send_action(chat_id, "✅ 新 Cookie 已入库",
+                       f"共 {len(data)} 个，覆盖 {'/'.join(doms[:3])}{'…' if len(doms) > 3 else ''}\n"
+                       f"关键票据：{('、'.join(keys)) or '⚠️ 未发现常见票据（可能无效）'}\n"
+                       + ("已触发监控验证，2-3 分钟后自动回报结果。" if ok
+                          else "⚠️ 监控触发失败，等下一个整点/半点自动验证。"),
+                       color="green")
+    log(f"🍪 cookie 命令：{len(data)} 个 Cookie 入库，监控触发={'成功' if ok else '失败'}")
+
+
 def process_command(text, chat_id):
     t = text.lower().strip()
     # 请假流程（优先级高，避免「请假」被其他规则吞掉）
     if text.strip().startswith("请假") or t.startswith("请个假") or t.startswith("申请请假"):
         cmd_leave(chat_id, text)
+        return
+    # v25: Cookie 刷新固定命令——「cookie <JSON>」
+    if t.startswith("cookie"):
+        cmd_cookie(chat_id, text)
         return
     # 自由格式加日历：「加日历 <标题> <日期> <开始> <结束>」
     if t.startswith(("加日历", "添加日历", "写入日历", "标到日历", "加到日历")):
@@ -3045,6 +3106,8 @@ SYSTEM_PROMPT = (
     "- 查看帮助：[ACTION:帮助]\n"
     "签到/出勤/请假是固定命令（不走 LLM），用户直接发「签到 码」「出勤」「请假 日期 原因」即可。\n"
     "加日历也是固定命令：「加日历 <标题> <日期> <开始> <结束>」直接写入 Outlook。\n"
+    "Cookie 刷新也是固定命令（v25）：监控提示 Cookie 过期时，引导用户把 export_cookies.py 输出的 JSON "
+    "以「cookie」开头粘贴到群里（或找星辰直接抓），系统自动校验入库并触发验证，无需碰 GitHub 网页。\n"
     "改假条原因也是固定命令：「改假条 <新原因>」——重新生成假条正文，发证明照片即可提交。\n\n"
     "## 规则\n"
     "1. 理解用户意图后加对应的 [ACTION:xxx] 标记，系统自动执行\n"
