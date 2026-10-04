@@ -970,8 +970,23 @@ def outlook_create_event(subject, start_dt, end_dt, body=""):
     return resp.get("Id") if resp else None
 
 
+def _mail_body_html(text):
+    """v37.3: 纯文本正文 → HTML 邮件正文
+    Outlook 的 ContentType=Text 会折叠 \n 换行（截图里正文挤成一坨），
+    必须转成 HTML 用 <p>/<br> 保排版。同时转义 HTML 特殊字符防注入。"""
+    import html as _html
+    text = _html.escape(text or "")           # < > & " ' 转义
+    paragraphs = re.split(r"\n\s*\n", text)   # 按空行切段落
+    parts = []
+    for para in paragraphs:
+        lines = [ln for ln in para.split("\n")]
+        parts.append("<br>".join(lines))
+    return "<p>" + "</p><p>".join(parts) + "</p>"
+
+
 def outlook_send_mail(to_recipients, subject, body_text, cc_recipients=None):
     """v36: 通过 Outlook API 发邮件（以学生邮箱身份发送）
+    v37.3: Body 改用 HTML 格式，修复纯文本模式下换行被折叠的问题
     to_recipients: 收件人邮箱列表 ["a@xjtlu.edu.cn", ...]
     cc_recipients: 抄送列表（可选）
     返回 True/False"""
@@ -979,7 +994,7 @@ def outlook_send_mail(to_recipients, subject, body_text, cc_recipients=None):
     mail = {
         "Message": {
             "Subject": subject[:200],
-            "Body": {"ContentType": "Text", "Content": body_text},
+            "Body": {"ContentType": "HTML", "Content": _mail_body_html(body_text)},
             "ToRecipients": [{"EmailAddress": {"Address": a.strip()}} for a in to_recipients if a.strip()],
         },
         "SaveToSentItems": "true",
@@ -4237,9 +4252,12 @@ SYSTEM_PROMPT = (
     "每天早上 8 点管家会自动发每日早报（天气+课程+作业+出勤一条消息），不用用户问。\n"
     "25. 用户说「提醒我明天下午3点去取快递」时，引导用户直接发「提醒我 <时间> <事件>」命令即可设置备忘提醒；"
     "到时间了管家会在群里自动提醒。用户也可说「我的提醒」查看、「取消提醒 N」删除。\n"
-    "26. 管家可以代用户发邮件（从学生邮箱 Guancheng.Wu26@student.xjtlu.edu.cn 发出）："
+"26. 管家可以代用户发邮件（从学生邮箱 Guancheng.Wu26@student.xjtlu.edu.cn 发出）："
     "用户说「给微积分老师发邮件请假，我崴脚了去不了10/5的课」时，先用 web_fetch 去 LM 课程页查老师邮箱，"
     "再引导用户发「发邮件 邮箱 主题 正文」命令。发送前会出确认卡让用户确认，绝不擅自发送。"
+    "生成邮件正文时，主题只放在 Subject 里不要写进正文；正文用正式英文邮件格式分段落："
+    "称呼（Dear XX,）→ 开头说明身份和来意 → 主体陈述 → 结尾致谢（I would be grateful for your guidance.）→ 落款 Yours sincerely, 后单独一行写姓名。"
+    "段落之间必须用空行分隔，不要把整封邮件挤成一大段。"
     "已知部门邮箱（中英文都能匹配，不用查 LM/eBridge）："
     "教务处(Registry/Registrar) registry@xjtlu.edu.cn、"
     "课表室(Timetable) timetables@xjtlu.edu.cn、"
