@@ -1,0 +1,51 @@
+name: Web Fetch
+
+# v26 网页查询：飞书管家云函数调度，云端浏览器实地打开 LM/eBridge 页面
+# inputs.op = JSON，例如：
+#   {"url": "https://core.xjtlu.edu.cn/course/view.php?id=1148", "question": "这周有什么新公告？", "chat_id": "oc_xxx"}
+on:
+  workflow_dispatch:
+    inputs:
+      op:
+        description: 'Web fetch JSON: {"url":..., "question":..., "chat_id":...}'
+        required: true
+
+jobs:
+  fetch:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - name: Checkout 代码仓库
+        uses: actions/checkout@v4
+
+      - name: Clone 私有数据仓库
+        run: git clone https://x-access-token:${{ secrets.GH_PAT }}@github.com/wutian-yu/butler-data.git data
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Install Playwright
+        run: |
+          pip install playwright
+          playwright install chromium --with-deps
+
+      - name: Run Web Fetch
+        env:
+          EBRIDGE_COOKIES: ${{ secrets.EBRIDGE_COOKIES }}
+          XJTLU_COOKIES_FILE: ${{ github.workspace }}/data/xjtlu_cookies.json
+          FEISHU_APP_ID: ${{ secrets.FEISHU_APP_ID }}
+          FEISHU_APP_SECRET: ${{ secrets.FEISHU_APP_SECRET }}
+          DEEPSEEK_API_KEY: ${{ secrets.DEEPSEEK_API_KEY }}
+          WEB_FETCH_OP: ${{ github.event.inputs.op }}
+          XJTLU_DATA_DIR: ${{ github.workspace }}/data
+        run: python web_fetch.py
+
+      - name: Push 数据仓库变更
+        run: |
+          cd data
+          git config user.name "XJTLU Monitor Bot"
+          git config user.email "bot@xjtlu.edu.cn"
+          git add .
+          git diff --cached --quiet || (git commit -m "web fetch cache update" && git push -f)
