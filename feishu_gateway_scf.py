@@ -1123,9 +1123,10 @@ HELP_TEXT = (
     "「花了 25 午饭」「支出 12.5 奶茶」记支出\n"
     "「收入 50 兼职」「赚了 30 家教」记收入\n"
     "「生活费到账」每月 3000 入账（已含在余额里则发「生活费已含」）\n"
+    "「打卡了」记今日打卡奖励 +10　「今天没打卡」当天不记\n"
     "「账本」今日明细　「本月账单」月明细　「余额」当前余额+月底预测\n"
-    "「删账 N」删今日第N条　「今天没打卡」当天不记 +10\n"
-    "（每晚 23:00 自动发当日收支日报 + 月底钱包余额预测；自然语言也行：「中午吃饭花了25」）\n\n"
+    "「删账 N」删今日第N条\n"
+    "（每晚 23:00 自动发当日收支日报，末尾会问你今天打卡了没；打卡奖励确认后才入账，预测按实际打卡率估算；自然语言也行：「中午吃饭花了25」）\n\n"
     "🩺 体检 · Cookie\n"
     "「状态」「体检」「管家身体怎么样」查看 GitHub token/Cookie/AMS/房间健康\n"
     "「cookie <JSON>」粘贴导出的新 Cookie 自动刷新\n\n"
@@ -3799,7 +3800,8 @@ FINANCE_DEFAULT = {
     "monthly_allowance": 3000,   # 每月生活费
     "checkin_reward": 10,        # 每日单词打卡奖励
     "records": [],               # {id,date,ts,type(expense/income/checkin/allowance),amount,note}
-    "no_checkin_dates": [],      # 用户报"没打卡"的日期（当天不自动+10）
+    "no_checkin_dates": [],      # 用户报"没打卡"的日期（当天不记打卡奖励）
+    "checkin_pending_date": "",  # v41b: 日报已发、等用户确认"打卡了"的日期
     "allowance_month": "",       # 生活费已记录到账的月份 "YYYY-MM"，空=本月未到账
 }
 
@@ -3846,17 +3848,25 @@ def _finance_month_stats(fin):
 
 
 def _finance_predict(fin):
-    """月底钱包余额预测：当前余额 + 剩余天数×打卡奖励 - 日均支出×剩余天数"""
+    """月底钱包余额预测：当前余额 + 剩余天数×打卡奖励×打卡率 - 日均支出×剩余天数
+    v41b: 用户不是每天都能打卡，打卡收入按"本月实际打卡率"估算（记账天数≤3天时按每天算，避免初期样本太少失真）"""
     now = datetime.now()
     st = _finance_month_stats(fin)
     month_end = datetime(now.year + 1, 1, 1) if now.month == 12 else datetime(now.year, now.month + 1, 1)
     days_left = (month_end - now).days
     reward = float(fin.get("checkin_reward", 10))
     daily_expense = st["expense"] / st["days_recorded"] if st["days_recorded"] else 0
-    predict_income = days_left * reward
+    mp = now.strftime("%Y-%m")
+    checkin_days = len([r for r in fin.get("records", [])
+                        if r.get("type") == "checkin" and str(r.get("date", "")).startswith(mp)])
+    if st["days_recorded"] <= 3:
+        rate = 1.0  # 数据太少，先按每天打卡估；有几天数据后自动改用实际打卡率
+    else:
+        rate = min(1.0, checkin_days / float(st["days_recorded"]))
+    predict_income = days_left * reward * rate
     predict_expense = daily_expense * days_left
     return {
-        "days_left": days_left, "reward": reward,
+        "days_left": days_left, "reward": reward, "rate": rate,
         "daily_expense": daily_expense,
         "predict_income": predict_income, "predict_expense": predict_expense,
         "predict_balance": fin["wallet_balance"] + predict_income - predict_expense,
@@ -3978,6 +3988,62 @@ def cmd_finance_record(chat_id, text):
             "查看：「账本」今日明细　「余额」月底预测", color="blue")
 
 
+def cmd_finance_checkin_confirm(chat_id):
+    """「打卡了」：确认今日打卡奖励 +10
+    三种场景：①日报询问后回复（按询问日补记）②白天主动报（提前记，晚报不问）③已记过（幂等提示）"""
+    try:
+        fin, sha = _finance_load()
+    except Exception as e:
+        feishu_send_action(chat_id, "💰 打卡", "❌ 账本读取失败，稍后再试。", color="red")
+        return
+    now = datetime.now()
+    today = now.strftime("%Y-%m-%d")
+    pending = fin.get("checkin_pending_date") or ""
+    # 归属日期：日报询问日优先（支持跨零点后回复昨天的问题），否则今天
+    target = pending if pending else today
+    already = [r for r in fin["records"] if r.get("date") == target and r.get("type") == "checkin"]
+    if already:
+        if pending:
+            fin["checkin_pending_date"] = ""
+            try:
+                _finance_save(fin, sha)
+            except Exception:
+                pass
+        feishu_send_action(chat_id, "💰 打卡",
+            f"ℹ️ {target[5:]} 的打卡奖励 +{already[0]['amount']:.2f} 已记过，不用重复确认。", color="blue")
+        return
+    if target in (fin.get("no_checkin_dates") or []):
+        # 之前说了没打卡，现在又打卡了——移除标记照常记
+        fin["no_checkin_dates"] = [d for d in fin["no_checkin_dates"] if d != target]
+    reward = round(float(fin.get("checkin_reward", 10)), 2)
+    rec = {"id": f"fin-{now.strftime('%Y%m%d%H%M%S')}-{len(fin['records'])}",
+           "date": target, "ts": now.strftime("%H:%M"), "type": "checkin",
+           "amount": reward, "note": "单词打卡奖励"}
+    fin["records"].append(rec)
+    fin["wallet_balance"] = round(fin["wallet_balance"] + reward, 2)
+    if pending:
+        fin["checkin_pending_date"] = ""
+    try:
+        _finance_save(fin, sha)
+    except Exception as e:
+        feishu_send_action(chat_id, "💰 打卡", "❌ 保存失败，请稍后再发一次。", color="red")
+        return
+    # 算当天净额给用户看
+    day_recs = [r for r in fin["records"] if r.get("date") == target]
+    inc_sum = sum(r["amount"] for r in day_recs if r["type"] != "expense")
+    exp_sum = sum(r["amount"] for r in day_recs if r["type"] == "expense")
+    suffix = ""
+    if target != today:
+        suffix = f"\n（这是 {target[5:]} 日报的补记）"
+    elif not pending:
+        suffix = "\n（今晚日报不再询问）"
+    feishu_send_action(chat_id, "💰 打卡奖励已入账",
+        f"✅ {target[5:]} 打卡奖励 +{reward:.2f}\n"
+        f"✨ 当日净额：{inc_sum - exp_sum:+.2f}\n"
+        f"🏦 当前钱包余额：{fin['wallet_balance']:.2f} 元{suffix}",
+        color="green")
+
+
 def cmd_finance_no_checkin(chat_id):
     """「今天没打卡」→ 当天不自动+10（若已自动记入则回滚）"""
     try:
@@ -3994,14 +4060,18 @@ def cmd_finance_no_checkin(chat_id):
         rolled += r["amount"]
     if today not in nc:
         nc.append(today)
+    # v41b: 若日报正在等确认（pending=今天），一并清掉
+    if fin.get("checkin_pending_date") == today:
+        fin["checkin_pending_date"] = ""
     try:
         _finance_save(fin, sha)
     except Exception as e:
         feishu_send_action(chat_id, "💰 打卡", "❌ 保存失败，稍后再试。", color="red")
         return
-    msg = f"✅ 已标记今天（{today}）没打卡，今晚日报不再记 +10。"
+    msg = f"✅ 已标记今天（{today}）没打卡，不记打卡奖励。"
     if rolled:
-        msg += f"\n（已回滚此前自动记入的打卡奖励 -{rolled:.2f}）"
+        msg += f"\n（已回滚此前记入的打卡奖励 -{rolled:.2f}）"
+    msg += "\n改主意了发「打卡了」即可补记。"
     feishu_send_action(chat_id, "💰 打卡", msg, color="green")
 
 
@@ -4067,12 +4137,14 @@ def cmd_finance_view(chat_id, text):
             allow_line = f"💰 本月 3000 生活费剩余：{pr['allowance_left']:.2f} 元"
         else:
             allow_line = "💰 本月生活费还没记录到账：发「生活费到账」（+3000）或「生活费已含」（已含在余额里）"
+        rate_pct = f"{pr['rate'] * 100:.0f}%"
+        rate_note = "每天打卡" if pr["rate"] >= 0.999 else f"按近期打卡率 {rate_pct}"
         feishu_send_action(chat_id, "🏦 钱包余额",
             f"🏦 当前钱包余额：{fin['wallet_balance']:.2f} 元\n"
             f"（记账起点 {fin.get('start_date','')} 为 {fin.get('wallet_start',0):.2f} 元）\n\n"
             f"{allow_line}\n"
             f"🔮 月底余额预测：{pr['predict_balance']:.2f} 元\n"
-            f"   （剩余 {pr['days_left']} 天 × 打卡 {pr['reward']:.0f}/天 = +{pr['predict_income']:.2f}，"
+            f"   （剩余 {pr['days_left']} 天：打卡 {rate_note} +{pr['predict_income']:.2f}，"
             f"按日均支出 {pr['daily_expense']:.2f}/天 预计再花 {pr['predict_expense']:.2f}）",
             color="blue")
         return
@@ -4115,7 +4187,8 @@ def cmd_finance_view(chat_id, text):
 
 
 def _check_daily_finance_report(chat_id=None):
-    """v41: 每天 23:00 自动记当日打卡奖励 + 发当日收支日报（持久化去重，容器重启不重发）"""
+    """v41b: 每天 23:00 发当日收支日报（持久化去重，容器重启不重发）
+    打卡奖励不自动记——日报末尾问用户"今天打卡了吗"，回复「打卡了」才补记（用户不是每天都能打卡）"""
     now = datetime.now()
     if now.hour != 23:
         return
@@ -4128,24 +4201,17 @@ def _check_daily_finance_report(chat_id=None):
     except Exception as e:
         log(f"财务日报-账本读取失败: {e}")
         return
-    # 自动记打卡（没标记"没打卡"且今天还没记过）
+    # v41b: 不再自动记打卡——先问，用户回「打卡了」再记（cmd_finance_checkin_confirm）
     today_recs = [r for r in fin["records"] if r.get("date") == today]
-    checkin_added = False
-    if today not in (fin.get("no_checkin_dates") or []) and \
-       not any(r.get("type") == "checkin" for r in today_recs):
-        rec = {"id": f"fin-{now.strftime('%Y%m%d%H%M%S')}-{len(fin['records'])}",
-               "date": today, "ts": "23:00", "type": "checkin",
-               "amount": round(float(fin.get("checkin_reward", 10)), 2), "note": "单词打卡奖励"}
-        fin["records"].append(rec)
-        fin["wallet_balance"] = round(fin["wallet_balance"] + rec["amount"], 2)
-        today_recs.append(rec)
-        checkin_added = True
+    checkin_confirmed = any(r.get("type") == "checkin" for r in today_recs)
+    need_ask = (not checkin_confirmed) and (today not in (fin.get("no_checkin_dates") or []))
+    if need_ask:
+        fin["checkin_pending_date"] = today
         try:
             _finance_save(fin, sha)
-            sha = "saved"
         except Exception as e:
-            log(f"财务日报-打卡入账失败: {e}")
-    # 日报正文
+            log(f"财务日报-待确认标记失败: {e}")
+    # 日报正文（打卡未确认时今日收入不含打卡，等回复后补记）
     inc_lines, exp_lines, inc_sum, exp_sum = _finance_day_lines(today_recs)
     pr = _finance_predict(fin)
     st = _finance_month_stats(fin)
@@ -4166,15 +4232,20 @@ def _check_daily_finance_report(chat_id=None):
         lines.append(f"💰 本月生活费剩余：{pr['allowance_left']:.2f}（已花 {used_pct:.0f}%）")
     else:
         lines.append("💰 本月生活费还没记录到账（发「生活费到账」或「生活费已含」）")
+    rate_pct = f"{pr['rate'] * 100:.0f}%"
+    rate_note = "每天打卡" if pr["rate"] >= 0.999 else f"按近期打卡率 {rate_pct}"
     lines += [
         f"🏦 钱包当前余额：{fin['wallet_balance']:.2f} 元",
         f"🔮 月底余额预测：{pr['predict_balance']:.2f} 元",
-        f"   （剩余 {pr['days_left']} 天：打卡 +{pr['predict_income']:.2f}，"
+        f"   （剩余 {pr['days_left']} 天：打卡 {rate_note} +{pr['predict_income']:.2f}，"
         f"按日均 {pr['daily_expense']:.2f} 预计再花 {pr['predict_expense']:.2f}）",
     ]
-    if not checkin_added and today in (fin.get("no_checkin_dates") or []):
+    if today in (fin.get("no_checkin_dates") or []):
         lines.append("")
         lines.append("ℹ️ 今天你说了没打卡，未记打卡奖励。")
+    elif need_ask:
+        lines.append("")
+        lines.append("📖 今天单词打卡了吗？打卡了回复「打卡了」（+10 自动补记），没打卡回「没打卡」或不用回。")
     feishu_send_action(chat_id, "🌙 收支日报", "\n".join(lines), color="blue")
 
 
@@ -4943,6 +5014,9 @@ def process_command(text, chat_id):
     if t in ("今天没打卡", "没打卡", "忘记打卡了", "没单词打卡", "单词没打卡"):
         cmd_finance_no_checkin(chat_id)
         return
+    if t in ("打卡了", "打了卡", "今天打卡了", "打卡", "打卡啦", "打完卡了"):
+        cmd_finance_checkin_confirm(chat_id)
+        return
     if t.startswith("删账"):
         cmd_finance_delete(chat_id, text)
         return
@@ -5488,11 +5562,13 @@ SYSTEM_PROMPT = (
     "系统自动转拼音按西浦账号规则搜索），之后订房自动带上同伴；"
     "用户提到和某位同学一起订时，把同学名字填进 partner 参数（中文名/账号均可）。"
     "用户没设同伴又要订房时，引导他设置；有 set_room_partner 工具可用。\n\n"
-    "9. **财务管家（记账）**：你管理用户的钱包。每月生活费 3000，每晚单词打卡奖励 +10。"
+    "9. **财务管家（记账）**：你管理用户的钱包。每月生活费 3000，单词打卡奖励 +10（但用户不是每天都能打卡）。"
     "用户说任何花钱/赚钱的事（「中午吃饭花了25」「兼职赚了50」），帮他记一笔账："
     "[ACTION:记账|支出|25|午饭] 或 [ACTION:记账|收入|50|兼职]（格式：类型|金额|备注）。"
+    "用户说「今天打卡了」→ [ACTION:打卡了]；说「没打卡」→ [ACTION:没打卡]。"
     "用户问「还剩多少钱」「钱包余额」→ [ACTION:余额]；问「今天/这个月花了多少」→ [ACTION:账本] 或 [ACTION:本月账单]。"
-    "生活费到账 → [ACTION:记账|生活费]。每天 23:00 系统自动发收支日报并预测月底余额，不用你操心。\n\n"
+    "生活费到账 → [ACTION:记账|生活费]。每天 23:00 系统自动发收支日报并在末尾问用户是否打卡，"
+    "用户回复后打卡奖励才入账，预测按实际打卡率估算，不用你操心。\n\n"
     "## 西浦课程考核知识（2026-10-04 实地抓取 LM 课程页 + Module Handbook，以老师公告为准，绝不编造作业性质）\n"
     "LearningMall（LMC）是西浦的教学中枢：课程资料、作业提交、测验、公告全在上面。"
     "「Exam Page for <课程>」是课程的考试页（正式考试入口），下面的 quiz 是机房考试项目，"
@@ -5578,6 +5654,8 @@ SYSTEM_PROMPT = (
     "- 记一笔支出：[ACTION:记账|支出|25|午饭]\n"
     "- 记一笔收入：[ACTION:记账|收入|50|兼职]\n"
     "- 生活费到账：[ACTION:记账|生活费]\n"
+    "- 确认今日打卡：[ACTION:打卡了]\n"
+    "- 今日没打卡：[ACTION:没打卡]\n"
     "- 查今日账单：[ACTION:账本]\n"
     "- 查本月账单：[ACTION:本月账单]\n"
     "- 查钱包余额/预测：[ACTION:余额]\n"
@@ -6056,6 +6134,10 @@ def execute_llm_action(action, chat_id):
         cmd_finance_view(chat_id, "余额")
     elif a in ("本月账单", "月账"):
         cmd_finance_view(chat_id, "本月账单")
+    elif a == "打卡了":
+        cmd_finance_checkin_confirm(chat_id)
+    elif a == "没打卡":
+        cmd_finance_no_checkin(chat_id)
     else:
         log(f"未知action: {action}")
 
