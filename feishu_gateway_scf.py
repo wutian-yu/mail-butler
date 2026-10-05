@@ -5014,13 +5014,16 @@ def process_command(text, chat_id):
     if t in ("今天没打卡", "没打卡", "忘记打卡了", "没单词打卡", "单词没打卡"):
         cmd_finance_no_checkin(chat_id)
         return
-    if t in ("打卡了", "打了卡", "今天打卡了", "打卡", "打卡啦", "打完卡了"):
+    if t in ("打卡了", "打了卡", "今天打卡了", "打卡", "打卡啦", "打完卡了",
+             "已打卡", "已打卡了", "今日已打卡", "今日打卡了", "今天已打卡",
+             "打卡成功", "打过卡了", "打完了"):
         cmd_finance_checkin_confirm(chat_id)
         return
     if t.startswith("删账"):
         cmd_finance_delete(chat_id, text)
         return
-    if t in ("账本", "今日账单", "账单", "本月账单", "月账", "余额", "钱包", "钱包余额", "财务"):
+    if (t in ("账本", "今日账单", "账单", "本月账单", "月账", "余额", "钱包", "钱包余额", "财务")
+            or (("还剩多少" in t or "剩多少" in t or "剩下多少" in t) and ("钱" in t or "余额" in t))):
         cmd_finance_view(chat_id, t)
         return
     if t.startswith("推荐房") or t.startswith("房间推荐") or re.search(r"^\d+人.*房", t) or re.search(r"^\d+个人.*房", t):
@@ -5568,7 +5571,11 @@ SYSTEM_PROMPT = (
     "用户说「今天打卡了」→ [ACTION:打卡了]；说「没打卡」→ [ACTION:没打卡]。"
     "用户问「还剩多少钱」「钱包余额」→ [ACTION:余额]；问「今天/这个月花了多少」→ [ACTION:账本] 或 [ACTION:本月账单]。"
     "生活费到账 → [ACTION:记账|生活费]。每天 23:00 系统自动发收支日报并在末尾问用户是否打卡，"
-    "用户回复后打卡奖励才入账，预测按实际打卡率估算，不用你操心。\n\n"
+    "用户回复后打卡奖励才入账，预测按实际打卡率估算，不用你操心。"
+    "**严禁口头承诺**：用户说「打卡了/已打卡/今天打卡」→ 必须输出 [ACTION:打卡了]；"
+    "用户问余额/还剩多少钱/打卡是否到账 → 必须输出 [ACTION:余额]。"
+    "绝不能只回复「已记 +10」「我帮你查」之类的空话却不输出 ACTION——"
+    "不输出 ACTION 就等于没执行，用户会以为记上了实际没记。\n\n"
     "## 西浦课程考核知识（2026-10-04 实地抓取 LM 课程页 + Module Handbook，以老师公告为准，绝不编造作业性质）\n"
     "LearningMall（LMC）是西浦的教学中枢：课程资料、作业提交、测验、公告全在上面。"
     "「Exam Page for <课程>」是课程的考试页（正式考试入口），下面的 quiz 是机房考试项目，"
