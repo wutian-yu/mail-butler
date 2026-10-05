@@ -1109,6 +1109,7 @@ HELP_TEXT = (
     "「查房 [日期] [楼层]」查空闲房间（含容量+设备信息）\n"
     "「推荐房间 4人」按人数推荐最佳房间\n"
     "「订房 房间号 日期 时段」预定（自动带同伴，需回复确认）\n"
+    "「定时订房 10-15 13:00-16:00」超3天窗口自动抢订（窗口开启日00:00触发）\n"
     "「设同伴 张伟」设置常用同学（中文名即可）\n"
     "「我的预约」查我的预定\n"
     "「取消预定 N」取消第N个\n"
@@ -2953,6 +2954,231 @@ def cmd_room_book(chat_id, text):
         feishu_send_action(chat_id, "🏛️ 研讨室预定", "❌ 触发预定失败（GitHub API 异常），稍后再试。", color="red")
 
 
+# ============ 定时订房（超3天窗口的任务，到窗口开启日 00:00 自动抢订） ============
+
+ROOM_QUEUE_FILE = "room_booking_queue.json"
+
+
+def _room_queue_load():
+    """读定时订房队列 (queue, sha)；文件不存在返回空队列"""
+    try:
+        return gh_read_json(ROOM_QUEUE_FILE)
+    except Exception:
+        return {"items": []}, ""
+
+
+def _room_auto_pick(date_str, people=2):
+    """自动选房：优先从监控缓存挑空闲的匹配房；缓存没数据（正常——3天窗口外日期还没快照）
+    就静态选（凌晨0点刚开窗，房间基本全空）。返回房间号字符串"""
+    compact = _room_cache(date_str)
+    if compact:
+        recs = _room_recommend(people, compact)
+        for num, p, status, slots, _, _ in recs:
+            if status in ("free", "partial", "unknown"):
+                return num
+    # 静态兜底顺序：2-5人经典房优先，然后大房
+    for cand in ("543", "545", "314", "316", "318", "445", "547", "714", "814", "1014", "429"):
+        if cand in ROOM_PROFILES:
+            return cand
+    return "543"
+
+
+def cmd_room_book_later(chat_id, text):
+    """「定时订房 10-15 13:00-16:00 [房号]」登记抢订任务
+    「定时订房列表」查看 /「取消定时订房 N」删除
+    原理：订 date 房间的3天窗口在 (date-3天) 00:00 开启，到点自动触发订房指令抢先机。"""
+    rest = re.sub(r"^定时订(个房|房|房间|研讨室)", "", text.strip()).strip()
+    now_bj = _bjnow_s()
+
+    # ---- 取消 ----
+    if rest.startswith("取消"):
+        n_m = re.search(r"(\d+)", rest)
+        queue, sha = _room_queue_load()
+        items = [i for i in queue.get("items", []) if i.get("status") == "pending"]
+        if not items:
+            feishu_send_action(chat_id, "⏰ 定时订房", "📭 没有可取消的定时订房任务。", color="blue")
+            return
+        n = int(n_m.group(1)) if n_m else len(items)
+        if n < 1 or n > len(items):
+            feishu_send_action(chat_id, "⏰ 定时订房", f"⚠️ 编号超出范围（1-{len(items)}）。", color="red")
+            return
+        target = items[n - 1]
+        queue["items"] = [i for i in queue.get("items", [])
+                          if i.get("id") != target.get("id")]
+        try:
+            gh_write_json(ROOM_QUEUE_FILE, queue, sha, "cancel room booking queue")
+            feishu_send_action(chat_id, "⏰ 定时订房",
+                f"✅ 已取消：{target['date']} {target['start']}-{target['end']}（{target.get('trigger_date')} 触发的那条）",
+                color="green")
+        except Exception as e:
+            log(f"取消定时订房失败: {e}")
+            feishu_send_action(chat_id, "⏰ 定时订房", "❌ 取消失败，稍后再试。", color="red")
+        return
+
+    # ---- 列表 ----
+    if not rest or rest in ("列表", "list", "查看", "队列"):
+        queue, _ = _room_queue_load()
+        items = [i for i in queue.get("items", []) if i.get("status") == "pending"]
+        if not items:
+            feishu_send_action(chat_id, "⏰ 定时订房",
+                "📭 没有待执行的定时订房任务。\n\n"
+                "设置：「定时订房 10-15 13:00-16:00」（房间自动选）\n"
+                "指定房间：「定时订房 10-15 13:00-16:00 445」\n"
+                "原理：3天窗口开启日（日期-3）凌晨 00:00 自动触发订房抢先机。",
+                color="blue")
+            return
+        lines = ["⏰ 定时订房队列：\n"]
+        for n, it in enumerate(items, 1):
+            room_txt = it.get("room") if str(it.get("room")) != "auto" else "自动选"
+            lines.append(f"{n}. {it['date']} {it['start']}-{it['end']} · 房间 {room_txt}")
+            lines.append(f"   ⏰ {it['trigger_date']} 00:00 自动触发\n")
+        lines.append("取消：「取消定时订房 N」")
+        feishu_send_action(chat_id, "⏰ 定时订房", "\n".join(lines), color="blue")
+        return
+
+    # ---- 登记 ----
+    m = re.search(r"(\d{1,2}:\d{2})\s*[-~到至]\s*(\d{1,2}:\d{2})", rest)
+    if not m:
+        feishu_send_action(chat_id, "⏰ 定时订房",
+            "用法：「定时订房 10-15 13:00-16:00」\n"
+            "指定房间：「定时订房 10-15 13:00-16:00 445」", color="red")
+        return
+    start, end = m.group(1), m.group(2)
+    date = _room_parse_date(rest, now_bj.replace(tzinfo=None))
+    # 房间号：时间段和日期删掉后找 3-4 位数字，没有则 auto
+    leftover = rest
+    leftover = re.sub(r"(\d{1,2}:\d{2})\s*[-~到至]\s*(\d{1,2}:\d{2})", "", leftover)
+    room_m = re.search(r"\b(\d{3,4})\b", leftover)
+    room_key = room_m.group(1) if room_m else "auto"
+    # 校验时段（不校验3天窗口——本功能就是为超窗口设计的）
+    try:
+        def to_min(t):
+            h, mm = t.split(":")
+            return int(h) * 60 + int(mm)
+        if to_min(end) <= to_min(start):
+            raise ValueError("end<=start")
+        if to_min(end) - to_min(start) > 3 * 60:
+            feishu_send_action(chat_id, "⏰ 定时订房", "❌ 每次最长 3 小时。", color="red")
+            return
+        if to_min(start) < 9 * 60 or to_min(end) > 22 * 60:
+            feishu_send_action(chat_id, "⏰ 定时订房", "❌ 开放时间为 09:00-22:00。", color="red")
+            return
+    except Exception:
+        feishu_send_action(chat_id, "⏰ 定时订房", "❌ 时间格式应为 HH:MM，如 13:00-16:00。", color="red")
+        return
+    # 日期校验
+    try:
+        d = datetime.strptime(date, "%Y-%m-%d").date()
+    except Exception:
+        feishu_send_action(chat_id, "⏰ 定时订房", f"❌ 日期格式不对：{date}", color="red")
+        return
+    today = now_bj.date()
+    if d <= today:
+        feishu_send_action(chat_id, "⏰ 定时订房", "❌ 不能订今天及之前的日期。", color="red")
+        return
+    days_ahead = (d - today).days
+    if days_ahead <= 3:
+        feishu_send_action(chat_id, "⏰ 定时订房",
+            f"ℹ️ {date} 在 3 天窗口内，现在就能直接订，不用定时。\n\n"
+            f"直接发：「订房 {room_key if room_key != 'auto' else '543'} {date} {start}-{end}」",
+            color="blue")
+        return
+    trigger_date = (d - timedelta(days=3)).strftime("%Y-%m-%d")
+    # 同伴检查（订房要求至少2人）
+    room_state, _ = _room_state()
+    partner = room_state.get("partner_accNo") or room_state.get("partner") or ""
+    if not partner:
+        feishu_send_action(chat_id, "⏰ 定时订房",
+            "❌ 研讨室要求至少 2 人，请先「设同伴 张伟」设置同伴。", color="red")
+        return
+    # 重复登记检查：同日期同时段只允许一条 pending
+    queue, sha = _room_queue_load()
+    for it in queue.get("items", []):
+        if (it.get("status") == "pending" and it.get("date") == date
+                and it.get("start") == start and it.get("end") == end):
+            feishu_send_action(chat_id, "⏰ 定时订房",
+                f"ℹ️ 已有相同任务：{date} {start}-{end}（{it['trigger_date']} 00:00 触发），不用重复登记。",
+                color="blue")
+            return
+    item = {
+        "id": f"rbq-{now_bj.strftime('%Y%m%d%H%M%S')}",
+        "date": date, "start": start, "end": end,
+        "room": room_key, "partner": str(partner),
+        "trigger_date": trigger_date, "status": "pending",
+        "created": now_bj.strftime("%Y-%m-%d %H:%M"),
+    }
+    queue.setdefault("items", []).append(item)
+    try:
+        gh_write_json(ROOM_QUEUE_FILE, queue, sha, f"room booking queue add {date} {start}")
+    except Exception as e:
+        log(f"定时订房登记失败: {e}")
+        feishu_send_action(chat_id, "⏰ 定时订房", "❌ 登记失败，稍后再试。", color="red")
+        return
+    room_txt = room_key if room_key != "auto" else "自动选（届时挑空闲房）"
+    feishu_send_action(chat_id, "⏰ 定时订房",
+        f"✅ 已登记定时订房：\n\n"
+        f"📅 {date}（{d.month}月{d.day}日）{start}-{end}\n"
+        f"🏛️ 房间：{room_txt}\n"
+        f"👥 同伴：{room_state.get('partner_display') or room_state.get('partner')}\n\n"
+        f"⏰ {trigger_date} 00:00 自动触发订房（3天窗口刚开启，抢先预订）\n"
+        f"结果约 2-4 分钟自动发群里。\n\n"
+        "查看：「定时订房列表」　取消：「取消定时订房 1」",
+        color="green")
+
+
+def _check_room_booking_queue(chat_id=None):
+    """定时订房队列检查（每分钟 Timer 跑）：到触发时间（trigger_date 00:00 北京时间）的任务自动触发订房。
+    持久化 status 去重，只触发一次。"""
+    chat_id = chat_id or CHAT_ID_FALLBACK
+    try:
+        queue, sha = gh_read_json(ROOM_QUEUE_FILE)
+    except Exception:
+        return
+    items = queue.get("items") or []
+    if not items:
+        return
+    from datetime import timezone
+    now_bj = _bjnow_s()
+    changed = False
+    for it in items:
+        if it.get("status") != "pending":
+            continue
+        trig = it.get("trigger_date") or ""
+        try:
+            trig_dt = datetime.strptime(trig, "%Y-%m-%d").replace(
+                hour=0, minute=0, tzinfo=timezone(timedelta(hours=8)))
+        except Exception:
+            continue
+        if now_bj < trig_dt:
+            continue
+        # ---- 到点，触发订房 ----
+        date, start, end = it.get("date", ""), it.get("start", ""), it.get("end", "")
+        room_key = str(it.get("room") or "auto")
+        if room_key.lower() in ("auto", ""):
+            room_key = _room_auto_pick(date)
+        op = {"action": "book", "date": date, "start": start, "end": end,
+              "room": room_key, "memo": "定时自动订房", "partner": it.get("partner") or ""}
+        ok = _trigger_room_op(op)
+        it["status"] = "triggered" if ok else "trigger_failed"
+        it["final_room"] = room_key
+        it["triggered_at"] = now_bj.strftime("%Y-%m-%d %H:%M")
+        changed = True
+        if ok:
+            feishu_send_action(chat_id, "⏰ 定时订房已触发",
+                f"⏰ 到点了，已自动发送订房指令：\n\n"
+                f"🏛️ Room {room_key}\n📅 {date} {start}-{end}\n\n"
+                "结果约 2-4 分钟自动送达。", color="green")
+        else:
+            feishu_send_action(chat_id, "⏰ 定时订房触发失败",
+                f"❌ Room {room_key} {date} {start}-{end} 触发失败（GitHub API 异常）。\n\n"
+                f"手动补救：「订房 {room_key} {date} {start}-{end}」", color="red")
+    if changed:
+        try:
+            gh_write_json(ROOM_QUEUE_FILE, queue, sha, "room booking queue trigger")
+        except Exception as e:
+            log(f"定时订房队列保存失败: {e}")
+
+
 def cmd_room_set_partner(chat_id, text):
     """「设同伴 张伟」/「设同伴 张伟 25」/「设同伴 TOM.SMITH25」设置常用同伴
     「设同伴」查看 /「设同伴 清除」删除。
@@ -3811,6 +4037,12 @@ def process_command(text, chat_id):
     if t.startswith("查房") or t.startswith("房间查询"):
         cmd_room_query(chat_id, text)
         return
+    if t.startswith("取消定时订房") or t.startswith("取消定时预订"):
+        cmd_room_book_later(chat_id, "定时订房 取消" + re.sub(r"^取消定时订(房|房间|预订)", "", t).strip())
+        return
+    if t.startswith("定时订房") or t.startswith("预约订房") or t.startswith("定时预订"):
+        cmd_room_book_later(chat_id, text)
+        return
     if t.startswith("推荐房") or t.startswith("房间推荐") or re.search(r"^\d+人.*房", t) or re.search(r"^\d+个人.*房", t):
         cmd_room_recommend(chat_id, text)
         return
@@ -4337,6 +4569,9 @@ SYSTEM_PROMPT = (
     "547(2-8人)、714(2-8人)、814(2-8人)、1014(2-10人,设备最全:大白板+移动屏幕+隔音玻璃)。"
     "所有房间标配白板+桌面插座+隔音；高层(7-10F)更安静。"
     "用户不知道选哪间时，引导发「推荐房间 X人」按人数+空闲匹配最佳房间。\n"
+    "用户要订超过 3 天窗口的房间时，引导用「定时订房 日期 时段」登记：系统会在窗口开启日（日期-3天）"
+    "凌晨 00:00 自动触发订房抢先机（用户睡觉时也能抢到房），房间可指定或自动选。"
+    "查队列「定时订房列表」，取消「取消定时订房 N」。\n"
     "⚠️ 研讨室规定每次预定至少 2 人：用户需先发「设同伴 张伟」（中文名即可，"
     "系统自动转拼音按西浦账号规则搜索），之后订房自动带上同伴；"
     "用户提到和某位同学一起订时，把同学名字填进 partner 参数（中文名/账号均可）。"
@@ -4964,6 +5199,8 @@ def _maybe_notify_no_pending_image(chat_id):
 
 def poll_group_messages():
     """定时任务入口：定时推送 + 保活 + 图片处理（文本消息由 webhook + feishu-poller 兜底，不再重复拉取）"""
+    # 定时订房队列检查：到触发时间的任务自动抢订（每分钟跑一次）
+    _check_room_booking_queue(CHAT_ID_FALLBACK)
     # 定时推送
     _check_pending_revoke(CHAT_ID_FALLBACK)
     _check_leave_approval(CHAT_ID_FALLBACK)
