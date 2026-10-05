@@ -796,7 +796,8 @@ def process_commands(commands, pending, confirmed, state, outlook):
             item = active[num - 1]
             item["status"] = "confirmed"
             confirmed_items.append(item)
-            pending_items.remove(item)
+            # v39c: 不再物理删除 item，保留在 pending.json 做去重
+            # pending_items.remove(item)  # 旧逻辑：删除后下次扫描会重复推送
 
             feishu_send(
                 f"✅ 已加入日历！\n\n"
@@ -827,7 +828,8 @@ def process_commands(commands, pending, confirmed, state, outlook):
 
             item = active[num - 1]
             item["status"] = "skipped"
-            pending_items.remove(item)
+            # v39c: 不再物理删除 item，保留在 pending.json 做去重
+            # pending_items.remove(item)  # 旧逻辑：删除后下次扫描会重复推送
 
             feishu_send(f"⏭️ 已跳过：{item['subject'][:50]}")
             log(f"用户跳过活动: {item['subject'][:40]}")
