@@ -1106,7 +1106,8 @@ HELP_TEXT = (
     "「取消请假」放弃进行中假条\n"
     "「撤回请假 [日期]」撤回待审批申请（「撤回请假」全撤；「撤回请假 10-11」只撤那天）\n\n"
     "🏛️ 图书馆研讨室\n"
-    "「查房 [日期] [楼层]」查空闲房间\n"
+    "「查房 [日期] [楼层]」查空闲房间（含容量+设备信息）\n"
+    "「推荐房间 4人」按人数推荐最佳房间\n"
     "「订房 房间号 日期 时段」预定（自动带同伴，需回复确认）\n"
     "「设同伴 张伟」设置常用同学（中文名即可）\n"
     "「我的预约」查我的预定\n"
@@ -2541,6 +2542,104 @@ def _check_leave_approval(chat_id):
 ROOM_MAX_AHEAD_DAYS = 3      # 只能提前 3 天内预定
 ROOM_OPEN, ROOM_CLOSE = "09:00", "22:00"
 
+# ---- SIP 图书馆研讨室 · 静态房间档案 ----
+# API 只返回房间号+容量，不返回设备信息。以下基于图书馆官网公告 + 实地信息整理。
+# 官网明确 Room 1014 配备：大白板、移动屏幕、桌面插座、双层隔音玻璃；
+# 官网称"装饰风格与其他研讨室一致" → 其他房间设备类似（白板+插座+隔音），但无独立屏幕。
+# 容量从 API devName 解析（如 "Room 543 Capacity: 2-5"）。
+# 楼层特点基于图书馆布局：高层(8/10F)更安静、风景好；低层(3-5F)更方便进出。
+ROOM_PROFILES = {
+    # 3F — 小型研讨室，3间连排，适合2-5人小组讨论
+    "314": {"floor": "3F", "cap": "2-5", "equip": "白板+桌面插座+隔音", "tag": "小型·便捷层"},
+    "316": {"floor": "3F", "cap": "2-5", "equip": "白板+桌面插座+隔音", "tag": "小型·便捷层"},
+    "318": {"floor": "3F", "cap": "2-5", "equip": "白板+桌面插座+隔音", "tag": "小型·便捷层"},
+    # 4F — 中型研讨室，适合4-9人
+    "429": {"floor": "4F", "cap": "6-9", "equip": "白板+桌面插座+隔音", "tag": "中型·适合6人+"},
+    "445": {"floor": "4F", "cap": "4-6", "equip": "白板+桌面插座+隔音", "tag": "中型·4-6人"},
+    # 5F — 混合层，有2-5人小间和2-8人中间
+    "543": {"floor": "5F", "cap": "2-5", "equip": "白板+桌面插座+隔音", "tag": "小型·经典"},
+    "545": {"floor": "5F", "cap": "2-5", "equip": "白板+桌面插座+隔音", "tag": "小型·经典"},
+    "547": {"floor": "5F", "cap": "2-8", "equip": "白板+桌面插座+隔音", "tag": "中型·灵活(2-8人)"},
+    # 7F — 单间，2-8人
+    "714": {"floor": "7F", "cap": "2-8", "equip": "白板+桌面插座+隔音", "tag": "中型·高层安静"},
+    # 8F — 单间，2-8人
+    "814": {"floor": "8F", "cap": "2-8", "equip": "白板+桌面插座+隔音", "tag": "中型·高层安静"},
+    # 10F — 最新房间(2025年新增)，最大，设备最全
+    "1014": {"floor": "10F", "cap": "2-10", "equip": "大白板+移动屏幕+桌面插座+双层隔音玻璃", "tag": "大型·设备最全·最新"},
+}
+
+def _room_profile(room_name):
+    """从房间名（如 'Room 543 Capacity: 2-5'）提取房间号，查档案"""
+    m = re.search(r"(\d{3,4})", room_name or "")
+    if m:
+        return ROOM_PROFILES.get(m.group(1), {"cap": "?", "equip": "白板+插座+隔音", "tag": ""})
+    return {"cap": "?", "equip": "白板+插座+隔音", "tag": ""}
+
+
+def _room_recommend(people, compact=None):
+    """根据人数推荐房间，返回排序后的 [(room号, profile, reason)] 列表"""
+    candidates = []
+    for num, p in ROOM_PROFILES.items():
+        # 解析容量范围
+        cap = p["cap"]
+        m = re.match(r"(\d+)\s*[-~]\s*(\d+)", cap)
+        if not m:
+            continue
+        lo, hi = int(m.group(1)), int(m.group(2))
+        if people < lo or people > hi:
+            continue
+        # 检查是否空闲
+        is_free = True
+        free_slots = ""
+        if compact:
+            for lab in compact:
+                for r in lab.get("rooms") or []:
+                    rn = r.get("name", "")
+                    if num in rn:
+                        bk = r.get("bk") or []
+                        if bk:
+                            is_free = False
+                        break
+        # 评分：刚好容纳 > 容量大余量 > 楼层高
+        cap_fit = hi - people  # 余量越小越优先
+        floor_bonus = {"10F": 5, "8F": 4, "7F": 3, "5F": 2, "4F": 1, "3F": 0}.get(p["floor"], 0)
+        score = -cap_fit * 10 + floor_bonus + (50 if is_free else 0)
+        candidates.append((num, p, score, is_free))
+    candidates.sort(key=lambda x: -x[2])
+    return candidates
+
+
+def cmd_room_recommend(chat_id, text):
+    """「推荐房间 4人」/「推荐房间 6」/「4个人订哪个房间好」"""
+    m = re.search(r"(\d+)\s*人", text)
+    people = int(m.group(1)) if m else 0
+    if not people:
+        feishu_send(chat_id, "用法：「推荐房间 4人」\n管家会根据人数推荐最合适的研讨室。")
+        return
+    today = _bjnow_s().strftime("%Y-%m-%d")
+    compact = _room_cache(today)
+    recs = _room_recommend(people, compact)
+    if not recs:
+        feishu_send_action(chat_id, "🏛️ 房间推荐",
+            f"❌ 没有适合 {people} 人的研讨室。\n\n现有房间容量：2-5人(314/316/318/543/545)、4-6人(445)、2-8人(547/714/814)、6-9人(429)、2-10人(1014)",
+            color="red")
+        return
+    lines = [f"🏛️ {people}人研讨室推荐（按匹配度排序）\n"]
+    for i, (num, p, score, is_free) in enumerate(recs[:5], 1):
+        status = "🟢 空闲" if is_free else ("🔴 已被占" if compact else "⚪ 状态未知")
+        lines.append(f"{i}. Room {num}（{p['floor']}）{status}")
+        lines.append(f"   容量 {p['cap']}人 · {p['equip']}")
+        lines.append(f"   {p['tag']}")
+        lines.append("")
+    lines.append("💡 发「查房」看实时空闲，「订房 房间号 日期 时段」直接预订")
+    feishu_send_action(chat_id, "🏛️ 房间推荐", "\n".join(lines), color="blue")
+
+
+def _bjnow_s():
+    """北京时间 now（用于云函数侧）"""
+    from datetime import datetime, timezone, timedelta
+    return datetime.now(timezone(timedelta(hours=8)))
+
 
 def _room_state():
     """读 butler-data 的 xjtlu_state.json，返回 (room 快照, sha)"""
@@ -2553,13 +2652,22 @@ def _room_state():
 
 
 def _room_avail_text(compact, date_str):
-    """把监控缓存的 compact 可用性数据格式化为展示文本"""
+    """把监控缓存的 compact 可用性数据格式化为展示文本（含容量+设备信息）"""
     lines = []
     for lab in compact or []:
         lines.append(f"\n【{lab.get('f')}】")
         for r in lab.get("rooms") or []:
             o_s, o_e = r.get("os", ROOM_OPEN), r.get("oe", ROOM_CLOSE)
             booked = sorted(r.get("bk") or [])
+            # 提取房间号查档案
+            rn_match = re.search(r"(\d{3,4})", r.get("name", ""))
+            rn = rn_match.group(1) if rn_match else ""
+            prof = ROOM_PROFILES.get(rn, {})
+            cap_str = prof.get("cap", "?")
+            equip = prof.get("equip", "")
+            tag = prof.get("tag", "")
+            tag_str = f" · {tag}" if tag else ""
+            equip_str = f"\n   📐 {equip}" if equip else ""
             if booked:
                 def to_min(t):
                     h, m = t.split(":")
@@ -2578,15 +2686,16 @@ def _room_avail_text(compact, date_str):
                     free.append((cur, to_min(o_e)))
                 if free:
                     slots = "、".join(f"{to_str(a)}-{to_str(b)}" for a, b in free)
-                    lines.append(f"🟢 {r.get('name')} 空闲：{slots}")
+                    lines.append(f"🟢 Room {rn}（{cap_str}人{tag_str}）空闲：{slots}{equip_str}")
                 else:
-                    lines.append(f"🔴 {r.get('name')}（{o_s}-{o_e}）已约满")
+                    lines.append(f"🔴 Room {rn}（{cap_str}人）{o_s}-{o_e} 已约满{equip_str}")
             else:
-                lines.append(f"🟢 {r.get('name')}（{o_s}-{o_e}）全天空闲")
+                lines.append(f"🟢 Room {rn}（{cap_str}人{tag_str}）{o_s}-{o_e} 全天空闲{equip_str}")
     if not lines:
         return None
     head = (f"🏛️ SIP 图书馆研讨室 · {date_str}\n"
-            f"⏰ 开放 {ROOM_OPEN}-{ROOM_CLOSE}，每次最长 3 小时，每天限 1 次，最多提前 {ROOM_MAX_AHEAD_DAYS} 天")
+           f"⏰ 开放 {ROOM_OPEN}-{ROOM_CLOSE}，每次最长 3 小时，每天限 1 次，最多提前 {ROOM_MAX_AHEAD_DAYS} 天\n"
+           f"💡 发「推荐房间 X人」按人数匹配最佳房间")
     return head + "\n" + "\n".join(lines)
 
 
@@ -3626,6 +3735,9 @@ def process_command(text, chat_id):
     if t.startswith("查房") or t.startswith("房间查询"):
         cmd_room_query(chat_id, text)
         return
+    if t.startswith("推荐房") or t.startswith("房间推荐") or re.search(r"^\d+人.*房", t) or re.search(r"^\d+个人.*房", t):
+        cmd_room_recommend(chat_id, text)
+        return
     if t.startswith("订房") or t.startswith("订个房") or t.startswith("订研讨室"):
         cmd_room_book(chat_id, text)
         return
@@ -4145,6 +4257,10 @@ SYSTEM_PROMPT = (
     "订房/取消由云端浏览器执行（约2-4分钟，结果自动发消息，要提前告知用户稍等）。"
     "SIP 校区楼层 3F/4F/5F/7F/8F/10F，开放 09:00-22:00，"
     "每次最长 3 小时、每天限 1 次、最多提前 3 天预定。"
+    "房间档案（11间）：314/316/318(2-5人)、429(6-9人)、445(4-6人)、543/545(2-5人)、"
+    "547(2-8人)、714(2-8人)、814(2-8人)、1014(2-10人,设备最全:大白板+移动屏幕+隔音玻璃)。"
+    "所有房间标配白板+桌面插座+隔音；高层(7-10F)更安静。"
+    "用户不知道选哪间时，引导发「推荐房间 X人」按人数+空闲匹配最佳房间。\n"
     "⚠️ 研讨室规定每次预定至少 2 人：用户需先发「设同伴 张伟」（中文名即可，"
     "系统自动转拼音按西浦账号规则搜索），之后订房自动带上同伴；"
     "用户提到和某位同学一起订时，把同学名字填进 partner 参数（中文名/账号均可）。"
