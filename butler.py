@@ -26,6 +26,9 @@ SECRETS_DIR = os.environ.get("DATA_DIR", os.path.join(BASE, ".secrets"))
 STATE_FILE = os.path.join(SECRETS_DIR, "state.json")
 PENDING_FILE = os.path.join(SECRETS_DIR, "pending.json")
 CONFIRMED_FILE = os.path.join(SECRETS_DIR, "confirmed.json")
+# v40c: 与云函数 webhook 共享的消息级去重表（云函数处理完用户消息后写入 ids，
+# butler 兜底拉群消息前先过滤，杜绝同一条消息被两条路径各执行一次）
+PROCESSED_MSGS_FILE = os.path.join(SECRETS_DIR, "feishu_processed_msgs.json")
 # ICS 文件名带随机token（防陌生人猜测订阅链接）
 ICS_FILENAME = os.environ.get("ICS_FILENAME", "calendar.ics")
 ICS_FILE = os.path.join(BASE, "docs", ICS_FILENAME)
@@ -475,9 +478,15 @@ def feishu_read_commands(state):
 
     commands = []
     processed = state.setdefault("feishu_processed", [])
+    # v40c: 读共享已处理表（云函数 webhook 处理过的消息在这里）；
+    # 文件不存在/为空属正常初始态（云函数还没处理过任何消息），按空表继续兜底
+    shared = load_json(PROCESSED_MSGS_FILE, {"ids": []})
+    shared_ids = set(shared.get("ids") or [])
+    shared_dirty = False
+    _now_ms = _time.time() * 1000
     for msg in data.get("data", {}).get("items", []):
         msg_id = msg.get("message_id", "")
-        if msg_id in processed:
+        if msg_id in processed or msg_id in shared_ids:
             continue
         # 只处理文本消息
         if msg.get("msg_type") != "text":
@@ -487,19 +496,46 @@ def feishu_read_commands(state):
         if sender_info.get("sender_type", "") != "user":
             processed.append(msg_id)
             continue
+        # v40c: 发出不到 2 分钟的新消息留给 webhook 秒级路径处理，本轮先跳过
+        # （不标记已处理，下轮再看；webhook 挂了 2 分钟后由这里兜底）
+        try:
+            ct = int(msg.get("create_time", "0"))
+            if ct and _now_ms - ct < 120_000:
+                continue
+        except (ValueError, TypeError):
+            pass
         # 解析消息内容
         content = json.loads(msg.get("body", {}).get("content", "{}"))
         text = content.get("text", "").strip()
         if text:
             commands.append({"text": text, "msg_id": msg_id})
             processed.append(msg_id)
+            shared_ids.add(msg_id)
+            shared_dirty = True
 
     # 只保留最近500条已处理记录
     state["feishu_processed"] = processed[-500:]
+    if shared_dirty:
+        shared["ids"] = list(shared_ids)[-500:]
+        shared["updated"] = datetime.now().strftime("%Y-%m-%d %H:%M")
+        save_json(PROCESSED_MSGS_FILE, shared)
     return commands
 
 
 WEEKDAYS = ["周一", "周二", "周三", "周四", "周五", "周六", "周日"]
+
+
+def norm_subject(s):
+    """剥邮件回复/转发前缀（RE:/FW:/Fwd:/答复:/转发:，支持多层嵌套）。
+    v40c: 学校导师常用"回复"形式重发同一封活动邀请（subject 带 RE: 前缀），
+    精确匹配会把变体当成新活动重复推送——规范化后比对，变体不再入队。"""
+    prev = None
+    s = s or ""
+    while prev != s:
+        prev = s
+        s = re.sub(r"^\s*(re\s*[:：]\s*|fw\s*[:：]\s*|fwd\s*[:：]\s*|答复\s*[:：]\s*|转发\s*[:：]\s*)",
+                   "", s, flags=re.IGNORECASE)
+    return s.strip()
 
 
 def fmt_date(date_str):
@@ -1048,8 +1084,9 @@ def run():
             "status": "pending",
             "found_at": datetime.now().strftime("%Y-%m-%d %H:%M"),
         }
-        # 去重：同一 subject 不重复加入
-        existing = [i for i in pending.setdefault("items", []) if i.get("subject") == subject]
+        # 去重：v40c 按"规范化 subject"比对——同一活动的 RE:/FW: 转发变体不重复入队
+        existing = [i for i in pending.setdefault("items", [])
+                    if norm_subject(i.get("subject") or "") == norm_subject(subject)]
         if not existing:
             pending["items"].append(item)
             new_activities += 1
