@@ -1558,15 +1558,19 @@ def _room_query_avail_raw(page, date_str, captured=None):
     return None
 
 
-def _room_compact_avail(raw_data):
-    """原始 data → 精简缓存结构（云函数只负责展示）"""
+def _room_compact_avail(raw_data, save_raw_sample=False):
+    """原始 data → 精简缓存结构（云函数只负责展示）
+    save_raw_sample=True 时额外返回一个完整原始房间对象供探测字段"""
     out = []
+    raw_sample = None
     for campus in raw_data or []:
         if "SIP" not in (campus.get("campusName") or ""):
             continue
         for lab in campus.get("labInfos") or []:
             rooms = []
             for r in lab.get("roomInfos") or []:
+                if raw_sample is None:
+                    raw_sample = r  # 保留第一个房间的完整原始数据
                 ot = (r.get("openTimes") or [{}])[0]
                 booked = []
                 for rv in r.get("resvInfos") or []:
@@ -1581,6 +1585,8 @@ def _room_compact_avail(raw_data):
                               "bk": booked})
             if rooms:
                 out.append({"f": lab.get("labName"), "rooms": rooms})
+    if save_raw_sample:
+        return out, raw_sample
     return out
 
 
@@ -1721,12 +1727,19 @@ def fetch_roombookings_session(browser, main_context, with_cache=True):
         if with_cache:
             # 可用性缓存：今天 + 未来 3 天（预定窗口）
             avail = {}
+            raw_sample = None
             for d in range(ROOM_MAX_AHEAD_DAYS + 1):
                 ds = (_bjnow() + timedelta(days=d)).strftime("%Y-%m-%d")
                 raw = _room_query_avail_raw(page, ds, captured)
                 if raw:
-                    avail[ds] = _room_compact_avail(raw)
+                    compact, sample = _room_compact_avail(raw, save_raw_sample=True)
+                    avail[ds] = compact
+                    if raw_sample is None:
+                        raw_sample = sample
             session["avail"] = avail
+            if raw_sample is not None:
+                session["raw_room_sample"] = raw_sample
+                log(f"📦 房间原始字段: {json.dumps(raw_sample, ensure_ascii=False, default=str)[:600]}")
             # 我的预约缓存（近2天~未来14天）
             begin = (_bjnow() - timedelta(days=2)).strftime("%Y-%m-%d")
             end = (_bjnow() + timedelta(days=14)).strftime("%Y-%m-%d")
