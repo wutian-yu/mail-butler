@@ -1360,6 +1360,12 @@ def cmd_approve(chat_id, text):
     if eid:
         item["outlook_event_id"] = eid
     confirmed.setdefault("items", []).append(item)
+    # v40c: 同一活动的 RE:/FW: 转发变体（规范化标题相同）一并标记为已批准，日历只写这一次
+    _subj = _norm_subject(item.get("subject") or "")
+    related = [i for i in active if i is not item and _norm_subject(i.get("subject") or "") == _subj]
+    for i in related:
+        i["status"] = "confirmed"
+        confirmed["items"].append(i)
     # v39c: 不再物理删除，保留在 pending.json 做去重
     # pending["items"].remove(item)  # 旧行为：删除后 butler 重扫邮件会重复推送
     gh_write_json("pending.json", pending, p_sha, "approve")
@@ -1370,6 +1376,8 @@ def cmd_approve(chat_id, text):
     except Exception:
         gh_write_json("confirmed.json", confirmed, c_sha, "approve")
     result_msg = f"📌 {item['subject'][:50]}\n📅 {item.get('date_txt', '时间待定')}\n👤 {item.get('sender', '')}"
+    if related:
+        result_msg += f"\n\nℹ️ 同一封邮件的转发/回复变体 {len(related)} 封一并标记，日历只写入一次。"
     if eid:
         result_msg += "\n\n✅ 已写入 Outlook 日历，iPhone 日历会自动同步显示。"
     else:
@@ -1415,10 +1423,18 @@ def cmd_skip(chat_id, text):
         return
     item = active[num - 1]
     item["status"] = "skipped"
+    # v40c: 同一活动的 RE:/FW: 转发变体（规范化标题相同）一并跳过，避免一条消息推/跳两遍
+    _subj = _norm_subject(item.get("subject") or "")
+    related = [i for i in active if i is not item and _norm_subject(i.get("subject") or "") == _subj]
+    for i in related:
+        i["status"] = "skipped"
     # v39c: 不再物理删除，保留在 pending.json 做去重
     # pending["items"].remove(item)  # 旧行为：删除后 butler 重扫邮件会重复推送
     gh_write_json("pending.json", pending, p_sha, "skip")
-    feishu_send_action(chat_id, "⏭️ 已跳过", f"{item['subject'][:50]}", color="blue")
+    note = f"{item['subject'][:50]}"
+    if related:
+        note += f"\n\nℹ️ 同一封邮件的转发/回复变体 {len(related)} 封也一并跳过，不会再重复推送。"
+    feishu_send_action(chat_id, "⏭️ 已跳过", note, color="blue")
 
 
 def cmd_schedule(chat_id):
@@ -2718,6 +2734,18 @@ def _room_state():
         return {}, ""
 
 
+def _room_state_strict():
+    """strict 版 _room_state：读取失败返回 (None, "")。
+    用于同伴设置/订房等"把 state 当事实依据"的命令——读不到就必须中止报错，
+    绝不能当空数据继续（否则会误清已设置的同伴、误触发重复查找/订房）。"""
+    try:
+        data, sha = gh_read_json("xjtlu_state.json")
+        return data.get("room") or {}, sha
+    except Exception as e:
+        log(f"room state 读取失败(strict): {e}")
+        return None, ""
+
+
 def _room_avail_text(compact, date_str):
     """把监控缓存的 compact 可用性数据格式化为展示文本（含容量+设备信息）"""
     lines = []
@@ -2935,8 +2963,14 @@ def cmd_room_book(chat_id, text):
         my = re.search(r"(?:^|\s)(20\d{2}|\d{2})\s*$", rest)
         if my:
             years = [my.group(1)[-2:]]
-    room_state, _ = _room_state()
     if not partner:
+        room_state, _ = _room_state_strict()
+        if room_state is None:
+            # 读不到同伴状态就继续订房会丢同伴（研讨室要求至少2人），中止
+            feishu_send_action(chat_id, "🏛️ 研讨室预定",
+                "⚠️ 状态读取失败（网络抖动），为避免订房丢同伴已中止。\n请稍等几秒再发一次。",
+                color="orange")
+            return
         if room_state.get("partner_accNo"):
             partner = str(room_state["partner_accNo"])  # 已解析过，直接用 accNo
         else:
@@ -3090,7 +3124,12 @@ def cmd_room_book_later(chat_id, text):
         return
     trigger_date = (d - timedelta(days=3)).strftime("%Y-%m-%d")
     # 同伴检查（订房要求至少2人）
-    room_state, _ = _room_state()
+    room_state, _ = _room_state_strict()
+    if room_state is None:
+        feishu_send_action(chat_id, "⏰ 定时订房",
+            "⚠️ 状态读取失败（网络抖动），为避免登记丢同伴已中止。\n请稍等几秒再发一次。",
+            color="orange")
+        return
     partner = room_state.get("partner_accNo") or room_state.get("partner") or ""
     if not partner:
         feishu_send_action(chat_id, "⏰ 定时订房",
@@ -3189,7 +3228,14 @@ def cmd_room_set_partner(chat_id, text):
     「设同伴」查看 /「设同伴 清除」删除。
     研讨室要求至少 2 人；支持中文名（自动转拼音按西浦规则搜索）、账号、拼音名。"""
     rest = re.sub(r"^设(常用)?同伴", "", text.strip()).strip()
-    room_state, _ = _room_state()
+    room_state, _ = _room_state_strict()
+    if room_state is None:
+        # 状态读不到就无法判断"已设置/查找中"，继续下去会把已设置的同伴
+        # 当成新名字重新处理（还会清掉已解析的 accNo）——必须中止
+        feishu_send_action(chat_id, "👥 常用同伴",
+            "⚠️ 状态读取失败（网络抖动），本次命令未执行，同伴设置未被改动。\n"
+            "请稍等几秒再发一次。", color="orange")
+        return
     cur = room_state.get("partner") or ""
     cur_disp = room_state.get("partner_display") or ""
     if not rest:
@@ -5745,6 +5791,54 @@ def poll_group_messages():
 
 
 # ============ 主入口 ============
+# ============ v40c: 跨路径消息级去重 + 活动标题规范化 ============
+
+PROCESSED_MSGS_FILE = "feishu_processed_msgs.json"
+
+
+def _norm_subject(s):
+    """剥邮件回复/转发前缀（RE:/FW:/Fwd:/答复:/转发:，支持多层嵌套）。
+    同一活动的 RE: 变体与原邮件规范化后视为同一活动，用于去重与合并处理。"""
+    prev = None
+    s = s or ""
+    while prev != s:
+        prev = s
+        s = re.sub(r"^\s*(re\s*[:：]\s*|fw\s*[:：]\s*|fwd\s*[:：]\s*|答复\s*[:：]\s*|转发\s*[:：]\s*)",
+                   "", s, flags=re.IGNORECASE)
+    return s.strip()
+
+
+def _is_msg_processed_shared(msg_id):
+    """查共享已处理表（butler-data，云函数与 butler 兜底两端共用）。
+    云函数是秒级主路径：读失败按"未处理"继续（fail-open），不能因读失败丢消息。"""
+    try:
+        data, _ = gh_read_json(PROCESSED_MSGS_FILE)
+        return msg_id in (data.get("ids") or [])
+    except Exception as e:
+        log(f"查共享已处理表失败(按未处理继续): {e}")
+        return False
+
+
+def _mark_msg_processed_shared(msg_id):
+    """命令处理完成后写入共享表，供 butler 兜底端去重。
+    写失败仅记日志（极小概率导致 butler 再执行一次，且其状态幂等可自愈）。"""
+    try:
+        data, sha = gh_read_json(PROCESSED_MSGS_FILE)
+    except Exception as e:
+        log(f"标记共享已处理-读失败: {e}")
+        return
+    ids = data.get("ids") or []
+    if msg_id in ids:
+        return
+    ids.append(msg_id)
+    data["ids"] = ids[-500:]
+    data["updated"] = time.strftime("%Y-%m-%d %H:%M")
+    try:
+        gh_write_json(PROCESSED_MSGS_FILE, data, sha, f"webhook processed {msg_id}")
+    except Exception as e:
+        log(f"标记共享已处理-写失败: {e}")
+
+
 def main_handler(event, context):
     # 定时触发器：按 TriggerName 分流
     if event.get("Type") == "Timer":
@@ -5877,6 +5971,12 @@ def main_handler(event, context):
 
         if not msg_text:
             return {"statusCode": 200, "body": "ok"}
+        # v40c: 跨路径去重——但ler 兜底（5分钟一次）已处理过的消息不再重复执行
+        # （v39d 只删了 SCF 轮询路径，webhook 与 butler feishu_read_commands 互不知晓，
+        #  曾导致用户发一次「跳过」被两条路径各执行一次）
+        if _is_msg_processed_shared(msg_id):
+            log(f"⏭️ 共享表显示已由兜底端处理: {msg_id}")
+            return {"statusCode": 200, "body": "ok"}
         log(f"📩 收到: {msg_text[:30]}")
         # v38: webhook 处理策略（根治"过一会儿又不理人"）
         # 问题：慢任务（读 Outlook/LLM 10-20s）占住 SCF 实例（并发=1），后续所有请求排队 → 全线失联。
@@ -5895,6 +5995,10 @@ def main_handler(event, context):
                     feishu_send(chat_id, f"⚠️ 处理失败：{err_hint}\n\n请重试，若持续失败请反馈给管理员。")
                 except Exception:
                     pass
+            finally:
+                # v40c: 处理完成（或已回复失败提示）后写共享表，
+                # 但ler 兜底拉到同一条消息时跳过，杜绝两条路径各执行一次
+                _mark_msg_processed_shared(msg_id)
         t = threading.Thread(target=_async_process, daemon=False)
         t.start()
         t.join(timeout=20)
