@@ -3002,6 +3002,21 @@ def cmd_room_set_partner(chat_id, text):
         feishu_send_action(chat_id, "👥 常用同伴",
             "❌ 不能把自己设为同伴（预定人就是你本人）。", color="red")
         return
+    # 幂等检查：如果已经在解析中或已解析完成同名同伴，不重复触发
+    cur_partner = room_state.get("partner") or ""
+    cur_accNo = room_state.get("partner_accNo")
+    if cur_partner == rest and cur_accNo:
+        cur_disp = room_state.get("partner_display") or ""
+        feishu_send_action(chat_id, "👥 常用同伴",
+            f"✅ 常用同伴已设置：{cur_disp}\n（{rest} → accNo {cur_accNo}）\n\n"
+            "不需要重复设置。如要换人发「设同伴 新名字」，清除发「设同伴 清除」。",
+            color="green")
+        return
+    if cur_partner == rest and not cur_accNo:
+        feishu_send_action(chat_id, "👥 常用同伴",
+            f"🔍 「{rest}」正在查找中，请稍候（约 2-4 分钟出结果），不要重复发送。",
+            color="blue")
+        return
     # 先存原始名字（LLM/订房时可见），再触发解析（异步，约2-4分钟回掩码确认）
     try:
         data, sha = gh_read_json("xjtlu_state.json")
@@ -4948,36 +4963,24 @@ def _maybe_notify_no_pending_image(chat_id):
 
 
 def poll_group_messages():
-    """主动查群消息，处理用户发的新消息（带回检测：已回复过的不再重复处理）"""
-    # 兑底：验证之前挂起的撤回是否真正生效（生效则发完成通知）
+    """定时任务入口：定时推送 + 保活 + 图片处理（文本消息由 webhook + feishu-poller 兜底，不再重复拉取）"""
+    # 定时推送
     _check_pending_revoke(CHAT_ID_FALLBACK)
-    # 审批结果监控：Pending → 已办结/已批准时发提醒（兑现提交卡片的承诺）
     _check_leave_approval(CHAT_ID_FALLBACK)
-    # v31: 每日下雨提醒（8点窗口，每天最多发一次）
-    # v34: 改为每日早报（含天气+课程+作业+出勤），下雨提醒合并进早报
     _daily_brief(CHAT_ID_FALLBACK)
-    # v34: 考试倒计时提醒（提前7/3/1天）
     _exam_countdown_remind(CHAT_ID_FALLBACK)
-    # v34: 备忘提醒——检查到期的提醒
     _check_reminders(CHAT_ID_FALLBACK)
-    # v35: 晚安提醒（每晚 22:00）
     _goodnight_brief(CHAT_ID_FALLBACK)
-    # v35: 周日复盘（每周日 20:00）
     _weekly_review(CHAT_ID_FALLBACK)
-    # v32: GitHub Actions 保活心跳——每 10 分钟主动触发一次 butler + monitor
-    # 原因：GitHub Actions schedule 停摆后不会自动恢复（token 失效期间停了就停了）
-    # 管家每分钟轮询，每 10 分钟检查一次，距上次超过 10 分钟就主动 dispatch
     _gh_actions_keepalive()
+    # 图片消息处理（webhook 对图片不可靠，需轮询兜底）
     try:
         processed_ids, last_msg_id = _load_poll_state()
         token = get_feishu_token()
-        # 关键：必须传 start_time/end_time（单位秒）——不传则返回最早的历史消息（9月22日的），新消息永远拉不到
         now_s = int(time.time())
-        # v37.4 修复：窗口内消息超过 page_size=50 时，最新消息会被截断永远拉不到（用户消息丢失）。
-        # 改为分页循环拉取窗口内全部消息（has_more + page_token）
         all_items = []
         page_token = ""
-        for _page in range(5):  # 最多 5 页（250 条），防止死循环
+        for _page in range(5):
             url = (f"https://open.feishu.cn/open-apis/im/v1/messages"
                    f"?container_id_type=chat&container_id={CHAT_ID_FALLBACK}"
                    f"&start_time={now_s - 7200}&end_time={now_s}&page_size=50")
@@ -4998,100 +5001,52 @@ def poll_group_messages():
         if not items:
             return
         new_processed = False
-        # bot回复时间线：用于回复检测（某条用户消息之后已有bot消息 = 已被处理过）
-        app_times = [int(m.get("create_time", "0")) / 1000
-                     for m in items
-                     if m.get("sender", {}).get("sender_type") == "app"]
-        # 消息按时间正序，最新在最后
         for m in items:
             sender_type = m.get("sender", {}).get("sender_type", "")
             mtype = m.get("msg_type", "")
             msg_id = m.get("message_id", "")
             if sender_type != "user":
                 continue
-            # 只处理用户发的文本/图片消息（图片 = 请假证明附件）
-            if mtype not in ("text", "image"):
+            # v39d: 只处理图片消息（文本消息由 webhook + feishu-poller 兜底，不再重复拉取）
+            if mtype != "image":
                 continue
-            # 跳过已处理的
             if msg_id in processed_ids or msg_id == last_msg_id:
-                continue
-            # 跨路径去重：事件推送路径已处理过 → 同步到state并跳过
-            # 注意：图片消息不由事件路径负责（事件受3秒限制、线程不可靠），统一交给轮询同步处理，因此对 image 放行
-            if msg_id in _PROCESSED_MSG_IDS and mtype != "image":
-                processed_ids[msg_id] = True
-                last_msg_id = msg_id
-                new_processed = True
-                continue
-            # 回复检测：该消息之后群里已有bot回复 → 已被处理，不再转发
-            msg_ts = int(m.get("create_time", "0")) / 1000
-            if any(at > msg_ts for at in app_times):
-                processed_ids[msg_id] = True
-                last_msg_id = msg_id
-                new_processed = True
-                continue
-            # 跳过超过5分钟前的旧消息（避免处理历史消息）
-            # 注意：图片消息放行——轮询周期（5分钟）与过滤窗口同长，图片常被误判为旧消息而永不处理；
-            #       图片处理有 pending 状态校验兜底（无进行中请假则忽略/限流提示），重复处理无害
-            if msg_ts < time.time() - 300 and mtype != "image":
-                processed_ids[msg_id] = True
-                last_msg_id = msg_id
-                new_processed = True
                 continue
             processed_ids[msg_id] = True
             last_msg_id = msg_id
             new_processed = True
-            import threading
-            if mtype == "text":
-                # 提取文本（复用 extract_msg_text 支持 post/富文本，与事件路径一致）
-                body = m.get("body", {}).get("content", "{}")
-                text = extract_msg_text("text", body)
-                if not text:
-                    continue
-                log(f"📩 轮询收到: {text[:30]}")
-                def _process_async(t=text):
-                    try:
-                        process_command(t, CHAT_ID_FALLBACK)
-                    except Exception as e:
-                        log(f"❌ 处理失败: {e}")
-                threading.Thread(target=_process_async, daemon=False).start()
-            else:
-                # 图片消息：同步处理（不用 daemon 线程——函数返回后线程可能被回收，
-                # 必须在本周期内完成 下载→上传AMS→提交 全流程）
-                raw = m.get("body", {}).get("content", "{}")
-                log("📩 轮询收到图片消息")
-                try:
-                    pending, _ = _load_leave_pending()
-                    if pending.get("status") != "awaiting_attachment":
-                        _maybe_notify_no_pending_image(CHAT_ID_FALLBACK)
-                        log("收到图片但无进行中请假申请，忽略")
+            raw = m.get("body", {}).get("content", "{}")
+            log("📩 轮询收到图片消息")
+            try:
+                pending, _ = _load_leave_pending()
+                if pending.get("status") != "awaiting_attachment":
+                    _maybe_notify_no_pending_image(CHAT_ID_FALLBACK)
+                    log("收到图片但无进行中请假申请，忽略")
+                else:
+                    content = json.loads(raw or "{}")
+                    image_key = content.get("image_key", "")
+                    if not image_key:
+                        log("❌ 图片消息缺 image_key")
                     else:
-                        content = json.loads(raw or "{}")
-                        image_key = content.get("image_key", "")
-                        if not image_key:
-                            log("❌ 图片消息缺 image_key")
-                        else:
-                            ftok = get_feishu_token()
-                            # 关键：file_key 是路径参数（?file_key= 会404）；实测完整 message_id+路径参数返回200
-                            img = _http_bin(
-                                f"{FEISHU_BASE}/open-apis/im/v1/messages/{msg_id}/resources/"
-                                f"{urllib.parse.quote(image_key)}?type=image",
-                                headers={"Authorization": f"Bearer {ftok}"}, timeout=20)
-                            filename = f"medical-cert-{datetime.now().strftime('%Y%m%d%H%M%S')}.png"
-                            cmd_leave_confirm_attachment(CHAT_ID_FALLBACK, img, filename)
-                except Exception as e:
-                    log(f"❌ 轮询图片处理失败: {e}")
-                    # 失败必通知：用户已被承诺"约1~5分钟给结果"，不能石沉大海
-                    try:
-                        feishu_send(CHAT_ID_FALLBACK,
-                            f"❌ 证明照片处理失败：{str(e)[:80]}\n\n"
-                            "请假申请仍暂存着，请重新发一张照片即可提交。")
-                    except Exception:
-                        pass
+                        ftok = get_feishu_token()
+                        img = _http_bin(
+                            f"{FEISHU_BASE}/open-apis/im/v1/messages/{msg_id}/resources/"
+                            f"{urllib.parse.quote(image_key)}?type=image",
+                            headers={"Authorization": f"Bearer {ftok}"}, timeout=20)
+                        filename = f"medical-cert-{datetime.now().strftime('%Y%m%d%H%M%S')}.png"
+                        cmd_leave_confirm_attachment(CHAT_ID_FALLBACK, img, filename)
+            except Exception as e:
+                log(f"❌ 轮询图片处理失败: {e}")
+                try:
+                    feishu_send(CHAT_ID_FALLBACK,
+                        f"❌ 证明照片处理失败：{str(e)[:80]}\n\n"
+                        "请假申请仍暂存着，请重新发一张照片即可提交。")
+                except Exception:
+                    pass
         if new_processed:
             _save_poll_state(processed_ids, last_msg_id)
     except Exception as e:
         log(f"❌ 轮询失败: {e}")
-        # v37.5: 诊断钩子——拉取异常时发一条到群里（每分钟限1次），便于定位 SCF 内真实错误
         try:
             if time.time() - _LAST_POLL_ERR.get("ts", 0) > 60:
                 _LAST_POLL_ERR["ts"] = time.time()
