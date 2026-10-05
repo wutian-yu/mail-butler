@@ -1114,6 +1114,11 @@ HELP_TEXT = (
     "「我的预约」查我的预定\n"
     "「取消预定 N」取消第N个\n"
     "（研讨室要求至少2人；也可自然语言：「明天下午和张伟订个研讨室」）\n\n"
+    "🏟️ 体育中心场地（sportscentre.xipueduinno.cn，16种运动可提前7天订）\n"
+    "「查场地 羽毛球 [日期]」实时查各场地时段状态（🟢可订🔴已订🟡固定课⚫关闭）\n"
+    "「场地规律 羽毛球」分析未来7天：哪些时段常年关闭/固定课/热门难抢\n"
+    "「盯场地 羽毛球 10-08 19:00」盯某时段，被抢/空出立即提醒（每分钟查）\n"
+    "「盯场地列表」「取消盯场 N」管理盯场任务\n\n"
     "🩺 体检 · Cookie\n"
     "「状态」「体检」「管家身体怎么样」查看 GitHub token/Cookie/AMS/房间健康\n"
     "「cookie <JSON>」粘贴导出的新 Cookie 自动刷新\n\n"
@@ -3303,6 +3308,432 @@ def cmd_room_cancel(chat_id, text):
         feishu_send_action(chat_id, "🗑️ 取消预约", "❌ 触发取消失败，稍后再试。", color="red")
 
 
+# ============ 体育中心场地系统（sportscentre.xipueduinno.cn，公开API免登录直连） ============
+# 场地查询/规律分析/盯场全走云函数直连（不像图书馆要走 Actions 浏览器），秒回。
+SPORTS_BASE = "http://sportscentre.xipueduinno.cn/website/api/website/court"
+SPORTS_SERVICES = {
+    "篮球": 1001, "羽毛球": 1002, "网球": 1003, "壁球": 1009, "乒乓球": 1010,
+    "健身": 1011, "足球": 1012, "武术": 1019, "桌球": 1028, "高尔夫": 1034,
+    "攀岩": 1040, "击剑": 1045, "射箭": 1054, "排球": 1068, "活动室": 1089,
+    "划船机": 1221,
+}
+SPORTS_BOOK_DAYS = 7
+SPORTS_WATCH_FILE = "sports_watch.json"
+
+
+def _sports_api(path, timeout=12):
+    """体育中心公开 API GET（免登录）"""
+    try:
+        return _http(f"{SPORTS_BASE}/{path}", timeout=timeout) or {}
+    except Exception as e:
+        log(f"体育API异常: {e}")
+        return {}
+
+
+def _sports_seg_hh(segment):
+    """segment(30分钟单位) → 'HH:00'"""
+    return f"{segment // 2:02d}:00"
+
+
+def _sports_state_view(seg):
+    """时段状态 → (emoji, 说明)"""
+    state = str(seg.get("state", ""))
+    fixed = str(seg.get("fixedOccupyType", "") or "")
+    price = seg.get("price", 0)
+    if state == "1":
+        return "⚫", "关闭"
+    if state == "0":
+        return "🟢", (f"¥{price // 100}" if price > 0 else "免费")
+    if state == "2":
+        if fixed == "4":
+            return "🟡", "固定课"
+        return "🔴", "已订"
+    return "⚪", "?"
+
+
+def _sports_resolve(name):
+    """文本 → (service_id, 运动名)；找不到返回 (None, None)"""
+    name = str(name or "").strip()
+    # 精确匹配优先
+    if name in SPORTS_SERVICES:
+        return SPORTS_SERVICES[name], name
+    # 包含匹配（"羽毛球馆"→羽毛球）
+    best = None
+    for k, v in SPORTS_SERVICES.items():
+        if k in name or name in k:
+            best = (v, k)
+            if len(k) > len(best[1] if best else ""):
+                best = (v, k)
+    return best or (None, None)
+
+
+def _sports_field_types(sid, ds):
+    """场地类型列表 [{fieldType, fieldTypeName, lowestPrice}]"""
+    j = _sports_api(f"fieldTypes?serviceId={sid}&date={ds}&lang=zh_cn")
+    return j.get("fieldTypeList") or []
+
+
+def _sports_field_list(sid, ds, ftype):
+    """某场地类型某天全部场地的时段数据"""
+    j = _sports_api(f"fieldList?serviceId={sid}&date={ds}&fieldType={ftype}&lang=zh_cn")
+    return j.get("fieldList") or []
+
+
+def cmd_sports_query(chat_id, text):
+    """「查场地 羽毛球 [日期]」「查场 羽毛球 明天」——实时查各场地各时段状态（秒回）"""
+    rest = re.sub(r"^查场(地|馆)?", "", text.strip()).strip()
+    date_str = _room_parse_date(rest, now=_bjnow_s().replace(tzinfo=None))
+    sid, sname = _sports_resolve(rest)
+    if not sid:
+        feishu_send_action(chat_id, "🏟️ 场地查询",
+            "用法：「查场地 羽毛球 明天」\n\n支持：篮球/羽毛球/网球/壁球/乒乓球/健身/足球/武术/桌球/高尔夫/攀岩/击剑/射箭/排球/活动室/划船机\n"
+            "规律分析：「场地规律 羽毛球」\n盯场：「盯场地 羽毛球 10-08 19:00」", color="red")
+        return
+    ds = date_str.replace("-", "")
+    fts = _sports_field_types(sid, ds)
+    if not fts:
+        feishu_send_action(chat_id, "🏟️ 场地查询", f"❌ {sname} 查不到场地数据（{date_str}）。", color="red")
+        return
+    lines = [f"🏟️ {sname} · {date_str}（只列可订时段）\n"]
+    any_free = False
+    for ft in fts:
+        ftname = ft.get("fieldTypeName", "")
+        left = ft.get("leftTicketNum", 0)
+        lines.append(f"【{ftname}】剩余可订 {left} 场次")
+        fields = _sports_field_list(sid, ds, ft.get("fieldType"))
+        if not fields:
+            lines.append("  （暂无场地数据）\n")
+            continue
+        for f in fields:
+            segs = f.get("fieldSgementList") or []
+            if not segs:
+                continue
+            fname = f.get("fieldName", "?")
+            # 只列可订时段（已订/固定课/关闭不显示，避免刷屏）
+            free = []
+            for s in segs:
+                if str(s.get("state")) == "0":
+                    price = s.get("price", 0)
+                    free.append(f"{_sports_seg_hh(s['segment'])}" + (f"(¥{price//100})" if price > 0 else "(免费)"))
+            if free:
+                any_free = True
+                lines.append(f"  ✅ {fname}: {'、'.join(free)}")
+            else:
+                lines.append(f"  ❌ {fname} 全满")
+        lines.append("")
+    if not any_free:
+        lines.append("💡 当天全满。可发「场地规律 " + sname + "」看哪些时段常年难抢，")
+        lines.append("   或「盯场地 " + sname + " 日期 时段」等空位（空出立即提醒）。")
+    else:
+        lines.append("规律：「场地规律 " + sname + "」　盯场：「盯场地 " + sname + " 日期 时段」")
+    feishu_send_action(chat_id, "🏟️ 场地查询", "\n".join(lines), color="blue")
+
+
+def cmd_sports_rules(chat_id, text):
+    """「场地规律 羽毛球」——抓未来7天数据分析：
+    ① 常年关闭时段（如午休）② 每周固定课表（哪天哪些时段有课，学生订不了）③ 热门/冷门时段"""
+    rest = re.sub(r"^场地规律", "", text.strip()).strip()
+    sid, sname = _sports_resolve(rest)
+    if not sid:
+        feishu_send_action(chat_id, "📊 场地规律", "用法：「场地规律 羽毛球」", color="red")
+        return
+    now_bj = _bjnow_s()
+    n_days = min(7, SPORTS_BOOK_DAYS)
+    # 三个维度统计
+    day_stat = {}     # (ft, fn, hh) → 状态计数（跨全部样本天）
+    fixed_by_wd = {}  # (ft, fn, weekday, hh) → fixed 天数/该星期样本天数
+    wd_samples = {}   # weekday → 样本天数
+    field_names = {}
+    for d_off in range(n_days):
+        d = now_bj + timedelta(days=d_off)
+        ds = d.strftime("%Y%m%d")
+        wd = d.weekday()  # 0=周一
+        wd_samples[wd] = wd_samples.get(wd, 0) + 1
+        fts = _sports_field_types(sid, ds)
+        for ft in fts:
+            fields = _sports_field_list(sid, ds, ft.get("fieldType"))
+            for f in fields:
+                fn = f.get("fieldName", "?")
+                field_names[fn] = True
+                for seg in f.get("fieldSgementList") or []:
+                    hh = seg["segment"] // 2
+                    state = str(seg.get("state", ""))
+                    fixed = str(seg.get("fixedOccupyType", "") or "")
+                    # 全样本统计
+                    key = (ft.get("fieldTypeName", ""), fn, hh)
+                    st = day_stat.setdefault(key, {"closed": 0, "fixed": 0, "booked": 0, "free": 0, "days": 0})
+                    st["days"] += 1
+                    if state == "1":
+                        st["closed"] += 1
+                    elif state == "2" and fixed == "4":
+                        st["fixed"] += 1
+                    elif state == "2":
+                        st["booked"] += 1
+                    elif state == "0":
+                        st["free"] += 1
+                    # 按星期统计固定课
+                    if state == "2" and fixed == "4":
+                        wkey = (ft.get("fieldTypeName", ""), fn, wd, hh)
+                        fixed_by_wd[wkey] = fixed_by_wd.get(wkey, 0) + 1
+    if not day_stat:
+        feishu_send_action(chat_id, "📊 场地规律", f"❌ {sname} 拉不到数据。", color="red")
+        return
+    WD_NAMES = ["周一", "周二", "周三", "周四", "周五", "周六", "周日"]
+    # ---- ① 常年关闭 ----
+    closed_slots = [k for k, st in day_stat.items()
+                    if st["days"] >= n_days and st["closed"] == st["days"]]
+    # ---- ② 每周固定课表（按星期）----
+    # (ft, fn, wd) → [hh...] 该星期有固定课的时段
+    fixed_week = {}
+    for (ftname, fn, wd, hh), cnt in fixed_by_wd.items():
+        if cnt >= wd_samples.get(wd, 1):  # 该星期样本全为固定课
+            fixed_week.setdefault((ftname, wd), {}).setdefault(fn, []).append(hh)
+    # ---- ③ 热门/冷门 ----
+    hot_slots, free_slots = [], []
+    for (ftname, fn, hh), st in day_stat.items():
+        if st["days"] < n_days:
+            continue
+        fixed_ratio = st["fixed"] / st["days"]
+        if fixed_ratio >= 0.8:
+            continue  # 固定课时段不算热门
+        if st["booked"] / st["days"] >= 0.7:
+            hot_slots.append((ftname, fn, hh))
+        elif st["free"] / st["days"] >= 0.7:
+            free_slots.append((ftname, fn, hh))
+    # 格式化输出
+    def group_fmt(slots):
+        by_ft = {}
+        for s in slots:
+            by_ft.setdefault(s[0], {}).setdefault(s[1], []).append(s[2])
+        out = []
+        for ftname, fields in by_ft.items():
+            out.append(f"【{ftname}】")
+            for fn, hours in sorted(fields.items()):
+                hours.sort()
+                out.append(f"  {fn}: " + "、".join(f"{h:02d}:00" for h in hours))
+        return out
+    lines = [f"📊 {sname} 场地规律（未来 {n_days} 天 · {len(field_names)} 块场地）\n"]
+    if fixed_week:
+        lines.append("🟡 每周固定课表（该时段有课/训练，学生订不了）：")
+        # 按场地聚合星期
+        by_ft_fn = {}
+        for (ftname, wd), fields in sorted(fixed_week.items(), key=lambda x: x[0][1]):
+            for fn, hours in fields.items():
+                by_ft_fn.setdefault(ftname, {}).setdefault(fn, []).append((wd, sorted(hours)))
+        for ftname, fields in by_ft_fn.items():
+            lines.append(f"【{ftname}】")
+            for fn, wds in sorted(fields.items()):
+                parts = []
+                for wd, hours in sorted(wds):
+                    hs = "、".join(f"{h:02d}:00" for h in hours)
+                    parts.append(f"{WD_NAMES[wd]} {hs}")
+                lines.append(f"  {fn}: " + "；".join(parts))
+        lines.append("")
+    if closed_slots:
+        lines.append("⚫ 常年关闭时段（每天都关，如午休/维护）：")
+        lines.extend(group_fmt(closed_slots))
+        lines.append("")
+    if hot_slots:
+        lines.append("🔴 热门时段（7成以上被订满，想订要趁早）：")
+        lines.extend(group_fmt(hot_slots))
+        lines.append("")
+    if free_slots:
+        lines.append("🟢 冷门时段（基本随到随订）：")
+        lines.extend(group_fmt(free_slots))
+        lines.append("")
+    lines.append("💡 固定课表按星期排列（体育课随学期调整）；实际可订以「查场地」实时为准。")
+    feishu_send_action(chat_id, "📊 场地规律", "\n".join(lines), color="blue")
+
+
+def cmd_sports_watch(chat_id, text):
+    """「盯场地 羽毛球 10-08 19:00」——盯某运动某时段，状态变化（被抢/空出）即时提醒
+    「盯场地列表」/「取消盯场 N」"""
+    rest = re.sub(r"^盯场(地|馆)?", "", text.strip()).strip()
+    now_bj = _bjnow_s()
+    # 列表
+    if not rest or rest in ("列表", "list", "查看"):
+        try:
+            wq, _ = gh_read_json(SPORTS_WATCH_FILE)
+        except Exception:
+            wq = {"items": []}
+        items = [i for i in wq.get("items", []) if i.get("status") == "watching"]
+        if not items:
+            feishu_send_action(chat_id, "👁️ 盯场地",
+                "📭 没有在盯的场地时段。\n\n"
+                "设置：「盯场地 羽毛球 10-08 19:00」\n"
+                "管家每分钟查一次，被订/空出立刻提醒你。", color="blue")
+            return
+        lines = ["👁️ 盯场地列表：\n"]
+        for n, it in enumerate(items, 1):
+            lines.append(f"{n}. {it['service']} {it['date']} {it['hour']}:00"
+                         f"（当前{'已订' if it.get('last_state') == '2' else '空闲' if it.get('last_state') == '0' else '未知'}）")
+        lines.append("\n取消：「取消盯场 N」")
+        feishu_send_action(chat_id, "👁️ 盯场地", "\n".join(lines), color="blue")
+        return
+    # 取消
+    if rest.startswith("取消") or text.strip().startswith("取消盯"):
+        n_m = re.search(r"(\d+)", rest)
+        try:
+            wq, sha = gh_read_json(SPORTS_WATCH_FILE)
+        except Exception:
+            feishu_send_action(chat_id, "👁️ 盯场地", "📭 没有在盯的场地。", color="blue")
+            return
+        items = [i for i in wq.get("items", []) if i.get("status") == "watching"]
+        if not items:
+            feishu_send_action(chat_id, "👁️ 盯场地", "📭 没有可取消的。", color="blue")
+            return
+        n = int(n_m.group(1)) if n_m else len(items)
+        if n < 1 or n > len(items):
+            feishu_send_action(chat_id, "👁️ 盯场地", f"⚠️ 编号超出范围（1-{len(items)}）。", color="red")
+            return
+        target = items[n - 1]
+        target["status"] = "cancelled"
+        try:
+            gh_write_json(SPORTS_WATCH_FILE, wq, sha, "cancel sports watch")
+            feishu_send_action(chat_id, "👁️ 盯场地",
+                f"✅ 已取消盯：{target['service']} {target['date']} {target['hour']}:00", color="green")
+        except Exception as e:
+            log(f"取消盯场失败: {e}")
+        return
+    # 登记：运动 + 日期 + 时段
+    m = re.search(r"(\d{1,2})(?::00)?(?:\s*[-~到至]\s*(\d{1,2})(?::00)?)?\s*$", rest)
+    if not m:
+        feishu_send_action(chat_id, "👁️ 盯场地",
+            "用法：「盯场地 羽毛球 10-08 19:00」（盯该时段全部场地）", color="red")
+        return
+    hour = int(m.group(1))
+    if not (7 <= hour <= 21):
+        feishu_send_action(chat_id, "👁️ 盯场地", "❌ 时段应在 7:00-21:00 之间。", color="red")
+        return
+    rest_no_hour = rest[:m.start()].strip()
+    date_str = _room_parse_date(rest_no_hour, now=now_bj.replace(tzinfo=None))
+    try:
+        d = datetime.strptime(date_str, "%Y-%m-%d").date()
+    except Exception:
+        feishu_send_action(chat_id, "👁️ 盯场地", f"❌ 日期不对：{date_str}", color="red")
+        return
+    if (d - now_bj.date()).days < 0 or (d - now_bj.date()).days >= SPORTS_BOOK_DAYS:
+        feishu_send_action(chat_id, "👁️ 盯场地",
+            f"❌ 只能盯未来 {SPORTS_BOOK_DAYS} 天内的场地（{date_str} 超出可订窗口）。", color="red")
+        return
+    sid, sname = _sports_resolve(rest_no_hour)
+    if not sid:
+        feishu_send_action(chat_id, "👁️ 盯场地", "❌ 没识别到运动项目。用法：「盯场地 羽毛球 10-08 19:00」", color="red")
+        return
+    # 重复检查
+    try:
+        wq, sha = gh_read_json(SPORTS_WATCH_FILE)
+    except Exception:
+        wq, sha = {"items": []}, ""
+    for it in wq.get("items", []):
+        if (it.get("status") == "watching" and it.get("service_id") == sid
+                and it.get("date") == date_str and it.get("hour") == hour):
+            feishu_send_action(chat_id, "👁️ 盯场地",
+                f"ℹ️ 已在盯：{sname} {date_str} {hour}:00，不用重复设置。", color="blue")
+            return
+    # 先查一次当前状态
+    ds = date_str.replace("-", "")
+    fts = _sports_field_types(sid, ds)
+    cur_free, cur_total = 0, 0
+    for ft in fts:
+        for f in _sports_field_list(sid, ds, ft.get("fieldType")):
+            for seg in f.get("fieldSgementList") or []:
+                if seg["segment"] // 2 == hour:
+                    cur_total += 1
+                    if str(seg.get("state")) == "0":
+                        cur_free += 1
+    item = {
+        "id": f"sw-{now_bj.strftime('%Y%m%d%H%M%S')}",
+        "service": sname, "service_id": sid,
+        "date": date_str, "hour": hour,
+        "status": "watching", "last_free": cur_free, "last_total": cur_total,
+        "last_state": "mixed", "created": now_bj.strftime("%Y-%m-%d %H:%M"),
+    }
+    wq.setdefault("items", []).append(item)
+    try:
+        gh_write_json(SPORTS_WATCH_FILE, wq, sha, f"sports watch {sname} {date_str} {hour}")
+    except Exception as e:
+        log(f"盯场登记失败: {e}")
+        feishu_send_action(chat_id, "👁️ 盯场地", "❌ 登记失败，稍后再试。", color="red")
+        return
+    state_txt = f"空闲 {cur_free}/{cur_total} 场" if cur_total else "暂无数据"
+    feishu_send_action(chat_id, "👁️ 盯场地已开启",
+        f"👁️ 开始盯：{sname} · {date_str} {hour}:00\n"
+        f"当前状态：{state_txt}\n\n"
+        "管家每分钟查一次：\n"
+        "🔴 有场地被抢订 → 立即提醒你（想订要趁早）\n"
+        "🟢 有场地空出来 → 立即提醒你（可以下手了）\n\n"
+        "查看：「盯场地列表」　取消：「取消盯场 1」", color="green")
+
+
+def _check_sports_watch(chat_id=None):
+    """盯场检查（每分钟）：状态变化即时提醒；场次过时自动结束"""
+    chat_id = chat_id or CHAT_ID_FALLBACK
+    try:
+        wq, sha = gh_read_json(SPORTS_WATCH_FILE)
+    except Exception:
+        return
+    items = wq.get("items") or []
+    watching = [i for i in items if i.get("status") == "watching"]
+    if not watching:
+        return
+    now_bj = _bjnow_s()
+    changed = False
+    for it in watching:
+        date_str, hour = it.get("date", ""), it.get("hour", 0)
+        try:
+            d = datetime.strptime(date_str, "%Y-%m-%d")
+        except Exception:
+            it["status"] = "invalid"
+            changed = True
+            continue
+        # 场次开始已过 1 小时 → 自动结束
+        start_dt = d.replace(hour=int(hour), minute=0)
+        if now_bj.replace(tzinfo=None) > start_dt + timedelta(hours=1):
+            it["status"] = "expired"
+            changed = True
+            continue
+        # 查当前状态
+        ds = date_str.replace("-", "")
+        sid = it.get("service_id")
+        free, total, first_free_name = 0, 0, ""
+        for ft in _sports_field_types(sid, ds):
+            for f in _sports_field_list(sid, ds, ft.get("fieldType")):
+                for seg in f.get("fieldSgementList") or []:
+                    if seg["segment"] // 2 == int(hour):
+                        total += 1
+                        if str(seg.get("state")) == "0":
+                            free += 1
+                            if not first_free_name:
+                                first_free_name = f.get("fieldName", "")
+        if total == 0:
+            continue  # 当天无数据（可能日期超窗口），跳过
+        last_free, last_total = it.get("last_free", free), it.get("last_total", total)
+        it["last_free"], it["last_total"] = free, total
+        if free == last_free and total == last_total:
+            continue  # 无变化
+        changed = True
+        sname = it.get("service", "")
+        # 变化详情：变少 = 被抢；变多 = 空出
+        if free < last_free:
+            feishu_send_action(chat_id, "🚨 场地被抢了",
+                f"🔴 {sname} {date_str} {hour}:00\n"
+                f"空闲场地 {last_free} → {free}（共 {total} 块）\n\n"
+                "有人刚抢订了场地！你要订的话现在就上：\n"
+                "http://sportscentre.xipueduinno.cn → 订场购票", color="red")
+        elif free > last_free:
+            extra = f"\n🟢 现在有空的：{first_free_name}" if first_free_name else ""
+            feishu_send_action(chat_id, "✅ 场地空出来了",
+                f"🟢 {sname} {date_str} {hour}:00\n"
+                f"空闲场地 {last_free} → {free}（共 {total} 块）{extra}\n\n"
+                "想订趁现在：http://sportscentre.xipueduinno.cn → 订场购票", color="green")
+    if changed:
+        try:
+            gh_write_json(SPORTS_WATCH_FILE, wq, sha, "sports watch check")
+        except Exception as e:
+            log(f"盯场状态保存失败: {e}")
+
+
 def cmd_del_calendar(chat_id, text):
     """删除 Outlook 日历事件
     「删日历」→ 列出
@@ -4043,6 +4474,18 @@ def process_command(text, chat_id):
     if t.startswith("定时订房") or t.startswith("预约订房") or t.startswith("定时预订"):
         cmd_room_book_later(chat_id, text)
         return
+    if t.startswith("取消盯场"):
+        cmd_sports_watch(chat_id, "盯场 取消" + re.sub(r"^取消盯场(地|馆)?", "", t).strip())
+        return
+    if t.startswith("盯场") or t.startswith("盯场地") or t.startswith("盯场馆"):
+        cmd_sports_watch(chat_id, text)
+        return
+    if t.startswith("场地规律") or t.startswith("运动规律"):
+        cmd_sports_rules(chat_id, text)
+        return
+    if t.startswith("查场") or t.startswith("查场馆"):
+        cmd_sports_query(chat_id, text)
+        return
     if t.startswith("推荐房") or t.startswith("房间推荐") or re.search(r"^\d+人.*房", t) or re.search(r"^\d+个人.*房", t):
         cmd_room_recommend(chat_id, text)
         return
@@ -4571,7 +5014,13 @@ SYSTEM_PROMPT = (
     "用户不知道选哪间时，引导发「推荐房间 X人」按人数+空闲匹配最佳房间。\n"
     "用户要订超过 3 天窗口的房间时，引导用「定时订房 日期 时段」登记：系统会在窗口开启日（日期-3天）"
     "凌晨 00:00 自动触发订房抢先机（用户睡觉时也能抢到房），房间可指定或自动选。"
-    "查队列「定时订房列表」，取消「取消定时订房 N」。\n"
+    "查队列「定时订房列表」，取消「取消定时订房 N」。\n\n"
+    "8. **体育中心场地**（sportscentre.xipueduinno.cn）：篮球/羽毛球/网球/壁球/乒乓球/健身/足球/武术/"
+    "桌球/高尔夫/攀岩/击剑/射箭/排球/活动室/划船机，可提前 7 天订，公开API免登录秒回。"
+    "「查场地 羽毛球 明天」查实时状态；「场地规律 羽毛球」分析哪些时段常年关闭/固定课/热门；"
+    "「盯场地 羽毛球 10-08 19:00」盯某时段被抢/空出立即提醒。"
+    "用户问场地闲空、担心被抢、想找冷门时段时用这些命令。"
+    "注意：体育场地需要用户自己上网订（管家暂不代订），盯场发现变化时提醒用户去订。\n"
     "⚠️ 研讨室规定每次预定至少 2 人：用户需先发「设同伴 张伟」（中文名即可，"
     "系统自动转拼音按西浦账号规则搜索），之后订房自动带上同伴；"
     "用户提到和某位同学一起订时，把同学名字填进 partner 参数（中文名/账号均可）。"
@@ -5201,6 +5650,8 @@ def poll_group_messages():
     """定时任务入口：定时推送 + 保活 + 图片处理（文本消息由 webhook + feishu-poller 兜底，不再重复拉取）"""
     # 定时订房队列检查：到触发时间的任务自动抢订（每分钟跑一次）
     _check_room_booking_queue(CHAT_ID_FALLBACK)
+    # 盯场地检查：被抢/空出即时提醒（每分钟跑一次）
+    _check_sports_watch(CHAT_ID_FALLBACK)
     # 定时推送
     _check_pending_revoke(CHAT_ID_FALLBACK)
     _check_leave_approval(CHAT_ID_FALLBACK)
