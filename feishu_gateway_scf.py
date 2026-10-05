@@ -5822,11 +5822,15 @@ def _is_msg_processed_shared(msg_id):
 def _mark_msg_processed_shared(msg_id):
     """命令处理完成后写入共享表，供 butler 兜底端去重。
     写失败仅记日志（极小概率导致 butler 再执行一次，且其状态幂等可自愈）。"""
+    data, sha = {"ids": []}, ""
     try:
         data, sha = gh_read_json(PROCESSED_MSGS_FILE)
     except Exception as e:
-        log(f"标记共享已处理-读失败: {e}")
-        return
+        if getattr(e, "code", None) == 404:
+            pass  # 文件尚不存在（首次运行）→ 下方按空表新建
+        else:
+            log(f"标记共享已处理-读失败: {e}")
+            return
     ids = data.get("ids") or []
     if msg_id in ids:
         return
