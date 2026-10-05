@@ -1119,6 +1119,13 @@ HELP_TEXT = (
     "「场地规律 羽毛球」分析未来7天：哪些时段常年关闭/固定课/热门难抢\n"
     "「盯场地 羽毛球 10-08 19:00」盯某时段，被抢/空出立即提醒（每分钟查）\n"
     "「盯场地列表」「取消盯场 N」管理盯场任务\n\n"
+    "💰 财务管家（记账）\n"
+    "「花了 25 午饭」「支出 12.5 奶茶」记支出\n"
+    "「收入 50 兼职」「赚了 30 家教」记收入\n"
+    "「生活费到账」每月 3000 入账（已含在余额里则发「生活费已含」）\n"
+    "「账本」今日明细　「本月账单」月明细　「余额」当前余额+月底预测\n"
+    "「删账 N」删今日第N条　「今天没打卡」当天不记 +10\n"
+    "（每晚 23:00 自动发当日收支日报 + 月底钱包余额预测；自然语言也行：「中午吃饭花了25」）\n\n"
     "🩺 体检 · Cookie\n"
     "「状态」「体检」「管家身体怎么样」查看 GitHub token/Cookie/AMS/房间健康\n"
     "「cookie <JSON>」粘贴导出的新 Cookie 自动刷新\n\n"
@@ -3780,6 +3787,397 @@ def _check_sports_watch(chat_id=None):
             log(f"盯场状态保存失败: {e}")
 
 
+# ============ v41: 财务管家（记账 + 每日23点收支日报 + 月底余额预测） ============
+# 模型：wallet_start=记账起点余额(以前的)，流水(打卡/生活费/其他收支)增减 wallet_balance；
+# 「本月3000剩余」= 3000 + 打卡 + 其他收入 - 本月支出；「钱包余额」= 起点 + 全部流水净额。
+
+FINANCE_FILE = "finance.json"
+FINANCE_DEFAULT = {
+    "wallet_start": 692.69,      # 记账起点余额（2026-10-05 用户报的当前钱包余额）
+    "start_date": "2026-10-05",  # 记账起点日期
+    "wallet_balance": 692.69,    # 当前钱包余额 = 起点 + 所有流水
+    "monthly_allowance": 3000,   # 每月生活费
+    "checkin_reward": 10,        # 每日单词打卡奖励
+    "records": [],               # {id,date,ts,type(expense/income/checkin/allowance),amount,note}
+    "no_checkin_dates": [],      # 用户报"没打卡"的日期（当天不自动+10）
+    "allowance_month": "",       # 生活费已记录到账的月份 "YYYY-MM"，空=本月未到账
+}
+
+
+def _finance_load():
+    """读 finance.json；文件不存在时返回默认结构（sha=""，首次保存即创建）"""
+    try:
+        data, sha = gh_read_json(FINANCE_FILE)
+    except Exception as e:
+        if getattr(e, "code", None) == 404:
+            fin = json.loads(json.dumps(FINANCE_DEFAULT))  # 深拷贝
+            return fin, ""
+        raise
+    for k, v in FINANCE_DEFAULT.items():
+        data.setdefault(k, json.loads(json.dumps(v)) if isinstance(v, (list, dict)) else v)
+    return data, sha
+
+
+def _finance_save(fin, sha):
+    gh_write_json(FINANCE_FILE, fin, sha, "finance update")
+
+
+def _fmt_amt(v):
+    """金额格式化：+10.00 / -25.50"""
+    return f"{'+' if v >= 0 else '-'}{abs(v):.2f}"
+
+
+def _finance_month_stats(fin):
+    """本月（自然月）统计：返回 dict(expense, income_other, checkin, allowance, net, days_recorded)"""
+    now = datetime.now()
+    mp = now.strftime("%Y-%m")
+    recs = [r for r in fin.get("records", []) if str(r.get("date", "")).startswith(mp)]
+    expense = sum(r["amount"] for r in recs if r["type"] == "expense")
+    income_other = sum(r["amount"] for r in recs if r["type"] == "income")
+    checkin = sum(r["amount"] for r in recs if r["type"] == "checkin")
+    allowance = sum(r["amount"] for r in recs if r["type"] == "allowance")
+    try:
+        sd = datetime.strptime(fin.get("start_date", now.strftime("%Y-%m-%d")), "%Y-%m-%d")
+        days_recorded = max((now - sd).days + 1, 1)
+    except Exception:
+        days_recorded = 1
+    return {"expense": expense, "income_other": income_other, "checkin": checkin,
+            "allowance": allowance, "days_recorded": days_recorded, "month": mp}
+
+
+def _finance_predict(fin):
+    """月底钱包余额预测：当前余额 + 剩余天数×打卡奖励 - 日均支出×剩余天数"""
+    now = datetime.now()
+    st = _finance_month_stats(fin)
+    month_end = datetime(now.year + 1, 1, 1) if now.month == 12 else datetime(now.year, now.month + 1, 1)
+    days_left = (month_end - now).days
+    reward = float(fin.get("checkin_reward", 10))
+    daily_expense = st["expense"] / st["days_recorded"] if st["days_recorded"] else 0
+    predict_income = days_left * reward
+    predict_expense = daily_expense * days_left
+    return {
+        "days_left": days_left, "reward": reward,
+        "daily_expense": daily_expense,
+        "predict_income": predict_income, "predict_expense": predict_expense,
+        "predict_balance": fin["wallet_balance"] + predict_income - predict_expense,
+        "allowance_left": fin.get("monthly_allowance", 3000) + st["checkin"] + st["income_other"] - st["expense"],
+    }
+
+
+def _finance_add(chat_id, ftype, amount, note):
+    """记一条流水并更新钱包余额；返回 (rec, fin) 或 None（失败已回复）"""
+    try:
+        fin, sha = _finance_load()
+    except Exception as e:
+        log(f"记账-账本读取失败: {e}")
+        feishu_send_action(chat_id, "💰 记账", "❌ 账本读取失败（网络抖动），请稍后再发一次。", color="red")
+        return None
+    now = datetime.now()
+    rec = {"id": f"fin-{now.strftime('%Y%m%d%H%M%S')}-{len(fin['records'])}",
+           "date": now.strftime("%Y-%m-%d"), "ts": now.strftime("%H:%M"),
+           "type": ftype, "amount": round(float(amount), 2), "note": str(note or "")[:40]}
+    fin["records"].append(rec)
+    delta = -rec["amount"] if ftype == "expense" else rec["amount"]
+    fin["wallet_balance"] = round(fin["wallet_balance"] + delta, 2)
+    if ftype == "allowance":
+        fin["allowance_month"] = now.strftime("%Y-%m")
+    try:
+        _finance_save(fin, sha)
+    except Exception as e:
+        log(f"记账-保存失败: {e}")
+        feishu_send_action(chat_id, "💰 记账", "❌ 账本保存失败，请稍后再发一次。", color="red")
+        return None
+    return rec, fin
+
+
+def cmd_finance_allowance(chat_id, text):
+    """「生活费到账」→ 本月 +3000；「生活费已含」→ 只标记到账不加分（钱已在当前余额里）"""
+    try:
+        fin, sha = _finance_load()
+    except Exception as e:
+        feishu_send_action(chat_id, "💰 生活费", "❌ 账本读取失败，稍后再试。", color="red")
+        return
+    now = datetime.now()
+    mp = now.strftime("%Y-%m")
+    if fin.get("allowance_month") == mp:
+        feishu_send_action(chat_id, "💰 生活费",
+            f"ℹ️ 本月（{mp}）生活费已记录过，不重复入账。", color="blue")
+        return
+    if any(k in text for k in ("已含", "已在", "已经包含", "不用加", "已到过", "早到")):
+        fin["allowance_month"] = mp  # 只标记，不加钱（3000 已在当前余额里）
+        try:
+            _finance_save(fin, sha)
+        except Exception as e:
+            feishu_send_action(chat_id, "💰 生活费", "❌ 保存失败，稍后再试。", color="red")
+            return
+        feishu_send_action(chat_id, "💰 生活费",
+            f"✅ 已标记 {mp} 生活费在账（不重复加钱，因为已包含在当前余额里）。\n"
+            f"🏦 当前钱包余额：{fin['wallet_balance']:.2f} 元", color="green")
+        return
+    m = re.search(r"(\d+(?:\.\d+)?)", text)
+    amount = float(m.group(1)) if m else float(fin.get("monthly_allowance", 3000))
+    r = _finance_add(chat_id, "allowance", amount, "每月生活费")
+    if r:
+        feishu_send_action(chat_id, "💰 生活费到账",
+            f"✅ 已入账：每月生活费 +{amount:.2f}\n"
+            f"🏦 当前钱包余额：{r[1]['wallet_balance']:.2f} 元", color="green")
+
+
+def cmd_finance_record(chat_id, text):
+    """「花了 25 午饭」「支出 12.5 奶茶」「收入 50 兼职」「买了 30 书」"""
+    t = text.strip()
+    is_expense = bool(re.match(r"^(花了|花掉|花去|支出|消费|买了|买|付了|付|用掉|用去|花费)", t))
+    is_income = bool(re.match(r"^(收入|收了|赚了|进账|得到了|收到)", t))
+    # 中置格式：「午饭花了25」「打车花掉18」「家教赚了50」
+    if not (is_expense or is_income):
+        mm = re.match(r"^(.*?)(花了|花掉|花去|用掉|用去|支出|消费|赚了|收了|收入)\s*"
+                      r"(\d+(?:\.\d+)?)\s*(?:块|元|块钱|圆|人民币)?\s*(.*)$", t)
+        if mm:
+            verb = mm.group(2)
+            ftype = "income" if verb in ("赚了", "收了", "收入") else "expense"
+            amount = float(mm.group(3))
+            note = (mm.group(4).strip() or mm.group(1).strip()
+                    or ("收入" if ftype == "income" else "支出"))
+            r = _finance_add(chat_id, ftype, amount, note)
+            if r:
+                rec, fin = r
+                sign = "-" if ftype == "expense" else "+"
+                feishu_send_action(chat_id, "💰 已记账",
+                    f"{'📤 支出' if ftype == 'expense' else '📥 收入'}：{note} {sign}{rec['amount']:.2f}\n"
+                    f"🏦 当前钱包余额：{fin['wallet_balance']:.2f} 元\n\n"
+                    "查看：「账本」今日明细　「余额」月底预测", color="blue")
+            return
+        feishu_send_action(chat_id, "💰 记账",
+            "用法：「花了 25 午饭」「收入 50 兼职」「生活费到账」", color="blue")
+        return
+    body = re.sub(r"^(花了|花掉|花去|支出|消费|买了|买|付了|付|用掉|用去|花费|收入|收了|赚了|进账|得到了|收到)",
+                  "", t).strip()
+    # 金额在前：「25 午饭」/「25块 午饭」；金额在后：「午饭 25」/「午饭 25元」
+    m1 = re.match(r"^(\d+(?:\.\d+)?)\s*(?:块|元|块钱|圆|人民币)?\s*(.*)$", body)
+    m2 = None if m1 else re.match(r"^(.*\S)\s*(\d+(?:\.\d+)?)\s*(?:块|元|块钱|圆|人民币)?$", body)
+    m = m1 or m2
+    if not m:
+        feishu_send_action(chat_id, "💰 记账",
+            "⚠️ 没识别到金额。格式：「" + ("支出 金额 备注" if is_expense else "收入 金额 备注")
+            + "」，例如「花了 25 午饭」。", color="orange")
+        return
+    if m1:
+        amount, note = float(m1.group(1)), m1.group(2).strip()
+    else:
+        note, amount = m2.group(1).strip(), float(m2.group(2))
+    if not note:
+        note = "支出" if is_expense else "收入"
+    ftype = "expense" if is_expense else "income"
+    r = _finance_add(chat_id, ftype, amount, note)
+    if r:
+        rec, fin = r
+        sign = "-" if ftype == "expense" else "+"
+        feishu_send_action(chat_id, "💰 已记账",
+            f"{'📤 支出' if ftype == 'expense' else '📥 收入'}：{note} {sign}{rec['amount']:.2f}\n"
+            f"🏦 当前钱包余额：{fin['wallet_balance']:.2f} 元\n\n"
+            "查看：「账本」今日明细　「余额」月底预测", color="blue")
+
+
+def cmd_finance_no_checkin(chat_id):
+    """「今天没打卡」→ 当天不自动+10（若已自动记入则回滚）"""
+    try:
+        fin, sha = _finance_load()
+    except Exception as e:
+        feishu_send_action(chat_id, "💰 打卡", "❌ 账本读取失败，稍后再试。", color="red")
+        return
+    today = datetime.now().strftime("%Y-%m-%d")
+    nc = fin.setdefault("no_checkin_dates", [])
+    rolled = 0
+    for r in [x for x in fin["records"] if x.get("date") == today and x.get("type") == "checkin"]:
+        fin["records"].remove(r)
+        fin["wallet_balance"] = round(fin["wallet_balance"] - r["amount"], 2)
+        rolled += r["amount"]
+    if today not in nc:
+        nc.append(today)
+    try:
+        _finance_save(fin, sha)
+    except Exception as e:
+        feishu_send_action(chat_id, "💰 打卡", "❌ 保存失败，稍后再试。", color="red")
+        return
+    msg = f"✅ 已标记今天（{today}）没打卡，今晚日报不再记 +10。"
+    if rolled:
+        msg += f"\n（已回滚此前自动记入的打卡奖励 -{rolled:.2f}）"
+    feishu_send_action(chat_id, "💰 打卡", msg, color="green")
+
+
+def cmd_finance_delete(chat_id, text):
+    """「删账 N」删除今日第 N 条流水（序号见「账本」）"""
+    rest = re.sub(r"^删账", "", text.strip()).strip()
+    try:
+        n = int(rest)
+    except ValueError:
+        feishu_send_action(chat_id, "💰 删账", "用法：「删账 2」（序号看「账本」今日明细）", color="blue")
+        return
+    try:
+        fin, sha = _finance_load()
+    except Exception as e:
+        feishu_send_action(chat_id, "💰 删账", "❌ 账本读取失败，稍后再试。", color="red")
+        return
+    today = datetime.now().strftime("%Y-%m-%d")
+    today_recs = [r for r in fin["records"] if r.get("date") == today]
+    if n < 1 or n > len(today_recs):
+        feishu_send_action(chat_id, "💰 删账",
+            f"⚠️ 序号超出范围（今日共 {len(today_recs)} 条，含自动打卡）", color="orange")
+        return
+    rec = today_recs[n - 1]
+    fin["records"].remove(rec)
+    delta = -rec["amount"] if rec["type"] == "expense" else rec["amount"]
+    fin["wallet_balance"] = round(fin["wallet_balance"] - delta, 2)
+    try:
+        _finance_save(fin, sha)
+    except Exception as e:
+        feishu_send_action(chat_id, "💰 删账", "❌ 保存失败，稍后再试。", color="red")
+        return
+    feishu_send_action(chat_id, "💰 已删账",
+        f"🗑️ 已删除：{rec['ts']} {rec['note']} {_fmt_amt(-rec['amount'] if rec['type']=='expense' else rec['amount'])}\n"
+        f"🏦 当前钱包余额：{fin['wallet_balance']:.2f} 元", color="green")
+
+
+def _finance_day_lines(today_recs):
+    """格式化某日流水明细 → (收入块, 支出块, 收入小计, 支出小计)"""
+    inc = [r for r in today_recs if r["type"] != "expense"]
+    exp = [r for r in today_recs if r["type"] == "expense"]
+    inc_sum = sum(r["amount"] for r in inc)
+    exp_sum = sum(r["amount"] for r in exp)
+    inc_lines = [f"  · {r['ts']} {r['note']} +{r['amount']:.2f}" for r in inc] or ["  （无）"]
+    exp_lines = [f"  · {r['ts']} {r['note']} -{r['amount']:.2f}" for r in exp] or ["  （无）"]
+    return inc_lines, exp_lines, inc_sum, exp_sum
+
+
+def cmd_finance_view(chat_id, text):
+    """「账本」今日明细 /「本月账单」月明细 /「余额」当前+预测"""
+    t = text.strip()
+    try:
+        fin, sha = _finance_load()
+    except Exception as e:
+        feishu_send_action(chat_id, "💰 账本", "❌ 账本读取失败，稍后再试。", color="red")
+        return
+    now = datetime.now()
+    today = now.strftime("%Y-%m-%d")
+    pr = _finance_predict(fin)
+
+    if t in ("余额", "钱包", "钱包余额", "财务", "余额查询"):
+        st = _finance_month_stats(fin)
+        if fin.get("allowance_month") == now.strftime("%Y-%m"):
+            allow_line = f"💰 本月 3000 生活费剩余：{pr['allowance_left']:.2f} 元"
+        else:
+            allow_line = "💰 本月生活费还没记录到账：发「生活费到账」（+3000）或「生活费已含」（已含在余额里）"
+        feishu_send_action(chat_id, "🏦 钱包余额",
+            f"🏦 当前钱包余额：{fin['wallet_balance']:.2f} 元\n"
+            f"（记账起点 {fin.get('start_date','')} 为 {fin.get('wallet_start',0):.2f} 元）\n\n"
+            f"{allow_line}\n"
+            f"🔮 月底余额预测：{pr['predict_balance']:.2f} 元\n"
+            f"   （剩余 {pr['days_left']} 天 × 打卡 {pr['reward']:.0f}/天 = +{pr['predict_income']:.2f}，"
+            f"按日均支出 {pr['daily_expense']:.2f}/天 预计再花 {pr['predict_expense']:.2f}）",
+            color="blue")
+        return
+
+    if "本月" in t or t == "月账":
+        mp = now.strftime("%Y-%m")
+        recs = [r for r in fin["records"] if str(r.get("date", "")).startswith(mp)]
+        if not recs:
+            feishu_send_action(chat_id, "💰 本月账单", "📭 本月还没有记账记录。", color="blue")
+            return
+        st = _finance_month_stats(fin)
+        lines = [f"💰 {mp} 账单（{len(recs)} 条）", ""]
+        by_date = {}
+        for r in recs:
+            by_date.setdefault(r["date"], []).append(r)
+        for d in sorted(by_date):
+            lines.append(f"【{d[5:]}】")
+            for r in by_date[d]:
+                sign = "-" if r["type"] == "expense" else "+"
+                lines.append(f"  · {r['ts']} {r['note']} {sign}{r['amount']:.2f}")
+        lines.append("")
+        lines.append(f"📥 收入合计：+{st['checkin'] + st['income_other'] + st['allowance']:.2f}"
+                     f"（打卡 {st['checkin']:.2f} + 其他 {st['income_other']:.2f} + 生活费 {st['allowance']:.2f}）")
+        lines.append(f"📤 支出合计：-{st['expense']:.2f}")
+        lines.append(f"✨ 本月净额：{st['checkin'] + st['income_other'] + st['allowance'] - st['expense']:+.2f}")
+        feishu_send_action(chat_id, "💰 本月账单", "\n".join(lines), color="blue")
+        return
+
+    # 默认：今日账单
+    today_recs = [r for r in fin["records"] if r.get("date") == today]
+    inc_lines, exp_lines, inc_sum, exp_sum = _finance_day_lines(today_recs)
+    lines = [f"📒 今日账单（{today[5:]}）", "",
+             "📥 收入", *inc_lines, f"  小计 +{inc_sum:.2f}",
+             "📤 支出", *exp_lines, f"  小计 -{exp_sum:.2f}",
+             f"✨ 今日净额：{inc_sum - exp_sum:+.2f}", "",
+             f"🏦 当前钱包余额：{fin['wallet_balance']:.2f} 元"]
+    if today_recs:
+        lines.append("删错可用：「删账 N」（N=序号，从上往下数，含打卡）")
+    feishu_send_action(chat_id, "📒 今日账单", "\n".join(lines), color="blue")
+
+
+def _check_daily_finance_report(chat_id=None):
+    """v41: 每天 23:00 自动记当日打卡奖励 + 发当日收支日报（持久化去重，容器重启不重发）"""
+    now = datetime.now()
+    if now.hour != 23:
+        return
+    today = now.strftime("%Y-%m-%d")
+    if not _sched_should_send(f"finance:{today}"):
+        return
+    chat_id = chat_id or CHAT_ID_FALLBACK
+    try:
+        fin, sha = _finance_load()
+    except Exception as e:
+        log(f"财务日报-账本读取失败: {e}")
+        return
+    # 自动记打卡（没标记"没打卡"且今天还没记过）
+    today_recs = [r for r in fin["records"] if r.get("date") == today]
+    checkin_added = False
+    if today not in (fin.get("no_checkin_dates") or []) and \
+       not any(r.get("type") == "checkin" for r in today_recs):
+        rec = {"id": f"fin-{now.strftime('%Y%m%d%H%M%S')}-{len(fin['records'])}",
+               "date": today, "ts": "23:00", "type": "checkin",
+               "amount": round(float(fin.get("checkin_reward", 10)), 2), "note": "单词打卡奖励"}
+        fin["records"].append(rec)
+        fin["wallet_balance"] = round(fin["wallet_balance"] + rec["amount"], 2)
+        today_recs.append(rec)
+        checkin_added = True
+        try:
+            _finance_save(fin, sha)
+            sha = "saved"
+        except Exception as e:
+            log(f"财务日报-打卡入账失败: {e}")
+    # 日报正文
+    inc_lines, exp_lines, inc_sum, exp_sum = _finance_day_lines(today_recs)
+    pr = _finance_predict(fin)
+    st = _finance_month_stats(fin)
+    net = inc_sum - exp_sum
+    wd_names = ["周一", "周二", "周三", "周四", "周五", "周六", "周日"]
+    lines = [
+        f"🌙 {today[5:]}（{wd_names[now.weekday()]}）收支日报",
+        "",
+        "📥 今日收入", *inc_lines, f"  小计 +{inc_sum:.2f}",
+        "📤 今日支出", *exp_lines, f"  小计 -{exp_sum:.2f}",
+        f"✨ 今日净额：{net:+.2f}",
+        "",
+        f"📊 本月累计（{st['month']}，记账 {st['days_recorded']} 天）："
+        f"支出 -{st['expense']:.2f} ｜ 打卡 +{st['checkin']:.2f} ｜ 其他收入 +{st['income_other']:.2f}",
+    ]
+    if fin.get("allowance_month") == now.strftime("%Y-%m"):
+        used_pct = st["expense"] / float(fin.get("monthly_allowance", 3000)) * 100
+        lines.append(f"💰 本月生活费剩余：{pr['allowance_left']:.2f}（已花 {used_pct:.0f}%）")
+    else:
+        lines.append("💰 本月生活费还没记录到账（发「生活费到账」或「生活费已含」）")
+    lines += [
+        f"🏦 钱包当前余额：{fin['wallet_balance']:.2f} 元",
+        f"🔮 月底余额预测：{pr['predict_balance']:.2f} 元",
+        f"   （剩余 {pr['days_left']} 天：打卡 +{pr['predict_income']:.2f}，"
+        f"按日均 {pr['daily_expense']:.2f} 预计再花 {pr['predict_expense']:.2f}）",
+    ]
+    if not checkin_added and today in (fin.get("no_checkin_dates") or []):
+        lines.append("")
+        lines.append("ℹ️ 今天你说了没打卡，未记打卡奖励。")
+    feishu_send_action(chat_id, "🌙 收支日报", "\n".join(lines), color="blue")
+
+
 def cmd_del_calendar(chat_id, text):
     """删除 Outlook 日历事件
     「删日历」→ 列出
@@ -4532,6 +4930,25 @@ def process_command(text, chat_id):
     if t.startswith("查场") or t.startswith("查场馆"):
         cmd_sports_query(chat_id, text)
         return
+    # v41: 财务管家（记账/账本/余额/生活费/打卡）
+    if t.startswith(("花了", "花掉", "花去", "支出", "消费", "买了", "买 ", "付了", "用掉", "用去", "花费")):
+        cmd_finance_record(chat_id, text)
+        return
+    if t.startswith(("收入", "收了", "赚了", "进账", "收到")):
+        cmd_finance_record(chat_id, text)
+        return
+    if "生活费" in t and any(k in t for k in ("到账", "到了", "转了", "给我", "给了", "已含", "已在")):
+        cmd_finance_allowance(chat_id, text)
+        return
+    if t in ("今天没打卡", "没打卡", "忘记打卡了", "没单词打卡", "单词没打卡"):
+        cmd_finance_no_checkin(chat_id)
+        return
+    if t.startswith("删账"):
+        cmd_finance_delete(chat_id, text)
+        return
+    if t in ("账本", "今日账单", "账单", "本月账单", "月账", "余额", "钱包", "钱包余额", "财务"):
+        cmd_finance_view(chat_id, t)
+        return
     if t.startswith("推荐房") or t.startswith("房间推荐") or re.search(r"^\d+人.*房", t) or re.search(r"^\d+个人.*房", t):
         cmd_room_recommend(chat_id, text)
         return
@@ -5071,6 +5488,11 @@ SYSTEM_PROMPT = (
     "系统自动转拼音按西浦账号规则搜索），之后订房自动带上同伴；"
     "用户提到和某位同学一起订时，把同学名字填进 partner 参数（中文名/账号均可）。"
     "用户没设同伴又要订房时，引导他设置；有 set_room_partner 工具可用。\n\n"
+    "9. **财务管家（记账）**：你管理用户的钱包。每月生活费 3000，每晚单词打卡奖励 +10。"
+    "用户说任何花钱/赚钱的事（「中午吃饭花了25」「兼职赚了50」），帮他记一笔账："
+    "[ACTION:记账|支出|25|午饭] 或 [ACTION:记账|收入|50|兼职]（格式：类型|金额|备注）。"
+    "用户问「还剩多少钱」「钱包余额」→ [ACTION:余额]；问「今天/这个月花了多少」→ [ACTION:账本] 或 [ACTION:本月账单]。"
+    "生活费到账 → [ACTION:记账|生活费]。每天 23:00 系统自动发收支日报并预测月底余额，不用你操心。\n\n"
     "## 西浦课程考核知识（2026-10-04 实地抓取 LM 课程页 + Module Handbook，以老师公告为准，绝不编造作业性质）\n"
     "LearningMall（LMC）是西浦的教学中枢：课程资料、作业提交、测验、公告全在上面。"
     "「Exam Page for <课程>」是课程的考试页（正式考试入口），下面的 quiz 是机房考试项目，"
@@ -5153,6 +5575,12 @@ SYSTEM_PROMPT = (
     "- 删除清单：[ACTION:删除]\n"
     "- 删除第N个：[ACTION:删除N]\n"
     "- 删除全部：[ACTION:删除全部]\n"
+    "- 记一笔支出：[ACTION:记账|支出|25|午饭]\n"
+    "- 记一笔收入：[ACTION:记账|收入|50|兼职]\n"
+    "- 生活费到账：[ACTION:记账|生活费]\n"
+    "- 查今日账单：[ACTION:账本]\n"
+    "- 查本月账单：[ACTION:本月账单]\n"
+    "- 查钱包余额/预测：[ACTION:余额]\n"
     "- 查看帮助：[ACTION:帮助]\n"
     "签到/出勤/请假是固定命令（不走 LLM），用户直接发「签到 码」「出勤」「请假 日期 原因」即可。\n"
     "加日历也是固定命令：「加日历 <标题> <日期> <开始> <结束>」直接写入 Outlook。\n"
@@ -5600,6 +6028,34 @@ def execute_llm_action(action, chat_id):
     elif a.startswith("删除") or a.startswith("delete"):
         rest = a[len("删除"):].strip() if a.startswith("删除") else a[len("delete"):].strip()
         cmd_smart_delete(chat_id, rest)
+    elif a.startswith("记账") or a.startswith("记一笔"):
+        # v41: [ACTION:记账|支出|25|午饭] / [ACTION:记账|收入|50|兼职] / [ACTION:记账|生活费]
+        body = re.sub(r"^(记账|记一笔)", "", action.strip()).strip(" ｜|,，")
+        parts = [p.strip() for p in re.split(r"[|｜]", body) if p.strip()]
+        if not parts:
+            cmd_finance_view(chat_id, "账本")
+        elif parts[0] in ("生活费", "allowance"):
+            cmd_finance_allowance(chat_id, "生活费到账")
+        elif parts[0] in ("支出", "花", "expense"):
+            if len(parts) >= 2:
+                note = parts[2] if len(parts) >= 3 else "支出"
+                cmd_finance_record(chat_id, f"支出 {parts[1]} {note}")
+            else:
+                feishu_send_action(chat_id, "💰 记账", "⚠️ 金额缺失，格式：[ACTION:记账|支出|25|午饭]", color="orange")
+        elif parts[0] in ("收入", "income", "赚"):
+            if len(parts) >= 2:
+                note = parts[2] if len(parts) >= 3 else "收入"
+                cmd_finance_record(chat_id, f"收入 {parts[1]} {note}")
+            else:
+                feishu_send_action(chat_id, "💰 记账", "⚠️ 金额缺失，格式：[ACTION:记账|收入|50|兼职]", color="orange")
+        else:
+            cmd_finance_record(chat_id, " ".join(parts))
+    elif a in ("账本", "今日账单", "账单"):
+        cmd_finance_view(chat_id, "账本")
+    elif a in ("余额", "钱包", "钱包余额"):
+        cmd_finance_view(chat_id, "余额")
+    elif a in ("本月账单", "月账"):
+        cmd_finance_view(chat_id, "本月账单")
     else:
         log(f"未知action: {action}")
 
@@ -5698,6 +6154,8 @@ def poll_group_messages():
     _check_room_booking_queue(CHAT_ID_FALLBACK)
     # 盯场地检查：被抢/空出即时提醒（每分钟跑一次）
     _check_sports_watch(CHAT_ID_FALLBACK)
+    # v41: 每天 23:00 财务收支日报（内部含 hour 判断+持久化去重）
+    _check_daily_finance_report(CHAT_ID_FALLBACK)
     # 定时推送
     _check_pending_revoke(CHAT_ID_FALLBACK)
     _check_leave_approval(CHAT_ID_FALLBACK)
