@@ -2577,10 +2577,12 @@ def _room_profile(room_name):
 
 
 def _room_recommend(people, compact=None):
-    """根据人数推荐房间，返回排序后的 [(room号, profile, reason)] 列表"""
+    """根据人数推荐房间，返回排序后的 [(room号, profile, status, free_slots)] 列表
+    status: "free"(全天空闲) / "partial"(部分空闲) / "busy"(已约满) / "unknown"(无数据)
+    排序：空闲 > 部分空闲 > 已约满 > 未知；同类内按匹配度(容量余量小+楼层高)排序
+    """
     candidates = []
     for num, p in ROOM_PROFILES.items():
-        # 解析容量范围
         cap = p["cap"]
         m = re.match(r"(\d+)\s*[-~]\s*(\d+)", cap)
         if not m:
@@ -2588,24 +2590,48 @@ def _room_recommend(people, compact=None):
         lo, hi = int(m.group(1)), int(m.group(2))
         if people < lo or people > hi:
             continue
-        # 检查是否空闲
-        is_free = True
-        free_slots = ""
+        # 查缓存里的预订状态
+        status = "unknown"
+        free_slots = None
         if compact:
             for lab in compact:
                 for r in lab.get("rooms") or []:
-                    rn = r.get("name", "")
-                    if num in rn:
+                    if num in (r.get("name") or ""):
                         bk = r.get("bk") or []
-                        if bk:
-                            is_free = False
+                        o_s, o_e = r.get("os", ROOM_OPEN), r.get("oe", ROOM_CLOSE)
+                        if not bk:
+                            status = "free"
+                            free_slots = [(o_s, o_e)]
+                        else:
+                            # 计算空闲时段
+                            def to_min(t):
+                                h, mm = t.split(":")
+                                return int(h) * 60 + int(mm)
+                            cur = to_min(o_s)
+                            free = []
+                            for s, e in sorted(bk):
+                                s_m, e_m = to_min(s), to_min(e)
+                                if s_m > cur:
+                                    free.append((cur, s_m))
+                                cur = max(cur, e_m)
+                            if cur < to_min(o_e):
+                                free.append((cur, to_min(o_e)))
+                            if free:
+                                status = "partial"
+                                free_slots = [(f"{a//60:02d}:{a%60:02d}", f"{b//60:02d}:{b%60:02d}") for a, b in free]
+                            else:
+                                status = "busy"
+                                free_slots = []
                         break
-        # 评分：刚好容纳 > 容量大余量 > 楼层高
-        cap_fit = hi - people  # 余量越小越优先
+        # 匹配度评分：容量余量越小越优先 + 楼层高加分
+        cap_fit = hi - people
         floor_bonus = {"10F": 5, "8F": 4, "7F": 3, "5F": 2, "4F": 1, "3F": 0}.get(p["floor"], 0)
-        score = -cap_fit * 10 + floor_bonus + (50 if is_free else 0)
-        candidates.append((num, p, score, is_free))
-    candidates.sort(key=lambda x: -x[2])
+        match_score = -cap_fit * 10 + floor_bonus
+        # 状态优先级：空闲 > 部分空闲 > 已约满 > 未知
+        status_order = {"free": 0, "partial": 1, "busy": 2, "unknown": 3}.get(status, 3)
+        candidates.append((num, p, status, free_slots, status_order, match_score))
+    # 排序：先按状态优先级，再按匹配度
+    candidates.sort(key=lambda x: (x[4], -x[5]))
     return candidates
 
 
@@ -2624,14 +2650,43 @@ def cmd_room_recommend(chat_id, text):
             f"❌ 没有适合 {people} 人的研讨室。\n\n现有房间容量：2-5人(314/316/318/543/545)、4-6人(445)、2-8人(547/714/814)、6-9人(429)、2-10人(1014)",
             color="red")
         return
-    lines = [f"🏛️ {people}人研讨室推荐（按匹配度排序）\n"]
-    for i, (num, p, score, is_free) in enumerate(recs[:5], 1):
-        status = "🟢 空闲" if is_free else ("🔴 已被占" if compact else "⚪ 状态未知")
-        lines.append(f"{i}. Room {num}（{p['floor']}）{status}")
-        lines.append(f"   容量 {p['cap']}人 · {p['equip']}")
-        lines.append(f"   {p['tag']}")
-        lines.append("")
-    lines.append("💡 发「查房」看实时空闲，「订房 房间号 日期 时段」直接预订")
+    # 分组：空闲 / 部分空闲 / 已约满 / 未知
+    free_list = [r for r in recs if r[2] == "free"]
+    partial_list = [r for r in recs if r[2] == "partial"]
+    busy_list = [r for r in recs if r[2] == "busy"]
+    unknown_list = [r for r in recs if r[2] == "unknown"]
+    lines = [f"🏛️ {people}人研讨室推荐（今天 {today}）\n"]
+    idx = 1
+    if free_list:
+        lines.append(f"🟢 全天空闲（{len(free_list)}间）——直接可订")
+        for num, p, status, slots, _, _ in free_list:
+            lines.append(f"{idx}. Room {num}（{p['floor']}）容量 {p['cap']}人")
+            lines.append(f"   {p['equip']} · {p['tag']}")
+            lines.append("")
+            idx += 1
+    if partial_list:
+        lines.append(f"🟡 部分时段空闲（{len(partial_list)}间）——避开已约时段即可")
+        for num, p, status, slots, _, _ in partial_list:
+            slot_str = "、".join(f"{s}-{e}" for s, e in slots) if slots else ""
+            lines.append(f"{idx}. Room {num}（{p['floor']}）容量 {p['cap']}人")
+            lines.append(f"   空闲时段：{slot_str}")
+            lines.append(f"   {p['equip']} · {p['tag']}")
+            lines.append("")
+            idx += 1
+    if busy_list:
+        lines.append(f"🔴 今日已约满（{len(busy_list)}间）——换一天可能可用")
+        for num, p, status, slots, _, _ in busy_list:
+            lines.append(f"{idx}. Room {num}（{p['floor']}）容量 {p['cap']}人 · {p['tag']}")
+            idx += 1
+    if unknown_list:
+        lines.append(f"⚪ 状态未知（{len(unknown_list)}间）——发「实时查房」刷新")
+        for num, p, status, slots, _, _ in unknown_list:
+            lines.append(f"{idx}. Room {num}（{p['floor']}）容量 {p['cap']}人 · {p['tag']}")
+            idx += 1
+    if not free_list and not partial_list:
+        lines.append("\n💡 今天全被占了，试试「推荐房间 4人 明天」换个日期")
+    else:
+        lines.append("\n💡 发「订房 房间号 日期 时段」直接预订")
     feishu_send_action(chat_id, "🏛️ 房间推荐", "\n".join(lines), color="blue")
 
 
