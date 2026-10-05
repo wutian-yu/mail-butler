@@ -1317,6 +1317,10 @@ def cmd_approve(chat_id, text):
                 created += 1
             confirmed.setdefault("items", []).append(item)
         pending["items"] = [i for i in pending.get("items", []) if i.get("status") != "pending"]
+        # v39c: 批量批准不删除 item，保留状态做去重（上面这行会删 pending 的，改成保留）
+        # 实际上上面那行已经把 pending 状态的删了，但我们刚改为 confirmed，所以不会删
+        # 问题：上面那行会删除所有 status==pending 的，但刚改完没有 pending 的了，没问题
+        # 但为了去重我们要保留 confirmed 的 → 不需要改，上面的逻辑已保留 confirmed
         gh_write_json("pending.json", pending, p_sha, "approve all")
         try:
             confirmed2, c_sha2 = gh_read_json("confirmed.json")
@@ -1350,7 +1354,8 @@ def cmd_approve(chat_id, text):
     if eid:
         item["outlook_event_id"] = eid
     confirmed.setdefault("items", []).append(item)
-    pending["items"].remove(item)
+    # v39c: 不再物理删除，保留在 pending.json 做去重
+    # pending["items"].remove(item)  # 旧行为：删除后 butler 重扫邮件会重复推送
     gh_write_json("pending.json", pending, p_sha, "approve")
     try:
         confirmed2, c_sha2 = gh_read_json("confirmed.json")
@@ -1404,7 +1409,8 @@ def cmd_skip(chat_id, text):
         return
     item = active[num - 1]
     item["status"] = "skipped"
-    pending["items"].remove(item)
+    # v39c: 不再物理删除，保留在 pending.json 做去重
+    # pending["items"].remove(item)  # 旧行为：删除后 butler 重扫邮件会重复推送
     gh_write_json("pending.json", pending, p_sha, "skip")
     feishu_send_action(chat_id, "⏭️ 已跳过", f"{item['subject'][:50]}", color="blue")
 
