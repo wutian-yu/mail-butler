@@ -46,4 +46,7 @@ jobs:
           git config user.name "XJTLU Monitor Bot"
           git config user.email "bot@xjtlu.edu.cn"
           git add .
-          git diff --cached --quiet || (git commit -m "xjtlu state update" && git push -f)
+          # v41 修复：原 git push -f 会把 clone 之后云函数/管家写入的全部提交强制抹掉
+          # （曾导致 finance.json 账本、消息去重记录等无端丢失）。
+          # 改为 rebase 远端新提交后再推；冲突则放弃本次（下次运行自然同步），绝不覆盖远端。
+          git diff --cached --quiet || (git commit -m "xjtlu state update" && (git pull --rebase origin main && git push || (git rebase --abort 2>/dev/null; echo "push skipped: rebase conflict, next run will retry")))
