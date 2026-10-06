@@ -1,0 +1,37 @@
+name: Feishu Live
+
+# 常驻轮询接力：把原 SCF 云函数「每分钟定时器」的节奏复刻到 GitHub Actions 规则内。
+# 单个任务最长跑 6 小时 → 任务内部每 ~50 秒轮询一轮飞书（消息 ~1 分钟内必处理），
+# 每天 4 个锚点接力拼成 24 小时覆盖；Feishu Poller(*/5) 保留为兜底，接力空档/停摆时消息零丢失。
+
+on:
+  schedule:
+    # 锚点避开整点高峰（GitHub 调度拥堵高发在每小时开头）
+    - cron: '5 0,6,12,18 * * *'
+  workflow_dispatch:
+
+concurrency:
+  group: feishu-live
+  # 锚点被拖延到上一棒还没结束时：取消旧棒、启用新棒（状态全在 butler-data，无丢失）
+  cancel-in-progress: true
+
+jobs:
+  live:
+    runs-on: ubuntu-latest
+    timeout-minutes: 360
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Run live loop
+        env:
+          TZ: Asia/Shanghai
+          FEISHU_APP_ID: ${{ secrets.FEISHU_APP_ID }}
+          FEISHU_APP_SECRET: ${{ secrets.FEISHU_APP_SECRET }}
+          FEISHU_VERIFY_TOKEN: ${{ secrets.FEISHU_VERIFY_TOKEN }}
+          CHAT_ID: ${{ secrets.CHAT_ID }}
+          # GH_PAT：仓库既有密钥（xjtlu-monitor 已用它经 Contents API 读写 butler-data）
+          GH_TOKEN: ${{ secrets.GH_PAT }}
+          OUTLOOK_REFRESH_TOKEN: ${{ secrets.OUTLOOK_REFRESH_TOKEN }}
+          OUTLOOK_CLIENT_ID: ${{ secrets.OUTLOOK_CLIENT_ID }}
+          DEEPSEEK_API_KEY: ${{ secrets.DEEPSEEK_API_KEY }}
+        run: python gateway_driver.py live
