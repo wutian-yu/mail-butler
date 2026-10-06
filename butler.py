@@ -1049,28 +1049,12 @@ def run():
         importance_emoji = IMPORTANCE_EMOJI[importance]
         log(f"🎯 活动邮件: {subject[:40]}（{date_txt} {time_txt}）[{importance}]")
 
-        # 写入 Outlook 日历
+        # v43: 不再自动写入 Outlook 日历！
+        # 用户明确反馈："我没批准过的活动凭什么进我手机日历？"
+        # （日期提取不到时还写成 00:00 全天垃圾日程，当天早报还会当"今日日程"推送骚扰用户）
+        # 新流程：只推送通知 + 进待确认队列，用户回复「批准」后由云函数写日历（cmd_approve）。
         prefix = "📮"
         title = f"{prefix} {subject[:40]}"
-        note = summary[:500]
-        try:
-            if dates:
-                d = dates[0]
-                if time_range:
-                    start = d.replace(hour=time_range[0], minute=time_range[1])
-                    end = d.replace(hour=time_range[2], minute=time_range[3])
-                else:
-                    start = d.replace(hour=9)
-                    end = d.replace(hour=10)
-                outlook.create_event(title, start, end, body=note)
-            else:
-                outlook.create_event(title + "（时间待定）",
-                                     now.replace(tzinfo=None) + timedelta(days=1),
-                                     now.replace(tzinfo=None) + timedelta(days=2),
-                                     body=note, all_day=True)
-            log(f"✅ Outlook 日历已写入: {title[:50]}")
-        except Exception as e:
-            log(f"⚠️ Outlook 日历写入失败: {e}", "WARN")
 
         # 加入待确认队列
         item = {
