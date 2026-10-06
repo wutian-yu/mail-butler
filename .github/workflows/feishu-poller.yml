@@ -153,9 +153,12 @@ jobs:
               state = json.load(open("poll-state.json"))
           except Exception:
               state = {}
-          state["heartbeat"] = datetime.datetime.now().strftime("%Y-%m-%d")
-          state["updated"] = datetime.datetime.now().isoformat()
-          json.dump(state, open("poll-state.json", "w"), ensure_ascii=False, indent=2)
+          day = datetime.datetime.now().strftime("%Y-%m-%d")
+          if state.get("heartbeat") == day:
+              print("heartbeat already set today, no change")
+          else:
+              state["heartbeat"] = day
+              json.dump(state, open("poll-state.json", "w"), ensure_ascii=False, indent=2)
           PYEOF
           if [ -z "$(git status --porcelain poll-state.json)" ]; then
             echo "heartbeat unchanged"
