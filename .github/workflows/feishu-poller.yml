@@ -2,152 +2,167 @@ name: Feishu Poller
 
 on:
   schedule:
-    # v43: 5→15 分钟——webhook 秒级 + SCF 每分钟轮询已覆盖，这是第三层兜底；
-    # 降频减少 Actions run 总量（凌晨 runner 紧张时高频 run 会连环取消→失败邮件轰炸用户邮箱）
-    - cron: '*/15 * * * *'
+    # 2026-10-06 起腾讯云 SCF 云函数已删除（停用付费服务）。
+    # 本工作流接管原 feishu-gateway 云函数的全部职责，GitHub Actions 公开仓库免费运行：
+    #   1. 文本消息处理 —— 原 webhook 秒级路径 → 现每 5 分钟轮询，回复最多延迟约 5-10 分钟
+    #   2. AMS 课节状态监控 —— 原 ams-poller 每分钟定时器（签到码 72h 有效，5 分钟粒度足够）
+    #   3. 定时推送/订房队列/盯场地/财务日报/图片处理 —— 原 msg 定时器职责，随 poll_group_messages 执行
+    - cron: '*/5 * * * *'
   workflow_dispatch:
 
 permissions:
   contents: write
 
+concurrency:
+  group: feishu-poller
+  # 新一轮开始时取消未跑完的旧任务：2 小时回看窗口 + butler-data 共享去重表保证消息零丢失
+  cancel-in-progress: true
+
 jobs:
   poll:
     runs-on: ubuntu-latest
+    timeout-minutes: 9
     steps:
       - uses: actions/checkout@v4
-      - name: Poll and forward
+
+      - name: Run butler gateway (AMS + 定时推送 + 消息处理)
         env:
+          TZ: Asia/Shanghai
           FEISHU_APP_ID: ${{ secrets.FEISHU_APP_ID }}
           FEISHU_APP_SECRET: ${{ secrets.FEISHU_APP_SECRET }}
-          SCF_URL: ${{ secrets.SCF_URL }}
-          CHAT_ID: ${{ secrets.CHAT_ID }}
           FEISHU_VERIFY_TOKEN: ${{ secrets.FEISHU_VERIFY_TOKEN }}
+          CHAT_ID: ${{ secrets.CHAT_ID }}
+          # GH_PAT：仓库既有密钥（xjtlu-monitor 已用它经 Contents API 读写 butler-data，
+          # 与网关 gh_read_json/gh_write_json 同一操作），无需新增 Secret
+          GH_TOKEN: ${{ secrets.GH_PAT }}
+          OUTLOOK_REFRESH_TOKEN: ${{ secrets.OUTLOOK_REFRESH_TOKEN }}
+          OUTLOOK_CLIENT_ID: ${{ secrets.OUTLOOK_CLIENT_ID }}
+          DEEPSEEK_API_KEY: ${{ secrets.DEEPSEEK_API_KEY }}
         run: |
-          cat > poll.py << 'PYEOF'
-          import json, urllib.request, time, os, datetime
+          cat > driver.py << 'PYEOF'
+          """SCF 云函数下线后的管家驱动器（原 feishu-gateway 的三个触发入口合并执行）：
+          1. ams_timer_poll()        —— 原 ams-poller 定时器：课节状态监控/签到提醒
+          2. poll_group_messages()  —— 原 msg 定时器：定时推送 + 订房队列 + 盯场地 + 图片处理
+          3. 文本消息本地处理         —— 原 webhook 路径：轮询群消息 → process_command → 飞书回复
+          """
+          import json, time, urllib.request
 
-          APP_ID = os.environ.get("FEISHU_APP_ID", "")
-          APP_SECRET = os.environ.get("FEISHU_APP_SECRET", "")
-          CHAT_ID = os.environ.get("CHAT_ID", "")
-          SCF_URL = os.environ.get("SCF_URL", "")
-          VERIFY_TOKEN = os.environ.get("FEISHU_VERIFY_TOKEN", "")
-          STATE_FILE = "poll-state.json"
+          import feishu_gateway_scf as gw
 
-          def log(msg):
-              print(msg, flush=True)
+          # 云函数时代的「Actions 保活」已无意义（保活的本意是云函数触发 GitHub，
+          # 现在两者同在 GitHub 上，Actions 停摆时本驱动同样停摆，谁也保不了谁），
+          # 且 Actions 每次运行都是新进程 → 记忆丢失 → 每轮误判超时重复 dispatch butler。
+          gw._gh_actions_keepalive = lambda *a, **k: None
 
-          # 1. 读取已处理消息ID（跨运行持久化，杜绝重复转发）
-          processed = set()
-          if os.path.exists(STATE_FILE):
-              try:
-                  with open(STATE_FILE) as f:
-                      processed = set(json.load(f).get("processed", []))
-              except Exception as e:
-                  log("State load failed, starting fresh: " + str(e))
-          log("State: " + str(len(processed)) + " processed ids")
+          # ---------- 1) AMS 课节监控 ----------
+          try:
+              gw.ams_timer_poll()
+          except Exception as e:
+              print("ams_timer_poll failed:", e)
 
-          # 2. 飞书token
-          tok_req = json.dumps({"app_id": APP_ID, "app_secret": APP_SECRET}).encode()
-          tok_resp = urllib.request.urlopen(
-              urllib.request.Request("https://open.feishu.cn/open-apis/auth/v3/tenant_access_token/internal",
-                  data=tok_req, headers={"Content-Type": "application/json"}), timeout=15)
-          token = json.loads(tok_resp.read().decode())["tenant_access_token"]
-          log("token OK")
+          # ---------- 2) 定时推送套件 + 图片轮询 ----------
+          try:
+              gw.poll_group_messages()
+          except Exception as e:
+              print("poll_group_messages failed:", e)
 
-          # 3. 查询最近2小时消息（覆盖cron延迟窗口，不漏消息）
-          end = int(time.time()) + 60
-          start = end - 7200
-          url = ("https://open.feishu.cn/open-apis/im/v1/messages"
-                 "?container_id_type=chat&container_id=" + CHAT_ID
-                 + "&start_time=" + str(start) + "&end_time=" + str(end) + "&page_size=50")
-          req = urllib.request.Request(url, headers={"Authorization": "Bearer " + token})
-          resp = urllib.request.urlopen(req, timeout=15)
-          items = json.loads(resp.read().decode()).get("data", {}).get("items", [])
-          log("Queried " + str(len(items)) + " messages (2h window)")
+          # ---------- 3) 文本消息处理（原 webhook 路径） ----------
+          def handle_text_messages():
+              chat_id = gw.CHAT_ID_FALLBACK
+              token = gw.get_feishu_token()
+              now_s = int(time.time())
+              url = ("https://open.feishu.cn/open-apis/im/v1/messages"
+                     "?container_id_type=chat&container_id=" + chat_id
+                     + "&start_time=" + str(now_s - 7200) + "&end_time=" + str(now_s + 60)
+                     + "&page_size=50")
+              req = urllib.request.Request(url, headers={"Authorization": "Bearer " + token})
+              with urllib.request.urlopen(req, timeout=20) as r:
+                  result = json.loads(r.read().decode())
+              items = result.get("data", {}).get("items", [])
+              print("text poll: " + str(len(items)) + " messages (2h window)")
 
-          # 回复检测：判断某条用户消息是否已有bot回复
-          # 逻辑：该消息之后、下一条用户消息之前，若存在bot消息则视为已回复
-          timeline = [(int(m.get("create_time", "0")) / 1000,
-                       m.get("sender", {}).get("sender_type", "")) for m in items]
+              # 时间线 + 已回复判定：bot 在该用户消息后、下一条用户消息前有发言 → 视为已回复
+              timeline = [(int(m.get("create_time", "0")),
+                            m.get("sender", {}).get("sender_type", "")) for m in items]
 
-          def is_replied(msg_ts):
-              next_user_ts = None
-              for ts, st in timeline:
-                  if st == "user" and ts > msg_ts:
-                      next_user_ts = ts
-                      break
-              for ts, st in timeline:
-                  if st == "app" and ts > msg_ts and (next_user_ts is None or ts < next_user_ts):
-                      return True
-              return False
+              def is_replied(msg_ts):
+                  next_user_ts = None
+                  for ts, st in timeline:
+                      if st == "user" and ts > msg_ts:
+                          next_user_ts = ts
+                          break
+                  for ts, st in timeline:
+                      if st == "app" and ts > msg_ts and (next_user_ts is None or ts < next_user_ts):
+                          return True
+                  return False
 
-          # 4. 转发所有未处理的用户文本消息（按时间正序；已回复的跳过防重复）
-          forwarded = 0
-          skipped = 0
-          for m in items:
-              if m.get("sender", {}).get("sender_type") != "user":
-                  continue
-              if m.get("msg_type") != "text":
-                  continue
-              msg_id = m.get("message_id", "")
-              if not msg_id or msg_id in processed:
-                  continue
-              body = m.get("body", {}).get("content", "{}")
-              try:
-                  text = json.loads(body).get("text", "").strip()
-              except Exception:
-                  continue
-              if not text:
-                  continue
-              processed.add(msg_id)
-              # 回复检测：已被秒回过（或其它通道处理过）的消息不再转发
-              if is_replied(int(m.get("create_time", "0")) / 1000):
-                  skipped += 1
-                  log("Skip (already replied): " + text[:40])
-                  continue
-              payload = json.dumps({
-                  "type": "event_callback",
-                  "token": VERIFY_TOKEN,
-                  "event": {
-                      "type": "im.message.receive_v1",
-                      "message": {
-                          "message_id": msg_id,
-                          "chat_type": "group",
-                          "chat_id": CHAT_ID,
-                          "msg_type": "text",
-                          "content": json.dumps({"text": text})
-                      },
-                      "sender": {"sender_id": {"open_id": "ou_poll"}, "sender_type": "user"}
-                  }
-              }).encode()
-              try:
-                  urllib.request.urlopen(
-                      urllib.request.Request(SCF_URL, data=payload, method="POST",
-                          headers={"Content-Type": "application/json"}), timeout=30)
-                  log("Forwarded: " + text[:40])
-                  forwarded += 1
-              except Exception as e:
-                  log("Forward FAILED: " + str(e))
+              handled = replied = shared = 0
+              for m in sorted(items, key=lambda x: int(x.get("create_time", "0"))):
+                  if m.get("sender", {}).get("sender_type") != "user":
+                      continue
+                  if m.get("msg_type") != "text":
+                      continue
+                  msg_id = m.get("message_id", "")
+                  if not msg_id:
+                      continue
+                  try:
+                      text = json.loads(m.get("body", {}).get("content", "{}")).get("text", "").strip()
+                  except Exception:
+                      continue
+                  if not text:
+                      continue
+                  if gw._is_msg_processed_shared(msg_id):
+                      shared += 1
+                      continue
+                  msg_ts = int(m.get("create_time", "0")) / 1000
+                  if is_replied(msg_ts):
+                      # butler.py 兜底或其他路径已回复 → 登记共享表防重复
+                      gw._mark_msg_processed_shared(msg_id)
+                      replied += 1
+                      print("skip (replied): " + text[:40])
+                      continue
+                  print("handle: " + text[:40])
+                  try:
+                      gw.process_command(text, chat_id)
+                  except Exception as e:
+                      print("process_command failed: " + str(e))
+                      try:
+                          gw.feishu_send(chat_id, "⚠️ 处理失败：" + str(e).splitlines()[0][:60] + "\n\n请重试。")
+                      except Exception:
+                          pass
+                  finally:
+                      gw._mark_msg_processed_shared(msg_id)
+                  handled += 1
+              print("text messages: handled=" + str(handled)
+                    + " skipped_replied=" + str(replied)
+                    + " skipped_shared=" + str(shared))
 
-          log("Done: forwarded=" + str(forwarded) + ", skipped_replied=" + str(skipped) + ", total_processed=" + str(len(processed)))
-
-          # 5. 保存状态（保留最近500条ID）
-          with open(STATE_FILE, "w") as f:
-              json.dump({"processed": sorted(processed)[-500:],
-                         "updated": datetime.datetime.now().isoformat()}, f, indent=2)
-          log("State saved")
+          handle_text_messages()
+          print("driver done")
           PYEOF
 
-          python3 poll.py
+          python3 driver.py
 
-      - name: Commit state
+      - name: Daily heartbeat commit
+        # 云函数时代 poll-state.json 由轮询任务频繁提交；现在改为每日一次心跳提交，
+        # 防止 GitHub「仓库 60 天无提交自动禁用定时工作流」机制误伤
         run: |
+          python3 - << 'PYEOF'
+          import json, datetime
+          try:
+              state = json.load(open("poll-state.json"))
+          except Exception:
+              state = {}
+          state["heartbeat"] = datetime.datetime.now().strftime("%Y-%m-%d")
+          state["updated"] = datetime.datetime.now().isoformat()
+          json.dump(state, open("poll-state.json", "w"), ensure_ascii=False, indent=2)
+          PYEOF
           if [ -z "$(git status --porcelain poll-state.json)" ]; then
-            echo "No state change"
+            echo "heartbeat unchanged"
           else
             git config user.name "github-actions[bot]"
             git config user.email "github-actions[bot]@users.noreply.github.com"
             git add poll-state.json
-            git commit -m "chore: poll state [skip ci]"
-            git push || echo "push conflict, next run will sync"
+            git commit -m "chore: daily heartbeat [skip ci]"
+            git push || echo "push conflict, skip"
           fi

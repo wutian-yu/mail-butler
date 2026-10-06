@@ -1099,13 +1099,10 @@ def run():
         f.write(generate_ics())
     log(f"✅ ICS 已生成（已确认 {len(confirmed.get('items', []))} 条活动）")
 
-    # ---- 4. 创建/续期 Outlook 推送订阅（实时邮件提醒）----
-    SCF_URL = os.environ.get("SCF_URL", "")
-    try:
-        outlook.create_subscription(SCF_URL)
-        log("✅ Outlook推送订阅已续期")
-    except Exception as e:
-        log(f"⚠️ 推送订阅续期失败（非致命）: {e}", "WARN")
+    # ---- 4. Outlook 推送订阅已移除 ----
+    # 原 SCF 云函数 2026-10-06 已删除（停用付费服务）：Outlook 实时推送通知Url指向云函数，
+    # 通知Url失效后 Graph 订阅会自动过期清理；邮件改为依赖本任务 5 分钟轮询发现。
+    log("ℹ️ 邮件实时推送订阅已随 SCF 下线停用（邮件由本任务 5 分钟轮询发现）")
 
     log(f"✅ 运行完成（本次新增 {new_activities} 条活动）")
 

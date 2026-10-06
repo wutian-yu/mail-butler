@@ -2,7 +2,10 @@ name: AI Mail Butler
 
 on:
   schedule:
-    - cron: '*/5 * * * *'
+    # 与 Feishu Poller 错开 2 分钟：poller(:00,:05…) 是文本命令第一处理人（全功能），
+    # 本工作流(:02,:07…)负责邮件监控/日历 ICS；其飞书命令读取仅兜底 poller 停摆时的漏网消息
+    # （feishu_read_commands 自带「<2 分钟的新消息让给快路径」规则 + butler-data 共享去重表）
+    - cron: '2-57/5 * * * *'
   workflow_dispatch:
 
 permissions:
@@ -31,7 +34,6 @@ jobs:
           FEISHU_APP_SECRET: ${{ secrets.FEISHU_APP_SECRET }}
           BARK_KEY: ${{ secrets.BARK_KEY }}
           DATA_DIR: ${{ github.workspace }}/data
-          SCF_URL: ${{ secrets.SCF_URL }}
           ICS_FILENAME: ${{ secrets.ICS_FILENAME }}
         run: python butler.py
 
@@ -41,7 +43,7 @@ jobs:
           git config user.name "mail-butler-bot"
           git config user.email "butler@users.noreply.github.com"
           git add .
-          # v41 加固：云函数高频写 butler-data，普通 git push 会因 non-fast-forward 被拒导致整轮失败。
+          # v41 加固：高频写 butler-data，普通 git push 会因 non-fast-forward 被拒导致整轮失败。
           # 改为 rebase 远端新提交后再推；冲突则放弃本次（下次运行自然同步）。
           git diff --cached --quiet || (git commit -m "state update" && (git pull --rebase origin main && git push || (git rebase --abort 2>/dev/null; echo "push skipped: rebase conflict, next run will retry")))
 
