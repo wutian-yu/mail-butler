@@ -2,7 +2,9 @@ name: Feishu Poller
 
 on:
   schedule:
-    - cron: '*/5 * * * *'
+    # v43: 5→15 分钟——webhook 秒级 + SCF 每分钟轮询已覆盖，这是第三层兜底；
+    # 降频减少 Actions run 总量（凌晨 runner 紧张时高频 run 会连环取消→失败邮件轰炸用户邮箱）
+    - cron: '*/15 * * * *'
   workflow_dispatch:
 
 permissions:
