@@ -672,14 +672,37 @@ def _save_exam_sent(sent_set):
     except Exception as e:
         log(f"⚠️ exam_reminder 保存失败: {e}")
 
+def _match_user_exam_event(summary, user_events):
+    """v43: 在用户 Outlook 日历里找同一场考试的个人场次事件
+    （LM 的 DDL 是全体考试窗口的截止时间，不是用户个人场次——
+    用户曾反馈："9号20:30是所有人考完的日子跟我有什么关系？"）"""
+    s = (summary or "").lower()
+    m = re.search(r"(practice\s*quiz\s*\d+|weekly\s*assignment\s*\d+|midterm|final\s*exam|exam)", s)
+    if not m:
+        return None
+    kw = re.sub(r"\s+", " ", m.group(1)).strip()
+    for ue in user_events or []:
+        subj = ((ue.get("Subject") or "") + " " + (ue.get("BodyPreview") or "")).lower()
+        if kw and kw in subj:
+            return ue
+    return None
+
+
 def _exam_countdown_remind(chat_id=CHAT_ID_FALLBACK):
     """v34: 从 LM 作业数据中识别 Exam 类型测验，提前 7/3/1 天提醒
     v37.2: 持久化去重，防止容器回收后重复发送
+    v43: 优先用用户日历里的个人场次时间提醒；没有个人场次才用 LM 全局截止时间并注明
     Exam Page 类型的 quiz 是正式机房考试，必须提醒"""
     try:
         sent = _load_exam_sent()
         lm_events = fetch_lm_assignments(days_ahead=14)
         now = datetime.now()
+        # v43: 读用户日历找个人场次
+        try:
+            user_events = outlook_events()
+        except Exception as e:
+            log(f"考试倒计时-读用户日历失败(用LM全局时间): {e}")
+            user_events = []
         changed = False
         for ev in lm_events:
             cats = ev.get("categories") or ""
@@ -688,22 +711,42 @@ def _exam_countdown_remind(chat_id=CHAT_ID_FALLBACK):
             dt = ev.get("dt")
             if not dt:
                 continue
-            day_gap = (dt.date() - now.date()).days
+            # v43: 匹配用户个人场次（日历事件时间为 UTC，转北京时间）
+            personal_dt = None
+            ue = _match_user_exam_event(ev.get("summary"), user_events)
+            if ue:
+                ust = (ue.get("Start", {}).get("DateTime", "") or "")
+                try:
+                    personal_dt = datetime.fromisoformat(ust[:19]) + timedelta(hours=8)
+                except Exception:
+                    personal_dt = None
+            target_dt = personal_dt or dt
+            day_gap = (target_dt.date() - now.date()).days
             for advance in (7, 3, 1):
                 if day_gap == advance:
-                    key = f"{ev['summary'][:20]}_{dt.strftime('%Y%m%d')}_{advance}"
+                    key = f"{ev['summary'][:20]}_{target_dt.strftime('%Y%m%d')}_{advance}"
                     if key in sent:
                         continue
                     sent.add(key)
                     changed = True
                     when = "后天" if advance == 2 else "明天" if advance == 1 else f"{advance}天后"
-                    feishu_send_action(chat_id, "⏰ 考试倒计时提醒",
-                        f"⚠️ {ev['summary'][:40]}\n"
-                        f"距离考试还有 {advance} 天（{when}，{dt.strftime('%m月%d日 %H:%M')}）\n\n"
-                        f"这是机房考试，需按分配场次到机房参加，有参与分。\n"
-                        f"具体场次和房间请到 LearningMall 查 schedule PDF 确认。",
-                        color="orange")
-                    log(f"⏰ 考试倒计时提醒: {ev['summary'][:20]} 还剩 {advance} 天")
+                    if personal_dt:
+                        # 用户有个人场次：直接按个人场次提醒，不说"去LM查场次"
+                        feishu_send_action(chat_id, "⏰ 考试倒计时提醒",
+                            f"⚠️ {ev['summary'][:40]}\n"
+                            f"距离你的考试还有 {advance} 天（{when}，{personal_dt.strftime('%m月%d日 %H:%M')}）\n\n"
+                            f"这是你的个人场次时间（来自你日历里的安排），机房考试，记得带手机（SEB二次认证+拍错题）。",
+                            color="orange")
+                    else:
+                        feishu_send_action(chat_id, "⏰ 考试倒计时提醒",
+                            f"⚠️ {ev['summary'][:40]}\n"
+                            f"距离考试还有 {advance} 天（{when}，{dt.strftime('%m月%d日 %H:%M')}）\n\n"
+                            f"⚠️ 这是全体考试窗口的截止时间，不是你的个人场次！\n"
+                            f"你的个人场次请到 LearningMall 查 schedule PDF，"
+                            f"查到后发「加日历 场次名 X月X日 开始 结束」记到日历里，管家以后按你的场次提醒。",
+                            color="orange")
+                    log(f"⏰ 考试倒计时提醒: {ev['summary'][:20]} 还剩 {advance} 天"
+                        f"{'(个人场次)' if personal_dt else '(LM全局时间)'}")
         if changed:
             _save_exam_sent(sent)
     except Exception as e:
@@ -870,8 +913,9 @@ def _gh_actions_keepalive(chat_id=CHAT_ID_FALLBACK):
         return  # token 挂了不浪费请求
     now = time.time()
     interval = 600  # 10 分钟
-    # butler 保活（邮件处理，原 schedule 每 5 分钟）
-    if now - _KEEPALIVE_LAST["butler"] >= interval:
+    # v43: butler 保活降频 10→30 分钟——GitHub cron */5 是主力，保活只是 cron 停摆兜底。
+    # 凌晨 GitHub runner 紧张时，双高频触发+排队超时导致连环 job 取消 → 用户邮箱被失败邮件轰炸。
+    if now - _KEEPALIVE_LAST["butler"] >= 1800:
         _KEEPALIVE_LAST["butler"] = now
         try:
             req = urllib.request.Request(
