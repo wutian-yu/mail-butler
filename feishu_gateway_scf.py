@@ -95,6 +95,12 @@ def _http(url, method="GET", headers=None, data=None, timeout=15):
 
 
 # ============ 飞书 API ============
+def invalidate_feishu_token():
+    """作废旧 token 缓存，强制下一轮重新获取（用于请求失败自愈）。"""
+    _FEISHU_TOKEN_CACHE["token"] = ""
+    _FEISHU_TOKEN_CACHE["expires"] = 0
+
+
 def get_feishu_token():
     if _FEISHU_TOKEN_CACHE["token"] and time.time() < _FEISHU_TOKEN_CACHE["expires"]:
         return _FEISHU_TOKEN_CACHE["token"]

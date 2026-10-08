@@ -63,10 +63,17 @@ def handle_text_messages(seen, age_gate=0):
            "?container_id_type=chat&container_id=" + chat_id
            + "&start_time=" + str(now_s - 7200) + "&end_time=" + str(now_s + 60)
            + "&page_size=50")
-    req = urllib.request.Request(url, headers={"Authorization": "Bearer " + token})
-    with urllib.request.urlopen(req, timeout=20) as r:
-        result = json.loads(r.read().decode())
-    items = result.get("data", {}).get("items", [])
+    try:
+        req = urllib.request.Request(url, headers={"Authorization": "Bearer " + token})
+        with urllib.request.urlopen(req, timeout=20) as r:
+            result = json.loads(r.read().decode())
+        items = result.get("data", {}).get("items", [])
+    except Exception as e:
+        # 拉取失败（超时/400/网络抖动）绝不让异常冒泡打死常驻任务；
+        # 主动作废 token 缓存，下一轮自动重新获取（自愈飞书 token 过期/失效）。
+        gw.invalidate_feishu_token()
+        log("拉取消息列表异常(已隔离): " + str(e))
+        return 0, 0, 0, 0
 
     # 时间线 + 已回复判定：bot 在该用户消息后、下一条用户消息前有发言 → 视为已回复
     timeline = [(int(m.get("create_time", "0")),
@@ -138,8 +145,13 @@ def mode_live():
     while time.time() < end_at:
         cycle += 1
         started = time.time()
-        run_duties()
-        handled, replied, shared, young = handle_text_messages(seen, age_gate=0)
+        try:
+            run_duties()
+            handled, replied, shared, young = handle_text_messages(seen, age_gate=0)
+        except Exception as e:
+            # 兜底隔离：任何未预期的异常都不能打死常驻循环，记录后继续下一轮。
+            handled = replied = shared = young = 0
+            log("cycle " + str(cycle) + " 异常(已隔离，继续运行): " + str(e))
         if handled or replied or shared:
             log("cycle " + str(cycle) + ": 处理=" + str(handled)
                 + " 已回复跳过=" + str(replied) + " 共享表跳过=" + str(shared))
