@@ -175,8 +175,10 @@ class Outlook:
                   "Body": {"ContentType": "Text", "Content": body}}
         return self._call("POST", "/api/v2.0/me/events", ev)
 
-    def upcoming_events(self, days=14, top=50):
-        """查询未来N天的日历事件（按开始时间排序，含非管家添加的）"""
+    def upcoming_events(self, days=14, top=300):
+        """查询未来N天的日历事件（按开始时间排序，含非管家添加的）
+        v44: top 50→300——iCloud 课表整体导入后日历有 245+ 事件，
+        服务器返回顺序不稳定，只拉 50 条会随机截断，早报/「日程」会漏课或误报"今天没课"。"""
         q = f"/api/v2.0/me/events?$top={top}&$select=Id,Subject,Start"
         events = self._call("GET", q).get("value", [])
         today = datetime.now().strftime("%Y-%m-%d")
