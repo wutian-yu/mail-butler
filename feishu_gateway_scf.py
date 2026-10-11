@@ -6320,8 +6320,21 @@ def poll_group_messages():
             req = urllib.request.Request(url, headers={
                 "Authorization": f"Bearer {token}",
                 "Content-Type": "application/json"})
-            with urllib.request.urlopen(req, timeout=15) as r:
-                result = json.loads(r.read().decode())
+            # v42: GitHub runner 网络瞬时抖动（read timeout）高发，单次超时直接报“轮询诊断”
+            # 会每十几分钟打扰用户。失败先等待 3 秒重试一次，大部分瞬时超时被二次消化。
+            result = None
+            for _attempt in range(2):
+                try:
+                    with urllib.request.urlopen(req, timeout=15) as r:
+                        result = json.loads(r.read().decode())
+                    break
+                except Exception:
+                    if _attempt == 0:
+                        time.sleep(3)
+                    else:
+                        raise
+            if result is None:
+                raise RuntimeError("拉取消息列表重试后仍失败")
             page_items = result.get("data", {}).get("items", [])
             all_items.extend(page_items)
             has_more = result.get("data", {}).get("has_more", False)
@@ -6379,7 +6392,9 @@ def poll_group_messages():
     except Exception as e:
         log(f"❌ 轮询失败: {e}")
         try:
-            if time.time() - _LAST_POLL_ERR.get("ts", 0) > 60:
+            # v42: 节流 60s→1800s——网络抖动期（每隔十几分钟超时一次）不再连续打扰用户；
+            # 重试机制已消化大部分瞬时超时，能走到这里的都是持续性故障，半小时报一条足够。
+            if time.time() - _LAST_POLL_ERR.get("ts", 0) > 1800:
                 _LAST_POLL_ERR["ts"] = time.time()
                 feishu_send(CHAT_ID_FALLBACK,
                     f"⚠️ 轮询诊断 {datetime.now().strftime('%H:%M:%S')}：{str(e)[:120]}")
