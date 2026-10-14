@@ -1,6 +1,12 @@
 #!/usr/bin/env python3
 """飞书诊断：调用 tenant token 接口，打印错误码（不打印任何密钥）。"""
-import json, urllib.request, urllib.parse
+import json
+import urllib.request
+import urllib.parse
+import urllib.error
+import os
+
+
 def req(url, data=None, headers=None, method=None):
     body = json.dumps(data).encode() if data is not None else None
     r = urllib.request.Request(url, data=body, method=method or ("POST" if data is not None else "GET"))
@@ -17,11 +23,22 @@ def req(url, data=None, headers=None, method=None):
     except Exception as e:
         return -1, str(e)
 
-import os
+
 print("=== 1) tenant_access_token 接口 ===")
 st, body = req("https://open.feishu.cn/open-apis/auth/v3/tenant_access_token/internal",
-               data={"app_id": os.environ.get("FEISHU_APP_ID",""), "app_secret": os.environ.get("FEISHU_APP_SECRET","")})
+               data={"app_id": os.environ.get("FEISHU_APP_ID", ""),
+                     "app_secret": os.environ.get("FEISHU_APP_SECRET", "")})
 print("HTTP", st)
 print(body[:800])
-PYEOF
-echo "脚本写好"
+print("=== 2) 若拿到 token，再测一个只读接口 ===")
+try:
+    tok = json.loads(body).get("tenant_access_token", "")
+    if tok:
+        st2, body2 = req("https://open.feishu.cn/open-apis/application/v6/applications",
+                         headers={"Authorization": "Bearer " + tok})
+        print("HTTP", st2)
+        print(body2[:400])
+    else:
+        print("无 token，跳过")
+except Exception as e:
+    print("解析失败:", e)
