@@ -35,9 +35,11 @@ jobs:
           XJTLU_PASSWORD: ${{ secrets.XJTLU_PASSWORD }}
           EBRIDGE_COOKIES: ${{ secrets.EBRIDGE_COOKIES }}
           XJTLU_COOKIES_FILE: ${{ github.workspace }}/data/xjtlu_cookies.json
-          FEISHU_APP_ID: ${{ secrets.FEISHU_APP_ID }}
-          FEISHU_APP_SECRET: ${{ secrets.FEISHU_APP_SECRET }}
           XJTLU_STATE_FILE: ${{ github.workspace }}/data/xjtlu_state.json
+          # v47: 飞书已弃用 → monitor_feed.json 消息邮箱 + Outlook token 代刷
+          GH_PAT: ${{ secrets.GH_PAT }}
+          OUTLOOK_CLIENT_ID: ${{ secrets.OUTLOOK_CLIENT_ID }}
+          OUTLOOK_REFRESH_TOKEN: ${{ secrets.OUTLOOK_REFRESH_TOKEN }}
         run: python xjtlu_monitor.py
 
       - name: Push 数据仓库变更
