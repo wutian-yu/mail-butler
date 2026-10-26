@@ -1,0 +1,242 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>AI 邮件管家 · 西浦</title>
+<style>
+  :root {
+    --bg: #f5f6fa; --panel: #ffffff; --primary: #2f6fed; --accent: #34c76f;
+    --user-bubble: #2f6fed; --assistant-bubble: #eef1f6; --text: #1f2430;
+    --muted: #8a94a6; --border: #e4e7ee; --radius: 14px;
+  }
+  * { box-sizing: border-box; margin: 0; padding: 0; }
+  html, body { height: 100%; }
+  body {
+    font-family: -apple-system, BlinkMacSystemFont, "PingFang SC", "Microsoft YaHei", sans-serif;
+    background: var(--bg); color: var(--text); display: flex; flex-direction: column; height: 100vh;
+  }
+  header {
+    padding: 12px 22px; background: var(--panel); border-bottom: 1px solid var(--border);
+    display: flex; align-items: center; gap: 12px; flex-shrink: 0; flex-wrap: wrap;
+  }
+  header .logo { width: 9px; height: 9px; border-radius: 50%; background: var(--accent); }
+  header h1 { font-size: 17px; font-weight: 600; }
+  header .conn { font-size: 12px; color: var(--muted); margin-left: auto; }
+
+  .tabs { display: flex; gap: 4px; padding: 0 22px; flex-shrink: 0; margin-top: 8px; }
+  .tabs button {
+    border: none; background: transparent; padding: 9px 16px; font: inherit; font-size: 14px;
+    color: var(--muted); cursor: pointer; border-bottom: 2px solid transparent; border-radius: 8px 8px 0 0;
+  }
+  .tabs button.active { color: var(--primary); border-bottom-color: var(--primary); font-weight: 500; }
+
+  main { flex: 1; overflow-y: auto; display: flex; }
+
+  /* ---- 聊天视图 ---- */
+  #chatView { flex: 1; display: flex; flex-direction: column; padding: 16px 22px; gap: 10px; }
+  #messages { flex: 1; overflow-y: auto; display: flex; flex-direction: column; gap: 12px;
+    padding: 4px 0; }
+  .msg { max-width: 80%; padding: 10px 14px; border-radius: var(--radius); line-height: 1.55;
+    font-size: 14px; white-space: pre-wrap; word-break: break-word; }
+  .msg.user { align-self: flex-end; background: var(--user-bubble); color: #fff; border-bottom-right-radius: 4px; }
+  .msg.assistant { align-self: flex-start; background: var(--assistant-bubble); border-bottom-left-radius: 4px; }
+  .msg.pending { opacity: .6; font-style: italic; }
+  .composer { display: flex; gap: 10px; padding-top: 10px; }
+  .composer textarea { flex: 1; resize: none; border: 1px solid var(--border); border-radius: var(--radius);
+    padding: 10px 14px; font: inherit; font-size: 14px; min-height: 44px; max-height: 120px; outline: none; }
+  .composer textarea:focus { border-color: var(--primary); }
+  .composer button { border: none; border-radius: var(--radius); background: var(--primary); color: #fff;
+    font-size: 15px; font-weight: 500; padding: 0 22px; cursor: pointer; }
+  .composer button:disabled { opacity: .5; cursor: not-allowed; }
+  .chips { display: flex; flex-wrap: wrap; gap: 6px; }
+  .chips span { font-size: 12px; color: var(--muted); background: #f0f2f7; border-radius: 20px;
+    padding: 4px 10px; cursor: pointer; }
+
+  /* ---- 站点视图 ---- */
+  #sitesView { flex: 1; padding: 16px 22px; overflow-y: auto; display: none; }
+  .section { margin-bottom: 18px; }
+  .section h2 { font-size: 13px; color: var(--muted); font-weight: 600; margin-bottom: 10px; }
+  .grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(230px, 1fr)); gap: 12px; }
+  .card {
+    background: var(--panel); border: 1px solid var(--border); border-radius: var(--radius);
+    padding: 14px; display: flex; flex-direction: column; gap: 8px; transition: transform .12s, box-shadow .12s;
+  }
+  .card:hover { transform: translateY(-2px); box-shadow: 0 6px 18px rgba(0,0,0,.06); }
+  .card .name { font-size: 15px; font-weight: 600; }
+  .card .desc { font-size: 12px; color: var(--muted); line-height: 1.5; }
+  .card .act { display: flex; gap: 8px; margin-top: 4px; }
+  .card a, .card .pending {
+    flex: 1; text-align: center; font-size: 13px; padding: 7px 0; border-radius: 8px; text-decoration: none;
+  }
+  .card a { background: var(--primary); color: #fff; }
+  .card .pending { background: #f0f2f7; color: var(--muted); cursor: default; }
+</style>
+</head>
+<body>
+<header>
+  <span class="logo"></span>
+  <h1>AI 邮件管家 · 西浦</h1>
+  <span class="conn" id="connState">…</span>
+</header>
+
+<div class="tabs">
+  <button id="tabChat" class="active">💬 聊天</button>
+  <button id="tabSites">🏛️ 西浦站点</button>
+</div>
+
+<!-- 聊天 -->
+<main>
+  <div id="chatView">
+    <div id="messages">
+      <div class="welcome" style="text-align:center;color:var(--muted);font-size:13px;padding:24px;line-height:1.9;">
+        <b style="color:var(--text);">你好，我是你的 AI 邮件管家 👋</b><br>
+        输入命令：查课表 · 签到 码 · 请假 10-05 10-14 崴脚 · 作业 · 发邮件给老师…<br>
+        「查询 <网址>」可抓取任意西浦页面并回答，需登录的页面会自动登录（首次约 30-60 秒）<br>
+        输入「帮助」查看全部命令；「西浦站点」页可直达各系统。
+      </div>
+    </div>
+    <div class="chips" id="chips"></div>
+    <div class="composer">
+      <textarea id="input" placeholder="输入命令，Enter 发送…" rows="1"></textarea>
+      <button id="send">发送</button>
+    </div>
+  </div>
+
+  <!-- 站点导航 -->
+  <div id="sitesView"></div>
+</main>
+
+<!-- 访问码弹层 -->
+<div id="pinGate" style="display:none; position:fixed; inset:0; background:rgba(15,20,30,.45); z-index:50; align-items:center; justify-content:center;">
+  <div style="background:#fff; border-radius:14px; padding:24px; width:280px; text-align:center; box-shadow:0 12px 40px rgba(0,0,0,.18);">
+    <div style="font-size:15px; font-weight:600; margin-bottom:6px;">🔒 需要访问码</div>
+    <div style="font-size:12px; color:#8a94a6; margin-bottom:12px;">首次使用请输入访问码（部署时设置的 ACCESS_PIN）</div>
+    <input id="pinInput" type="password" placeholder="访问码" style="width:100%; padding:10px; border:1px solid #e4e7ee; border-radius:8px; font-size:15px; text-align:center; letter-spacing:4px; outline:none;">
+    <button id="pinOk" style="margin-top:12px; width:100%; padding:10px; border:none; border-radius:8px; background:#2f6fed; color:#fff; font-size:14px; cursor:pointer;">进入</button>
+  </div>
+</div>
+
+<script>
+  // v47: 后端迁至腾讯云函数 URL（SCF），GitHub Pages 静态托管
+  const BACKEND_URL = "https://1498782142-1gh6vevlbz.ap-guangzhou.tencentscf.com";
+  const messagesEl = document.getElementById('messages');
+  const inputEl = document.getElementById('input');
+  const sendBtn = document.getElementById('send');
+  const connEl = document.getElementById('connState') || document.getElementById('conn');
+  const sitesView = document.getElementById('sitesView');
+  const chatView = document.getElementById('chatView');
+
+  // ---- 站点数据（neoschool/体育馆订场 链接待补充）----
+  const SITES = [
+    { cat: '学习与教学', items: [
+      { n: 'LearningMall 教学平台 (Core)', d: '课程、作业、讲稿、评分与反馈', u: 'https://core.xjtlu.edu.cn' },
+      { n: 'eBridge 学生门户', d: '公告、课表、成绩、学生事务', u: 'https://ebridge.xjtlu.edu.cn' },
+      { n: 'AMS 考勤系统', d: '签到、出勤率、请假', u: 'https://ams.xjtlu.edu.cn' },
+      { n: 'neoschool 直播课平台', d: '线上直播课、作业、成绩、课程通知（独立账号登录）', u: 'https://www.neoschool.com/#/home' },
+    ]},
+    { cat: '🏫 校园服务', items: [
+      { n: '图书馆', d: '检索、预约、电子资源', u: 'https://lib.xjtlu.edu.cn' },
+      { n: '就业与职业中心', d: '招聘、实习、职业服务', u: 'https://careers.xjtlu.edu.cn' },
+      { n: '统一认证登录 (UIM)', d: '统一 SSO 登录入口', u: 'https://uim.xjtlu.edu.cn' },
+      { n: '学校官网', d: '校园新闻、通知、学校介绍', u: 'https://www.xjtlu.edu.cn' },
+      { n: '体育馆介绍页', d: '室内场馆与开放信息', u: 'https://www.xjtlu.edu.cn/zh/it-services/gym-intro' },
+    ]},
+    { cat: '待补充链接', items: [
+      { n: '体育馆订场系统', d: '场馆/场地在线预订', u: '' },
+    ]},
+  ];
+
+  // 渲染站点导航
+  function renderSites() {
+    sitesView.innerHTML = '';
+    for (const sec of SITES) {
+      const s = document.createElement('div'); s.className = 'section';
+      s.innerHTML = `<h2>${sec.cat}</h2>`;
+      const grid = document.createElement('div'); grid.className = 'grid';
+      for (const it of sec.items) {
+        const card = document.createElement('div'); card.className = 'card';
+        card.innerHTML = `<div class="name">${it.n}</div><div class="desc">${it.d}</div>`;
+        const act = document.createElement('div'); act.className = 'act';
+        if (it.u) {
+          act.innerHTML = `<a href="${it.u}" target="_blank" rel="noopener">打开</a>`;
+        } else {
+          act.innerHTML = `<span class="pending">待补充链接</span>`;
+        }
+        card.appendChild(act); grid.appendChild(card);
+      }
+      s.appendChild(grid); sitesView.appendChild(s);
+    }
+  }
+  renderSites();
+
+  // Tab 切换
+  const tabChat = document.getElementById('tabChat'), tabSites = document.getElementById('tabSites');
+  function show(view) {
+    const chat = view === 'chat';
+    tabChat.classList.toggle('active', chat);
+    tabSites.classList.toggle('active', !chat);
+    chatView.style.display = chat ? 'flex' : 'none';
+    sitesView.style.display = chat ? 'none' : 'block';
+  }
+  tabChat.addEventListener('click', () => show('chat'));
+  tabSites.addEventListener('click', () => show('sites'));
+
+  // 聊天
+  function append(text, role) {
+    const div = document.createElement('div'); div.className = 'msg ' + role; div.textContent = text;
+    messagesEl.appendChild(div); messagesEl.scrollTop = messagesEl.scrollHeight; return div;
+  }
+  let PIN = localStorage.getItem('butler_pin') || '';
+  let lastText = '';
+  const gate = document.getElementById('pinGate');
+  const pinInput = document.getElementById('pinInput');
+  const pinOk = document.getElementById('pinOk');
+  function showGate() { gate.style.display = 'flex'; pinInput.focus(); }
+  pinOk.addEventListener('click', () => {
+    PIN = pinInput.value.trim();
+    if (!PIN) return;
+    localStorage.setItem('butler_pin', PIN);
+    gate.style.display = 'none';
+    if (lastText) { inputEl.value = lastText; lastText = ''; send(); }
+  });
+  pinInput.addEventListener('keydown', e => { if (e.key === 'Enter') pinOk.click(); });
+
+  async function send() {
+    const text = inputEl.value.trim();
+    if (!text || sendBtn.disabled) return;
+    lastText = text;
+    inputEl.value = ''; append(text, 'user'); sendBtn.disabled = true;
+    const wait = append('正在处理…（需登录页面首次可能 30-60 秒）', 'assistant');
+    try {
+      // v47: 「查询 <url>」不再单独走 /api/fetch（容器已下线），统一发给后端命令入口，
+      // 后端会用缓存的监控数据回答；需登录页会提示受限
+      let endpoint = BACKEND_URL;
+      let body = { text, pin: PIN };
+      const resp = await fetch(endpoint, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body) });
+      if (resp.status === 403) {
+        sendBtn.disabled = false;
+        wait.remove();
+        showGate();
+        return;
+      }
+      const data = await resp.json();
+      wait.classList.remove('pending'); wait.textContent = data.reply || '（无回复）';
+    } catch (e) {
+      wait.classList.remove('pending'); wait.textContent = '⚠️ 连接失败：' + e.message;
+    }
+    sendBtn.disabled = false; inputEl.focus();
+  }
+  sendBtn.addEventListener('click', send);
+  inputEl.addEventListener('keydown', e => { if (e.key === 'Enter' && !e.shiftKey) { e.preventDefault(); send(); } });
+
+  const chips = ['帮助', '查课表', '作业', '签到', '请假', '查询 https://ebridge.xjtlu.edu.cn 最新公告',
+                 '查询 https://lib.xjtlu.edu.cn 开馆时间'];
+  const chipsEl = document.getElementById('chips');
+  chips.forEach(t => { const s = document.createElement('span'); s.textContent = t;
+    s.onclick = () => { inputEl.value = t; inputEl.focus(); }; chipsEl.appendChild(s); });
+
+  fetch(BACKEND_URL + '?ping=1', { method: 'GET' }).then(() => connEl.textContent = '在线').catch(() => connEl.textContent = '后端不可达');
+</script>
+</body>
+</html>
