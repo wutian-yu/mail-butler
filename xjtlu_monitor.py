@@ -113,12 +113,16 @@ def _butler_read_json(path):
     return None, ""
 
 
-def _butler_write_json(path, payload, message):
-    """写 butler-data 文件：API + 本地 data 目录双写。
-    双写原因：工作流末尾 push 前有 rebase，但 API 写的改动若不同步本地，
-    rebase 时可能冲突跳过；双写保证两条路内容一致。"""
+def _butler_write_json(path, payload, message, attempts=3):
+    """写 butler-data 文件：API 直写（读 sha → PUT，409/422 冲突自动重读重试）。
+    v48：不再依赖「本地写 + 工作流 git push」交付——云函数每分钟写远端 state 文件，
+    末尾 rebase 100% 冲突被跳过（v41 skip逻辑永久饿死，AMS token 12 天没同步上远端）。
+    API 是状态文件唯一交付通道；本地同步仅供脚本内部读，run 结束会还原（见 _revert_api_files_local）。"""
     pat = os.environ.get("GH_PAT", "")
-    if pat:
+    if not pat:
+        _butler_local_write(path, payload)
+        return
+    for i in range(attempts):
         try:
             _, sha = _butler_read_json(path)
             body = {"message": message,
@@ -132,18 +136,66 @@ def _butler_write_json(path, payload, message):
                 headers={"Authorization": f"Bearer {pat}", "Accept": "application/vnd.github+json"})
             with urllib.request.urlopen(req, timeout=20000):
                 log(f"✅ butler-data/{path} 已更新（API）: {message[:40]}")
+            _butler_local_write(path, payload)
+            return
+        except urllib.error.HTTPError as e:
+            if e.code in (409, 422) and i < attempts - 1:
+                log(f"ℹ️ butler-data/{path} 冲突({e.code})，第{i + 2}次重读 sha 重试")
+                time.sleep(2)
+                continue
+            log(f"⚠️ butler-data/{path} API 写入失败: HTTP{e.code} {str(e)[:80]}")
+            _butler_local_write(path, payload)
+            return
         except Exception as e:
             log(f"⚠️ butler-data/{path} API 写入失败: {str(e)[:100]}")
+            _butler_local_write(path, payload)
+            return
+    _butler_local_write(path, payload)
+
+
+def _butler_local_write(path, payload):
+    """本地 data 目录同步写（仅供脚本内后续读，最终会被还原，不靠它交付）"""
     d = _butler_data_dir()
-    if d:
+    if not d:
+        return
+    try:
+        local = os.path.join(d, path)
+        os.makedirs(os.path.dirname(local), exist_ok=True)
+        with open(local, "w", encoding="utf-8") as f:
+            json.dump(payload, f, ensure_ascii=False, indent=2)
+    except Exception as e:
+        log(f"⚠️ data/{path} 本地同步失败: {e}")
+
+
+def _revert_api_files_local():
+    """v48: 还原本地 data 克隆中已被 API 直写的状态文件——
+    让工作流末尾的 git push 只送 cookie 等文件，不再撞 rebase 冲突被跳过。"""
+    d = _butler_data_dir()
+    if not d or not os.environ.get("GH_PAT", ""):
+        return
+    import subprocess
+    for f in ("xjtlu_state.json", "state.json", "monitor_feed.json"):
         try:
-            local = os.path.join(d, path)
-            os.makedirs(os.path.dirname(local), exist_ok=True)
-            with open(local, "w", encoding="utf-8") as f:
-                json.dump(payload, f, ensure_ascii=False, indent=2)
-            log(f"✅ data/{path} 本地已同步")
+            local = os.path.join(d, f)
+            if not os.path.exists(local):
+                continue
+            r = subprocess.run(["git", "-C", d, "status", "--porcelain", "--", f],
+                               capture_output=True, text=True, timeout=30)
+            st = (r.stdout or "").strip()
+            if not st:
+                continue
+            if st.startswith("??"):
+                os.remove(local)
+            else:
+                subprocess.run(["git", "-C", d, "checkout", "--", f],
+                               capture_output=True, timeout=30)
+            log(f"♻️ 已还原本地 {f}（API 直写占道，git push 只送 cookie）")
         except Exception as e:
-            log(f"⚠️ data/{path} 本地同步失败: {e}")
+            log(f"⚠️ 还原 {f} 失败: {str(e)[:60]}")
+
+
+import atexit
+atexit.register(_revert_api_files_local)
 
 
 def feishu_send(text):
@@ -1313,6 +1365,14 @@ def load_state():
 
 
 def save_state(state):
+    """v48: xjtlu_state 改 API 直写（读 sha→PUT，409 重试）——根治
+    「本地写+git push 被 rebase 冲突跳过」导致 AMS token / 课表基线 / LM 事件
+    去重表 12 天无法同步到远端的饿死问题；本地写仅为脚本内部一致性。"""
+    if os.environ.get("GH_PAT", ""):
+        try:
+            _butler_write_json("xjtlu_state.json", state, "xjtlu monitor state sync (api)")
+        except Exception as e:
+            log(f"⚠️ xjtlu_state API 写失败: {str(e)[:80]}")
     os.makedirs(os.path.dirname(STATE_FILE), exist_ok=True)
     with open(STATE_FILE, "w", encoding="utf-8") as f:
         json.dump(state, f, ensure_ascii=False, indent=2)
