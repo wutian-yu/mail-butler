@@ -8,7 +8,9 @@
 环境变量：
   XJTLU_USERNAME — SSO 用户名（学号或邮箱前缀）
   XJTLU_PASSWORD — SSO 密码
-  FEISHU_APP_ID / FEISHU_APP_SECRET — 飞书凭据
+  GH_PAT — GitHub token（读写 butler-data）
+  OUTLOOK_CLIENT_ID / OUTLOOK_REFRESH_TOKEN — Outlook 凭据（代刷 access token，
+    云函数 IP 可能被微软条件访问拒绝刷新，由 runner 代刷写入 state.json）
 """
 import json
 import os
@@ -73,45 +75,129 @@ def log(msg):
     print(f"[{datetime.now().strftime('%H:%M:%S')}] {msg}", flush=True)
 
 
-# ============ 飞书通知 ============
-def get_feishu_token():
-    data = json.dumps({"app_id": FEISHU_APP_ID, "app_secret": FEISHU_APP_SECRET}).encode()
-    req = urllib.request.Request(
-        "https://open.feishu.cn/open-apis/auth/v3/tenant_access_token/internal",
-        data=data, method="POST",
-        headers={"Content-Type": "application/json"})
-    with urllib.request.urlopen(req, timeout=30) as r:
-        return json.loads(r.read().decode())["tenant_access_token"]
+# ============ v47: monitor 消息邮箱（替代已弃用的飞书） ============
+# 通知写入 butler-data/monitor_feed.json（append-only，上限 200 条），
+# 云函数每分钟读增量，经 monitor_seen.json 去重后发邮件。
+
+def _butler_data_dir():
+    """Actions runner 上的 data 克隆目录（工作流最终 git push 上去）"""
+    p = os.environ.get("XJTLU_STATE_FILE", "")
+    return os.path.dirname(p) if p else ""
+
+
+def _butler_read_json(path):
+    """读 butler-data 某 JSON（GH_PAT + Contents API；404/失败→回退本地 data 目录）"""
+    pat = os.environ.get("GH_PAT", "")
+    if pat:
+        try:
+            req = urllib.request.Request(
+                f"https://api.github.com/repos/wutian-yu/butler-data/contents/{path}",
+                headers={"Authorization": f"Bearer {pat}", "Accept": "application/vnd.github+json"})
+            with urllib.request.urlopen(req, timeout=20000) as r:
+                meta = json.load(r)
+            return json.loads(base64.b64decode(meta["content"]).decode()), meta.get("sha", "")
+        except urllib.error.HTTPError as e:
+            if e.code != 404:
+                log(f"⚠️ butler-data 读 {path} 失败: {e}")
+        except Exception as e:
+            log(f"⚠️ butler-data 读 {path} 失败: {e}")
+    d = _butler_data_dir()
+    if d:
+        local = os.path.join(d, path)
+        if os.path.exists(local):
+            try:
+                with open(local, encoding="utf-8") as f:
+                    return json.load(f), ""
+            except Exception:
+                pass
+    return None, ""
+
+
+def _butler_write_json(path, payload, message):
+    """写 butler-data 文件：API + 本地 data 目录双写。
+    双写原因：工作流末尾 push 前有 rebase，但 API 写的改动若不同步本地，
+    rebase 时可能冲突跳过；双写保证两条路内容一致。"""
+    pat = os.environ.get("GH_PAT", "")
+    if pat:
+        try:
+            _, sha = _butler_read_json(path)
+            body = {"message": message,
+                    "content": base64.b64encode(
+                        json.dumps(payload, ensure_ascii=False).encode()).decode()}
+            if sha:
+                body["sha"] = sha
+            req = urllib.request.Request(
+                f"https://api.github.com/repos/wutian-yu/butler-data/contents/{path}",
+                data=json.dumps(body).encode(), method="PUT",
+                headers={"Authorization": f"Bearer {pat}", "Accept": "application/vnd.github+json"})
+            with urllib.request.urlopen(req, timeout=20000):
+                log(f"✅ butler-data/{path} 已更新（API）: {message[:40]}")
+        except Exception as e:
+            log(f"⚠️ butler-data/{path} API 写入失败: {str(e)[:100]}")
+    d = _butler_data_dir()
+    if d:
+        try:
+            local = os.path.join(d, path)
+            os.makedirs(os.path.dirname(local), exist_ok=True)
+            with open(local, "w", encoding="utf-8") as f:
+                json.dump(payload, f, ensure_ascii=False, indent=2)
+            log(f"✅ data/{path} 本地已同步")
+        except Exception as e:
+            log(f"⚠️ data/{path} 本地同步失败: {e}")
 
 
 def feishu_send(text):
-    if not FEISHU_APP_ID:
+    """v47: 飞书已弃用——通知改为追加写入 butler-data/monitor_feed.json，
+    云函数读增量发邮件（函数名保留，兼容既有全部调用点）"""
+    if not text:
         return
     try:
-        token = get_feishu_token()
-        card = {
-            "config": {"wide_screen_mode": True},
-            "header": {"template": "turquoise",
-                       "title": {"tag": "plain_text", "content": "🏫 西浦校园通"}},
-            "elements": [
-                {"tag": "div", "text": {"tag": "lark_md", "content": text}},
-                {"tag": "hr"},
-                {"tag": "note", "elements": [
-                    {"tag": "plain_text", "content": "⚡ 西浦网站自动监控"}
-                ]}
-            ]
-        }
-        data = json.dumps({"receive_id": CHAT_ID, "msg_type": "interactive",
-                           "content": json.dumps(card)}).encode()
-        req = urllib.request.Request(
-            "https://open.feishu.cn/open-apis/im/v1/messages?receive_id_type=chat_id",
-            data=data, method="POST",
-            headers={"Authorization": f"Bearer {token}",
-                     "Content-Type": "application/json"})
-        urllib.request.urlopen(req, timeout=30)
-        log(f"✅ 飞书通知已发送")
+        feed, _ = _butler_read_json("monitor_feed.json")
+        feed = feed or {"items": []}
+        items = feed.setdefault("items", [])
+        items.append({"id": f"{int(time.time() * 1000)}",
+                      "ts": time.time(), "text": text})
+        feed["items"] = items[-200:]   # 上限 200 条
+        _butler_write_json("monitor_feed.json", feed, "monitor feed append")
+        log(f"📤 monitor_feed 已追加（共 {len(feed['items'])} 条）")
     except Exception as e:
-        log(f"飞书发送失败: {e}")
+        log(f"⚠️ monitor_feed 写入失败: {e}")
+
+
+def refresh_outlook_token():
+    """v47: 云函数 IP 可能被微软条件访问拒绝刷新 → 由 Actions runner 代刷
+    access token，写入 butler-data/state.json 的 outlook_access
+    （云函数 index.get_outlook_token 优先读取该缓存，token 1h 有效，30min 一刷永新鲜）"""
+    cid = os.environ.get("OUTLOOK_CLIENT_ID", "")
+    rt = os.environ.get("OUTLOOK_REFRESH_TOKEN", "")
+    if not cid or not rt:
+        log("ℹ️ Outlook 凭据未配置（OUTLOOK_CLIENT_ID / OUTLOOK_REFRESH_TOKEN），跳过代刷")
+        return
+    try:
+        data = urllib.parse.urlencode({
+            "client_id": cid,
+            "grant_type": "refresh_token",
+            "refresh_token": rt,
+            "scope": "https://outlook.office.com/.default offline_access",
+        }).encode()
+        req = urllib.request.Request(
+            "https://login.microsoftonline.com/common/oauth2/v2.0/token",
+            data=data, method="POST",
+            headers={"Content-Type": "application/x-www-form-urlencoded"})
+        with urllib.request.urlopen(req, timeout=30000) as r:
+            tok = json.load(r)
+        at = tok.get("access_token", "")
+        if not at:
+            log("⚠️ Outlook 刷新响应无 access_token（refresh token 可能已过期）")
+            return
+        expires_at = time.time() + int(tok.get("expires_in", 3600)) - 120
+        state, _ = _butler_read_json("state.json")
+        state = state or {}
+        state["outlook_access"] = {"token": at, "expires_at": expires_at}
+        _butler_write_json("state.json", state, "outlook access refresh (actions)")
+        log(f"✅ Outlook access token 已代刷（有效 {int(tok.get('expires_in', 0))}s）")
+    except Exception as e:
+        log(f"⚠️ Outlook token 刷新失败: {str(e)[:120]}")
 
 
 # ============ SSO 登录 ============
@@ -2361,6 +2447,9 @@ def run_room_op(op_json):
 
 def run():
     log("🚀 西浦网站监控启动")
+
+    # v47: 先代刷 Outlook access token（不依赖浏览器，即使后续登录失败也保证 token 新鲜）
+    refresh_outlook_token()
 
     state = load_state()
     is_first_run = state.get("first_run", True)
