@@ -133,7 +133,7 @@
       { n: 'LearningMall 教学平台 (Core)', d: '课程、作业、讲稿、评分与反馈', u: 'https://core.xjtlu.edu.cn' },
       { n: 'eBridge 学生门户', d: '公告、课表、成绩、学生事务', u: 'https://ebridge.xjtlu.edu.cn' },
       { n: 'AMS 考勤系统', d: '签到、出勤率、请假', u: 'https://ams.xjtlu.edu.cn' },
-      { n: 'neoschool 直播课平台', d: '线上直播课、作业、成绩、课程通知（独立账号登录）', u: 'https://www.neoschool.com/#/home' },
+      { n: 'neoschool 直播课平台', d: '线上直播课、作业、成绩（自动唤起 Chrome，独立账号）', u: 'https://www.neoschool.com/#/home', chrome: true },
     ]},
     { cat: '🏫 校园服务', items: [
       { n: '图书馆', d: '检索、预约、电子资源', u: 'https://lib.xjtlu.edu.cn' },
@@ -148,6 +148,22 @@
   ];
 
   // 渲染站点导航
+  // iOS Chrome 唤起：googlechrome:// 私有 scheme（neoschool 前端 UA 检查只放行 Chrome/Edge≥109，
+  // Safari 会被拦；点击后 0.9s 未跳走说明未装 Chrome，自动回退普通打开）
+  function openWithChrome(url) {
+    const chromeUrl = 'googlechrome://' + url.replace(/^https?:\/\//, '');
+    let ok = false;
+    const mark = () => { ok = true; };
+    document.addEventListener('visibilitychange', mark, { once: true });
+    window.addEventListener('pagehide', mark, { once: true });
+    window.addEventListener('blur', mark, { once: true });
+    const t = setTimeout(() => {
+      clearTimeout(t);
+      if (!ok) window.location.href = url;   // 回退：本窗口打开（Chrome 未装时）
+    }, 900);
+    window.location.href = chromeUrl;
+  }
+
   function renderSites() {
     sitesView.innerHTML = '';
     for (const sec of SITES) {
@@ -159,7 +175,15 @@
         card.innerHTML = `<div class="name">${it.n}</div><div class="desc">${it.d}</div>`;
         const act = document.createElement('div'); act.className = 'act';
         if (it.u) {
-          act.innerHTML = `<a href="${it.u}" target="_blank" rel="noopener">打开</a>`;
+          if (it.chrome) {
+            act.innerHTML = `<a href="${it.u}" target="_blank" rel="noopener">📲 用 Chrome 打开</a>`;
+            act.querySelector('a').addEventListener('click', e => {
+              e.preventDefault();
+              openWithChrome(it.u);
+            });
+          } else {
+            act.innerHTML = `<a href="${it.u}" target="_blank" rel="noopener">打开</a>`;
+          }
         } else {
           act.innerHTML = `<span class="pending">待补充链接</span>`;
         }
